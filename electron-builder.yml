@@ -90,18 +90,21 @@ mac:
   gatekeeperAssess: false
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
-  # Code signing + notarization are driven by environment variables — nothing
-  # about a specific Apple developer identity lives in source. Set on your
-  # machine (or in CI secrets) before building a release:
-  #   CSC_NAME                       — keychain identity (e.g. "Your Name (TEAMID)")
-  #   APPLE_ID                       — Apple ID email
+  # Notarization is enabled with an explicit teamId so the unsigned-fallback
+  # path (no CSC_LINK secret) doesn't try to notarize. electron-builder's
+  # notarytool driver reads APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD from env;
+  # we don't embed credentials here.
+  notarize:
+    teamId: "8Z6V759KCC"
+  # Code-signing inputs (set in CI as repo secrets, or in env locally):
+  #   CSC_LINK                       — base64 of the Developer ID .p12 (or file:/https: URL)
+  #   CSC_KEY_PASSWORD               — password for that .p12
+  #   APPLE_ID                       — Apple ID email (notarization)
   #   APPLE_APP_SPECIFIC_PASSWORD    — app-specific password (appleid.apple.com)
-  #   APPLE_TEAM_ID                  — Apple developer team ID (when set,
-  #                                    electron-builder auto-enables notarytool)
-  # Without notarization, electron-updater's staged binary is blocked by
-  # Gatekeeper on macOS 10.15+ and the auto-update silently fails to install.
-  # Forks without Apple credentials should set CSC_IDENTITY_AUTO_DISCOVERY=false
-  # to produce an unsigned dev build.
+  #   APPLE_TEAM_ID                  — Apple developer team ID
+  # When CSC_LINK is unset, the CI workflow sets CSC_IDENTITY_AUTO_DISCOVERY=false
+  # so the runner produces an unsigned build instead of silently picking up
+  # a runner-local identity.
   target:
     - target: dmg
       arch:

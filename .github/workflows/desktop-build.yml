@@ -104,16 +104,24 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
-          # Never silently sign with a keychain identity that happens to be
-          # on the runner — only sign when CSC_LINK / WIN_CSC_LINK is set.
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
+          # Strip empty signing/notarization env vars. electron-builder
+          # treats an empty CSC_LINK as "path '' doesn't exist" and aborts;
+          # an unset CSC_LINK means "no certificate provided" → unsigned build.
           for var in APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID \
                      CSC_LINK CSC_KEY_PASSWORD WIN_CSC_LINK WIN_CSC_KEY_PASSWORD; do
             if [ -z "${!var}" ]; then
               unset "$var"
             fi
           done
+          # Pin auto-discovery only on the unsigned path so electron-builder
+          # doesn't try to use a runner-local keychain identity. When CSC_LINK
+          # IS set, leave auto-discovery at its default (true) — that's what
+          # tells electron-builder to use the cert it just imported from the
+          # base64 blob; setting it to false here suppresses signing entirely.
+          if [ -z "${CSC_LINK:-}" ]; then
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+          fi
           npx electron-builder --config electron-builder.yml --${{ matrix.platform }} --publish never
 
       - name: Upload artifacts
