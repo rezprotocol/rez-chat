@@ -1,0 +1,215 @@
+appId: com.rezprotocol.chat
+productName: Rez Chat
+
+directories:
+  # rez-chat repo IS the app root. The four sibling Rez packages live at
+  # ../rez-core, ../rez-sdk, ../rez-node, ../rez-ui (see the polyrepo
+  # checkout pattern in .github/workflows/desktop-build.yml).
+  app: .
+  output: artifacts/rez-chat-desktop
+  buildResources: build
+
+files:
+  - package.json
+  - src/**/*
+  - electron/**/*
+  - artifacts/rez-chat/**/*
+  # Cross-package source bundling. The four sibling Rez packages are
+  # installed under rez-chat/node_modules via `npm install --install-links`
+  # (CI does this; local dev should also use --install-links before packing).
+  # That gives electron-builder real directories to bundle, all under the
+  # app root.
+  - from: node_modules/@rezprotocol/core
+    to: node_modules/@rezprotocol/core
+    filter:
+      - src/**/*
+      - package.json
+  - from: node_modules/@rezprotocol/sdk
+    to: node_modules/@rezprotocol/sdk
+    filter:
+      - src/**/*
+      - package.json
+  - from: node_modules/@rezprotocol/node
+    to: node_modules/@rezprotocol/node
+    filter:
+      - src/**/*
+      - package.json
+  - from: node_modules/rez-ui
+    to: node_modules/rez-ui
+    filter:
+      - src/**/*
+      - package.json
+  # npm-installed deps (all under rez-chat/node_modules). Map each in
+  # explicitly because the dep tree is shallow but electron-builder's
+  # automatic prod-dep packaging misses workspace-style deps.
+  - from: node_modules/better-sqlite3
+    to: node_modules/better-sqlite3
+    filter:
+      - "**/*"
+  - from: node_modules/bindings
+    to: node_modules/bindings
+    filter:
+      - "**/*"
+  - from: node_modules/file-uri-to-path
+    to: node_modules/file-uri-to-path
+    filter:
+      - "**/*"
+  - from: node_modules/ws
+    to: node_modules/ws
+    filter:
+      - "**/*"
+  # electron-updater runtime tree.
+  - from: node_modules/electron-updater
+    to: node_modules/electron-updater
+    filter:
+      - "**/*"
+  # electron-updater pins specific nested versions of these (fs-extra ^10,
+  # semver ~7.7, builder-util-runtime 9.5.1, jsonfile 6.x, universalify 2.x).
+  # When npm leaves them under node_modules/electron-updater/node_modules/
+  # rather than hoisting, map them in directly at the asar root. Conditional
+  # paths are not supported here — if npm hoists, these `from:` entries fail
+  # the build, surfacing the layout drift. Re-flatten back to the hoisted
+  # paths in that case.
+  - from: node_modules/electron-updater/node_modules/builder-util-runtime
+    to: node_modules/builder-util-runtime
+    filter:
+      - "**/*"
+  - from: node_modules/electron-updater/node_modules/fs-extra
+    to: node_modules/fs-extra
+    filter:
+      - "**/*"
+  - from: node_modules/electron-updater/node_modules/jsonfile
+    to: node_modules/jsonfile
+    filter:
+      - "**/*"
+  - from: node_modules/electron-updater/node_modules/universalify
+    to: node_modules/universalify
+    filter:
+      - "**/*"
+  - from: node_modules/electron-updater/node_modules/semver
+    to: node_modules/semver
+    filter:
+      - "**/*"
+  # The rest are correct at root.
+  - from: node_modules/graceful-fs
+    to: node_modules/graceful-fs
+    filter:
+      - "**/*"
+  - from: node_modules/js-yaml
+    to: node_modules/js-yaml
+    filter:
+      - "**/*"
+  - from: node_modules/argparse
+    to: node_modules/argparse
+    filter:
+      - "**/*"
+  - from: node_modules/lazy-val
+    to: node_modules/lazy-val
+    filter:
+      - "**/*"
+  - from: node_modules/lodash.escaperegexp
+    to: node_modules/lodash.escaperegexp
+    filter:
+      - "**/*"
+  - from: node_modules/lodash.isequal
+    to: node_modules/lodash.isequal
+    filter:
+      - "**/*"
+  - from: node_modules/tiny-typed-emitter
+    to: node_modules/tiny-typed-emitter
+    filter:
+      - "**/*"
+  - from: node_modules/sax
+    to: node_modules/sax
+    filter:
+      - "**/*"
+  - from: node_modules/debug
+    to: node_modules/debug
+    filter:
+      - "**/*"
+  - from: node_modules/ms
+    to: node_modules/ms
+    filter:
+      - "**/*"
+  - "!**/test/**"
+  - "!**/tests/**"
+  - "!**/.claude/**"
+  - "!**/docs/**"
+  - "!**/*.log"
+
+extraMetadata:
+  name: rez-chat
+  description: Rez Chat desktop app
+  author: Rez Protocol
+  main: electron/main.mjs
+
+# Auto-update publish target (rezprotocol/rez-chat GitHub Releases).
+# electron-updater reads this at runtime to know which repo to poll for
+# `latest-mac.yml` / `latest.yml` / `latest-linux.yml` metadata.
+publish:
+  provider: github
+  owner: rezprotocol
+  repo: rez-chat
+  releaseType: release
+  vPrefixedTagName: true
+
+asar: true
+asarUnpack:
+  - electron/preload.cjs
+  - node_modules/better-sqlite3/**/*.node
+  - node_modules/**/*.node
+# electron-builder's host-platform npm rebuild would overwrite the prebuild
+# we deliberately installed for the target platform/arch via
+# scripts/desktop-native-modules.mjs. The desktop:pack:<platform> scripts
+# (and CI) install the correct better-sqlite3 prebuild before electron-builder
+# runs. better-sqlite3 is the only native module we ship; the other listed
+# deps (bindings, file-uri-to-path, ws) are pure JS.
+npmRebuild: false
+electronVersion: 31.7.7
+
+mac:
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Code signing + notarization are driven by environment variables — nothing
+  # about a specific Apple developer identity lives in source. Set on your
+  # machine (or in CI secrets) before building a release:
+  #   CSC_NAME                       — keychain identity (e.g. "Your Name (TEAMID)")
+  #   APPLE_ID                       — Apple ID email
+  #   APPLE_APP_SPECIFIC_PASSWORD    — app-specific password (appleid.apple.com)
+  #   APPLE_TEAM_ID                  — Apple developer team ID (when set,
+  #                                    electron-builder auto-enables notarytool)
+  # Without notarization, electron-updater's staged binary is blocked by
+  # Gatekeeper on macOS 10.15+ and the auto-update silently fails to install.
+  # Forks without Apple credentials should set CSC_IDENTITY_AUTO_DISCOVERY=false
+  # to produce an unsigned dev build.
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  category: public.app-category.social-networking
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: zip
+      arch:
+        - x64
+
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: zip
+      arch:
+        - x64
+  category: Network;Chat;InstantMessaging

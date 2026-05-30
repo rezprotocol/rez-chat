@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Hardened Runtime entitlements (SECURITY_AUDIT HIGH-11).
+
+    Only `allow-jit` is enabled here. V8 needs JIT for the renderer.
+    Every other hardening toggle is intentionally OMITTED so the
+    Hardened Runtime protections it would relax remain ACTIVE:
+
+      - `allow-unsigned-executable-memory`     -> blocked
+      - `allow-dyld-environment-variables`     -> blocked (no DYLD_INSERT_LIBRARIES injection)
+      - `disable-library-validation`           -> blocked (no unsigned dylib loading)
+
+    If a future Electron bump fails to launch with this minimal set,
+    re-add the *smallest* additional entitlement that resolves the
+    failure and document the Electron version + reason here. Do NOT
+    re-add `allow-dyld-environment-variables` or `disable-library-validation`
+    without explicit security review — they neutralize Hardened Runtime
+    for our specific threat model (local-attacker dylib injection).
+  -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <key>com.apple.security.network.server</key>
+  <true/>
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+</dict>
+</plist>

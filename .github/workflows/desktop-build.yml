@@ -1,0 +1,141 @@
+name: Desktop Build
+
+# Cross-platform Electron build for rez-chat. Triggered manually (smoke test)
+# or by pushing a `v*` tag (cuts a draft GitHub Release with the artifacts).
+#
+# The repo is the standalone rez-chat. The four sibling Rez packages
+# (rez-core, rez-sdk, rez-node, rez-ui) are checked out at sibling paths so
+# rez-chat/package.json's `file:../<sibling>` deps resolve at npm-install
+# time, and so electron-builder.yml's `from: ../<sibling>` source-bundling
+# entries reach them.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+          - os: windows-latest
+            platform: win
+          - os: ubuntu-latest
+            platform: linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout rez-chat
+        uses: actions/checkout@v4
+        with:
+          path: rez-chat
+
+      - name: Checkout rez-core
+        uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-core
+          path: rez-core
+          ref: main
+
+      - name: Checkout rez-sdk
+        uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-sdk
+          path: rez-sdk
+          ref: main
+
+      - name: Checkout rez-node
+        uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-node
+          path: rez-node
+          ref: main
+
+      - name: Checkout rez-ui
+        uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-ui
+          path: rez-ui
+          ref: main
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+
+      - name: Install rez-chat deps
+        # `--install-links` copies the sibling `file:..` deps into
+        # rez-chat/node_modules as real directories (not symlinks) so
+        # electron-builder can bundle them from inside the app root —
+        # the asar packager rejects any `from:` path outside `directories.app`.
+        run: npm install --install-links --no-audit --no-fund
+        working-directory: rez-chat
+
+      - name: Build web assets
+        run: npm run desktop:build:web
+        working-directory: rez-chat
+
+      - name: Rebuild native modules for Electron target
+        # better-sqlite3 ships prebuilds; refetch the one matching the
+        # Electron version + this runner's platform/arch so electron-builder
+        # bundles the right .node binary.
+        run: npm run desktop:rebuild:native
+        working-directory: rez-chat
+
+      - name: Build desktop (${{ matrix.platform }})
+        run: npx electron-builder --config electron-builder.yml --${{ matrix.platform }} --publish never
+        working-directory: rez-chat
+        env:
+          # electron-updater needs an auth token to know which repo to read.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS code-signing + notarization. If unset, electron-builder
+          # falls back to an unsigned build (Gatekeeper users right-click →
+          # Open to bypass). Friends-test builds can ship unsigned; once you
+          # set the four secrets, the next tagged release is notarized.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          # Refuse silently-discovered keychain identities when CSC_LINK is
+          # unset — we want either a deliberate signed build (CSC_LINK set)
+          # or a clearly-unsigned build, never a half-signed surprise.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: |
+            rez-chat/artifacts/rez-chat-desktop/*.dmg
+            rez-chat/artifacts/rez-chat-desktop/*.zip
+            rez-chat/artifacts/rez-chat-desktop/*.exe
+            rez-chat/artifacts/rez-chat-desktop/*.AppImage
+            rez-chat/artifacts/rez-chat-desktop/latest*.yml
+          if-no-files-found: warn
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/**/*

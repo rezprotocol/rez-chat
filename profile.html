@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>REZ Profile Editor Dark Mode</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&amp;family=Manrope:wght@200..800&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+          darkMode: "class",
+          theme: {
+            extend: {
+              colors: {
+                "primary": "#00f0ff",
+                "primary-dim": "#00a3ad",
+                "accent-red": "#ff003c",
+                "background-light": "#f6f7f8",
+                "background-dark": "#050505",
+                "background-panel": "#111111",
+                "glass": "rgba(255, 255, 255, 0.03)",
+                "glass-border": "rgba(0, 240, 255, 0.15)",
+              },
+              fontFamily: {
+                "display": ["Manrope", "sans-serif"],
+                "mono": ["Space Mono", "monospace"],
+              },
+              borderRadius: {"DEFAULT": "0.25rem", "lg": "0.5rem", "xl": "0.75rem", "2xl": "1rem", "full": "9999px"},
+              boxShadow: {
+                "neon": "0 0 10px rgba(0, 240, 255, 0.3), 0 0 20px rgba(0, 240, 255, 0.1)",
+                "glitch": "2px 0 #ff003c, -2px 0 #00f0ff",
+              }
+            },
+          },
+        }
+    </script>
+<style>
+        body { font-family: 'Manrope', sans-serif; }
+        .font-mono { font-family: 'Space Mono', monospace; }
+        .glass-effect {
+            backdrop-filter: blur(12px);
+            background-color: rgba(10, 10, 10, 0.6);
+            border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.1));
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #000;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #333;
+            border: 1px solid #000;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #00f0ff;
+        }
+        .glitch-text {
+            position: relative;
+            color: white;
+            letter-spacing: 0.1em;
+        }
+        .glitch-text::before,
+        .glitch-text::after {
+            content: attr(data-text);
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        .glitch-text::before {
+            left: 2px;
+            text-shadow: -1px 0 #ff003c;
+            clip: rect(44px, 450px, 56px, 0);
+            animation: glitch-anim 5s infinite linear alternate-reverse;
+        }
+        .glitch-text::after {
+            left: -2px;
+            text-shadow: -1px 0 #00f0ff;
+            clip: rect(44px, 450px, 56px, 0);
+            animation: glitch-anim2 5s infinite linear alternate-reverse;
+        }
+        @keyframes scan {
+            0% { top: 0%; opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% { top: 100%; opacity: 0; }
+        }
+        @keyframes glitch-anim {
+            0% { clip: rect(13px, 9999px, 81px, 0); }
+            5% { clip: rect(68px, 9999px, 4px, 0); }
+            10% { clip: rect(98px, 9999px, 8px, 0); }
+            15% { clip: rect(10px, 9999px, 93px, 0); }
+            20% { clip: rect(3px, 9999px, 34px, 0); }
+            25% { clip: rect(78px, 9999px, 62px, 0); }
+            30% { clip: rect(26px, 9999px, 3px, 0); }
+            35% { clip: rect(42px, 9999px, 5px, 0); }
+            40% { clip: rect(13px, 9999px, 93px, 0); }
+            45% { clip: rect(69px, 9999px, 96px, 0); }
+            50% { clip: rect(32px, 9999px, 56px, 0); }
+            55% { clip: rect(10px, 9999px, 12px, 0); }
+            60% { clip: rect(80px, 9999px, 5px, 0); }
+            65% { clip: rect(18px, 9999px, 20px, 0); }
+            70% { clip: rect(73px, 9999px, 16px, 0); }
+            75% { clip: rect(35px, 9999px, 62px, 0); }
+            80% { clip: rect(16px, 9999px, 54px, 0); }
+            85% { clip: rect(56px, 9999px, 34px, 0); }
+            90% { clip: rect(93px, 9999px, 23px, 0); }
+            95% { clip: rect(48px, 9999px, 10px, 0); }
+            100% { clip: rect(61px, 9999px, 52px, 0); }
+        }
+        @keyframes glitch-anim2 {
+            0% { clip: rect(65px, 9999px, 96px, 0); }
+            5% { clip: rect(23px, 9999px, 83px, 0); }
+            10% { clip: rect(48px, 9999px, 35px, 0); }
+            15% { clip: rect(10px, 9999px, 16px, 0); }
+            20% { clip: rect(94px, 9999px, 54px, 0); }
+            25% { clip: rect(50px, 9999px, 7px, 0); }
+            30% { clip: rect(18px, 9999px, 88px, 0); }
+            35% { clip: rect(35px, 9999px, 96px, 0); }
+            40% { clip: rect(63px, 9999px, 3px, 0); }
+            45% { clip: rect(5px, 9999px, 19px, 0); }
+            50% { clip: rect(86px, 9999px, 44px, 0); }
+            55% { clip: rect(12px, 9999px, 73px, 0); }
+            60% { clip: rect(39px, 9999px, 90px, 0); }
+            65% { clip: rect(62px, 9999px, 12px, 0); }
+            70% { clip: rect(28px, 9999px, 66px, 0); }
+            75% { clip: rect(54px, 9999px, 34px, 0); }
+            80% { clip: rect(91px, 9999px, 5px, 0); }
+            85% { clip: rect(20px, 9999px, 18px, 0); }
+            90% { clip: rect(74px, 9999px, 43px, 0); }
+            95% { clip: rect(33px, 9999px, 85px, 0); }
+            100% { clip: rect(11px, 9999px, 62px, 0); }
+        }
+        .tech-grid {
+            background-image:
+                linear-gradient(rgba(0, 240, 255, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 240, 255, 0.03) 1px, transparent 1px);
+            background-size: 40px 40px;
+        }
+        .tech-dots {
+            background-image: radial-gradient(rgba(0, 240, 255, 0.1) 1px, transparent 1px);
+            background-size: 20px 20px;
+        }
+    </style>
+</head>
+<body class="bg-background-light dark:bg-background-dark text-slate-900 dark:text-slate-100 font-display selection:bg-primary selection:text-black">
+<div class="flex h-screen w-full overflow-hidden">
+<aside class="w-20 lg:w-64 flex flex-col border-r border-white/5 bg-background-panel z-20 shrink-0">
+<div class="flex h-full flex-col justify-between p-4">
+<div class="flex flex-col gap-8">
+<div class="flex items-center gap-4 px-2 pt-2 mb-2">
+<div class="relative group cursor-pointer">
+<div class="absolute inset-0 bg-primary/20 rounded-full blur-md opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
+<div class="bg-black border border-white/10 rounded-full size-10 flex items-center justify-center relative overflow-hidden">
+<span class="material-symbols-outlined text-primary" style="font-size: 24px;">psychology</span>
+<div class="absolute top-0 w-full h-[1px] bg-primary/50 shadow-[0_0_5px_#00f0ff] animate-[scan_2s_linear_infinite]"></div>
+</div>
+</div>
+<div class="hidden lg:flex flex-col">
+<h1 class="text-2xl font-black font-mono tracking-widest glitch-text" data-text="REZ">REZ</h1>
+<p class="text-[10px] text-primary/70 font-mono tracking-wider uppercase">Secure Link v2.0</p>
+</div>
+</div>
+<div class="flex items-center gap-3 px-2 py-2 bg-white/5 rounded-lg border border-white/5">
+<div class="bg-center bg-no-repeat aspect-square bg-cover rounded size-8 ring-1 ring-primary/50" data-alt="Profile picture of Alex Rivera" style='background-image: url("https://lh3.googleusercontent.com/aida-public/AB6AXuB3RgHzyxgykuc_UyU3CTrN003qLbQKvDyBTbix-e0ulcbeIbt6jQoL0-p4s1epK4k0sBfgbHGlV62G9H5hrGIQ2R3xsfXdzTR0OvPQH1U5NZfDARBNGibNAgz7gIDjtpNy8bTMarw5ig99CH_x13PpB9mfEPJwUQlRAIMjRmPIjErNuOoz7DR1P2Um6yWv-QDP7LhbcKJPNzdGZNatUDp_k0OHOw5hWfjvaAyOM1RS5EKhnpUWXkyOuEDo7aGnjWsbM2Sab7nvet4");'>
+</div>
+<div class="hidden lg:flex flex-col">
+<h1 class="text-white text-sm font-bold leading-none font-mono">Alex Rivera</h1>
+<p class="text-xs font-normal mt-1 flex items-center gap-1 text-emerald-400">
+<span class="size-1.5 bg-emerald-500 rounded-full shadow-[0_0_5px_#10b981]"></span> Encrypted
+                            </p>
+</div>
+</div>
+<nav class="flex flex-col gap-2 mt-4">
+<div class="flex items-center gap-3 px-3 py-3 rounded hover:bg-white/5 text-slate-500 dark:text-slate-400 hover:text-white transition-colors cursor-pointer group">
+<span class="material-symbols-outlined group-hover:text-primary transition-colors">chat_bubble</span>
+<p class="hidden lg:block text-sm font-medium">CHATS</p>
+</div>
+<div class="flex items-center gap-3 px-3 py-3 rounded hover:bg-white/5 text-slate-500 dark:text-slate-400 hover:text-white transition-colors cursor-pointer group">
+<span class="material-symbols-outlined group-hover:text-primary transition-colors">group</span>
+<p class="hidden lg:block text-sm font-medium">CONTACTS</p>
+</div>
+<div class="flex items-center gap-3 px-3 py-3 rounded hover:bg-white/5 text-slate-500 dark:text-slate-400 hover:text-white transition-colors cursor-pointer group">
+<span class="material-symbols-outlined group-hover:text-primary transition-colors">folder</span>
+<p class="hidden lg:block text-sm font-medium">FILES</p>
+</div>
+<div class="flex items-center gap-3 px-3 py-3 rounded bg-primary/10 border-l-2 border-primary text-primary cursor-pointer">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1">settings</span>
+<p class="hidden lg:block text-sm font-bold tracking-wide">SYSTEM</p>
+</div>
+</nav>
+</div>
+<div class="flex items-center gap-3 px-3 py-3 rounded hover:bg-accent-red/10 text-slate-500 dark:text-slate-400 hover:text-accent-red transition-colors cursor-pointer border border-transparent hover:border-accent-red/20">
+<span class="material-symbols-outlined">power_settings_new</span>
+<p class="hidden lg:block text-sm font-medium">DISCONNECT</p>
+</div>
+</div>
+</aside>
+<main class="flex-1 flex flex-col bg-background-dark relative overflow-hidden">
+<div class="absolute inset-0 z-0 pointer-events-none tech-grid opacity-30"></div>
+<div class="absolute inset-0 z-0 pointer-events-none bg-gradient-to-b from-transparent via-background-dark/50 to-background-dark"></div>
+<div class="relative z-10 flex flex-col items-center justify-center h-full p-6 overflow-y-auto custom-scrollbar">
+<div class="w-full max-w-3xl bg-background-panel/80 backdrop-blur-md border border-white/10 shadow-[0_0_50px_rgba(0,0,0,0.8)] relative group perspective-1000 animate-[fadeIn_0.5s_ease-out]">
+<div class="absolute -top-[1px] -left-[1px] w-4 h-4 border-t-2 border-l-2 border-primary shadow-[0_0_10px_#00f0ff]"></div>
+<div class="absolute -top-[1px] -right-[1px] w-4 h-4 border-t-2 border-r-2 border-primary shadow-[0_0_10px_#00f0ff]"></div>
+<div class="absolute -bottom-[1px] -left-[1px] w-4 h-4 border-b-2 border-l-2 border-primary shadow-[0_0_10px_#00f0ff]"></div>
+<div class="absolute -bottom-[1px] -right-[1px] w-4 h-4 border-b-2 border-r-2 border-primary shadow-[0_0_10px_#00f0ff]"></div>
+<div class="border-b border-white/10 p-6 flex justify-between items-center bg-white/[0.01]">
+<div class="flex flex-col">
+<h2 class="text-2xl font-bold font-mono text-white tracking-widest flex items-center gap-3 uppercase">
+<span class="material-symbols-outlined text-primary text-3xl">badge</span>
+                                Profile_Editor
+                            </h2>
+<p class="text-[10px] text-slate-500 font-mono mt-1 tracking-widest pl-11">ACCESS LEVEL 5 // ROOT</p>
+</div>
+<div class="flex flex-col items-end gap-1">
+<div class="flex items-center gap-2">
+<div class="size-2 bg-accent-red rounded-full animate-pulse shadow-[0_0_8px_#ff003c]"></div>
+<span class="text-xs font-mono text-accent-red font-bold">UNSECURED CHANGES</span>
+</div>
+<span class="text-[10px] text-slate-600 font-mono">SESSION ID: XJ-9292</span>
+</div>
+</div>
+<div class="p-8 grid grid-cols-1 md:grid-cols-12 gap-10">
+<div class="md:col-span-4 flex flex-col items-center gap-6 border-r border-white/5 pr-4">
+<div class="relative size-40 group cursor-pointer">
+<div class="absolute inset-0 bg-primary/20 rounded-sm blur-md group-hover:blur-xl transition-all duration-500 opacity-50"></div>
+<div class="relative w-full h-full bg-black border border-primary/30 group-hover:border-primary transition-colors overflow-hidden">
+<div class="w-full h-full bg-cover bg-center opacity-90 group-hover:opacity-100 transition-opacity grayscale group-hover:grayscale-0" style='background-image: url("https://lh3.googleusercontent.com/aida-public/AB6AXuB3RgHzyxgykuc_UyU3CTrN003qLbQKvDyBTbix-e0ulcbeIbt6jQoL0-p4s1epK4k0sBfgbHGlV62G9H5hrGIQ2R3xsfXdzTR0OvPQH1U5NZfDARBNGibNAgz7gIDjtpNy8bTMarw5ig99CH_x13PpB9mfEPJwUQlRAIMjRmPIjErNuOoz7DR1P2Um6yWv-QDP7LhbcKJPNzdGZNatUDp_k0OHOw5hWfjvaAyOM1RS5EKhnpUWXkyOuEDo7aGnjWsbM2Sab7nvet4");'></div>
+<div class="absolute top-0 w-full h-[2px] bg-primary/80 shadow-[0_0_15px_#00f0ff] animate-[scan_3s_linear_infinite] pointer-events-none"></div>
+<div class="absolute inset-0 bg-black/70 flex flex-col items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-300 backdrop-blur-sm">
+<span class="material-symbols-outlined text-primary text-4xl mb-2">upload_file</span>
+<span class="text-primary font-mono text-xs font-bold tracking-widest">UPLOAD_IMG</span>
+</div>
+<div class="absolute bottom-1 right-1 w-2 h-2 bg-primary"></div>
+</div>
+</div>
+<div class="text-center w-full">
+<p class="text-xs font-mono text-slate-400 mb-1">CURRENT_AVATAR.PNG</p>
+<p class="text-[10px] text-slate-600 font-mono uppercase tracking-wider">
+                                    Size: 256x256 • 45KB
+                                </p>
+<div class="mt-4 w-full h-1 bg-white/5 rounded overflow-hidden">
+<div class="h-full bg-primary/50 w-3/4 shadow-[0_0_5px_#00f0ff]"></div>
+</div>
+<p class="text-[9px] text-primary/50 font-mono mt-1 text-right">STORAGE: 75%</p>
+</div>
+</div>
+<div class="md:col-span-8 flex flex-col gap-6">
+<div class="group">
+<label class="block text-xs font-bold text-primary font-mono uppercase tracking-widest mb-2 flex items-center gap-2">
+<span class="material-symbols-outlined text-sm">alternate_email</span>
+                                    Alias / Codename
+                                </label>
+<div class="relative">
+<input class="w-full bg-black/50 border border-white/10 text-white px-4 py-3 text-sm font-mono focus:border-primary focus:ring-1 focus:ring-primary focus:shadow-[0_0_15px_rgba(0,240,255,0.15)] transition-all placeholder:text-slate-700 outline-none" type="text" value="Alex Rivera"/>
+<div class="absolute right-0 top-0 h-full w-1 bg-primary scale-y-0 group-focus-within:scale-y-100 transition-transform origin-center"></div>
+</div>
+<p class="text-[10px] text-slate-500 mt-1 font-mono pl-1">Visible to all encrypted nodes.</p>
+</div>
+<div class="group">
+<label class="block text-xs font-bold text-primary font-mono uppercase tracking-widest mb-2 flex items-center gap-2">
+<span class="material-symbols-outlined text-sm">campaign</span>
+                                    Status Beacon
+                                </label>
+<div class="relative">
+<input class="w-full bg-black/50 border border-white/10 text-white px-4 py-3 text-sm font-mono focus:border-primary focus:ring-1 focus:ring-primary focus:shadow-[0_0_15px_rgba(0,240,255,0.15)] transition-all placeholder:text-slate-700 outline-none" type="text" value="[Encrypted] Exploring the deep web..."/>
+<div class="absolute right-0 top-0 h-full w-1 bg-primary scale-y-0 group-focus-within:scale-y-100 transition-transform origin-center"></div>
+</div>
+</div>
+<div class="group mt-2">
+<label class="block text-xs font-bold text-slate-400 font-mono uppercase tracking-widest mb-2 flex justify-between items-end">
+<span class="flex items-center gap-2"><span class="material-symbols-outlined text-sm">key</span> Public Key Identity</span>
+<span class="text-[9px] text-accent-red border border-accent-red/30 px-1.5 py-0.5 rounded bg-accent-red/5">READ_ONLY</span>
+</label>
+<div class="w-full bg-[#080808] border border-white/5 p-4 rounded-sm relative group hover:border-white/20 transition-colors tech-dots">
+<p class="font-mono text-[11px] text-emerald-500/90 break-all leading-loose select-all font-medium">
+                                        ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC0g+Z8j9X7q1/
+                                        2y5j9X7q1/2y5j9X7q1/2y5j9X7q1/2y5j9X7q1/2y5j9X7q1
+                                        Kj8s9dF8a7s6D5f4G3h2J1k0L9z8x7c6v5b4n3m2,./
+                                    </p>
+<button class="absolute top-2 right-2 p-1.5 rounded hover:bg-white/10 text-slate-500 hover:text-white transition-colors" title="Copy Key">
+<span class="material-symbols-outlined text-base">content_copy</span>
+</button>
+</div>
+<p class="text-[10px] text-slate-600 mt-1 font-mono pl-1">Generated: 2023-10-24 08:42:11 UTC</p>
+</div>
+</div>
+</div>
+<div class="p-6 border-t border-white/5 bg-white/[0.01] flex justify-between items-center">
+<button class="text-accent-red hover:text-red-400 text-xs font-bold font-mono uppercase tracking-wider flex items-center gap-2 px-3 py-2 hover:bg-accent-red/5 rounded transition-colors">
+<span class="material-symbols-outlined text-sm">delete_forever</span>
+                            Revoke Identity
+                        </button>
+<div class="flex gap-4">
+<button class="px-6 py-3 text-xs font-bold text-slate-400 font-mono border border-white/10 hover:border-white/30 hover:text-white hover:bg-white/5 transition-all uppercase tracking-wider">
+                                Discard
+                            </button>
+<button class="relative px-8 py-3 bg-primary/10 border border-primary text-primary hover:bg-primary hover:text-black text-xs font-bold font-mono transition-all uppercase tracking-wider shadow-[0_0_15px_rgba(0,240,255,0.15)] hover:shadow-[0_0_25px_rgba(0,240,255,0.5)] group overflow-hidden">
+<span class="relative z-10 flex items-center gap-2">
+<span class="material-symbols-outlined text-sm">save</span>
+                                    // Save_Changes
+                                </span>
+<div class="absolute inset-0 bg-primary translate-y-full group-hover:translate-y-0 transition-transform duration-300 z-0"></div>
+</button>
+</div>
+</div>
+</div>
+<div class="mt-8 text-center opacity-30">
+<p class="text-[10px] font-mono text-slate-500">REZ PROTOCOL v4.2.1 • END-TO-END ENCRYPTED</p>
+</div>
+</div>
+</main>
+</div>
+
+</body></html>

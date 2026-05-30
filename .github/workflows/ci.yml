@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# rez-chat tests need all four sibling Rez packages checked out at ../<name>
+# so its `file:..` workspace deps resolve.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rez-chat
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-core
+          path: rez-core
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-sdk
+          path: rez-sdk
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-node
+          path: rez-node
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-ui
+          path: rez-ui
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+      - run: npm install --no-audit --no-fund
+        working-directory: rez-chat
+      - run: npm test
+        working-directory: rez-chat

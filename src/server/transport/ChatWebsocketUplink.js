@@ -1,0 +1,303 @@
+import { WebSocketServer } from "ws";
+import { BridgeRouter, BridgeResponse, BridgeEvent, BRIDGE_ERROR_CODES } from "@rezprotocol/sdk/client";
+import { BridgeClient } from "./BridgeClient.js";
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+export class ChatWebsocketUplink {
+  #server;
+  #chatBridge;
+  #chatServer;
+  #bus;
+  #bridgeToken;
+  #logger;
+  #router;
+  #clients;
+  #serverEventUnsubs;
+  #bridgeReady;
+  #wss;
+  #upgradeHandler;
+
+  constructor({ server, chatBridge = null, chatServer = null, bus = null, bridgeToken = "", logger = console } = {}) {
+    if (!server || typeof server.on !== "function") {
+      throw new Error("ChatWebsocketUplink requires server");
+    }
+    this.#server = server;
+    this.#chatServer = chatServer && typeof chatServer === "object" ? chatServer : null;
+    this.#chatBridge = chatBridge || (chatServer && chatServer.bridge ? chatServer.bridge : null);
+    this.#bus = bus || (chatServer && chatServer.bus ? chatServer.bus : (this.#chatBridge && this.#chatBridge.bus ? this.#chatBridge.bus : null));
+    if (this.#chatBridge && typeof this.#chatBridge.getSpec !== "function") {
+      throw new Error("ChatWebsocketUplink chatBridge must expose getSpec()");
+    }
+    if (this.#chatBridge && (!this.#bus || typeof this.#bus !== "object") && (!this.#chatServer || typeof this.#chatServer.on !== "function")) {
+      throw new Error("ChatWebsocketUplink requires bus or chatServer event emitter");
+    }
+    this.#bridgeToken = typeof bridgeToken === "string" ? bridgeToken : "";
+    this.#logger = logger || console;
+    this.#router = new BridgeRouter();
+    if (this.#chatBridge && typeof this.#chatBridge.getSpec === "function") {
+      this.#router.register(this.#chatBridge.getSpec());
+    }
+    this.#clients = new Map();
+    this.#serverEventUnsubs = [];
+    this.#bridgeReady = false;
+    this.#wss = new WebSocketServer({ noServer: true });
+    this.#upgradeHandler = (req, socket, head) => this.#handleUpgrade(req, socket, head);
+  }
+
+  get ready() {
+    return this.#bridgeReady;
+  }
+
+  get clients() {
+    return this.#clients;
+  }
+
+  get router() {
+    return this.#router;
+  }
+
+  start() {
+    this.#server.on("upgrade", this.#upgradeHandler);
+    this.#wss.on("connection", (ws) => this.#handleConnection(ws));
+    this.#subscribeBridgeEvents();
+    return this;
+  }
+
+  setReady(flag) {
+    this.#bridgeReady = flag === true;
+  }
+
+  async close() {
+    for (const off of this.#serverEventUnsubs.splice(0)) {
+      try {
+        off();
+      } catch {
+        // ignore subscriber cleanup failures
+      }
+    }
+    if (typeof this.#server.off === "function") {
+      this.#server.off("upgrade", this.#upgradeHandler);
+    } else if (typeof this.#server.removeListener === "function") {
+      this.#server.removeListener("upgrade", this.#upgradeHandler);
+    }
+    for (const [, client] of this.#clients) {
+      try {
+        client.close(1001, "server shutdown");
+      } catch {
+        // ignore disconnect failures
+      }
+    }
+    this.#clients.clear();
+    await new Promise((resolve) => {
+      this.#wss.close(() => resolve());
+    });
+  }
+
+  #subscribeBridgeEvents() {
+    if (!this.#chatBridge || typeof this.#chatBridge.getSpec !== "function") return;
+    const spec = this.#chatBridge.getSpec();
+    const events = spec && spec.events && typeof spec.events === "object" ? spec.events : {};
+    for (const eventName of Object.keys(events)) {
+      const handler = (record) => {
+        this.#broadcastEvent(eventName, record, events[eventName]);
+      };
+      if (this.#bus && typeof this.#bus.on === "function") {
+        const off = this.#bus.on(eventName, handler);
+        if (typeof off === "function") {
+          this.#serverEventUnsubs.push(off);
+        }
+        continue;
+      }
+      if (this.#chatServer && typeof this.#chatServer.on === "function") {
+        this.#chatServer.on(eventName, handler);
+        this.#serverEventUnsubs.push(() => {
+          if (this.#chatServer && typeof this.#chatServer.off === "function") {
+            this.#chatServer.off(eventName, handler);
+          } else if (this.#chatServer && typeof this.#chatServer.removeListener === "function") {
+            this.#chatServer.removeListener(eventName, handler);
+          }
+        });
+      }
+    }
+  }
+
+  #handleUpgrade(req, socket, head) {
+    const pathname = this.#normalizePathname(req.url || "/");
+    if (pathname !== "/ws") {
+      socket.destroy();
+      return;
+    }
+    if (!this.#isLoopbackHost(req.headers.host)) {
+      socket.destroy();
+      return;
+    }
+    const origin = req.headers.origin || "";
+    if (origin && !this.#isLoopbackOrigin(origin)) {
+      socket.destroy();
+      return;
+    }
+    this.#wss.handleUpgrade(req, socket, head, (ws) => {
+      this.#wss.emit("connection", ws, req);
+    });
+  }
+
+  #handleConnection(ws) {
+    const client = new BridgeClient({ ws });
+    this.#clients.set(client.id, client);
+    ws.on("message", async (data) => {
+      await this.#handleMessage(client, ws, data);
+    });
+    ws.on("close", () => {
+      this.#clients.delete(client.id);
+    });
+    ws.on("error", () => {
+      this.#clients.delete(client.id);
+    });
+  }
+
+  async #handleMessage(client, ws, data) {
+    let frame = null;
+    try {
+      frame = this.#router.parseFrame(String(data));
+    } catch (err) {
+      this.#sendRawBridgeError(ws, {
+        code: BRIDGE_ERROR_CODES.INTERNAL,
+        message: this.#toErrorMessage(err),
+      });
+      return;
+    }
+
+    if (frame.type !== "bridge.req") return;
+    try {
+      if (frame.method !== "session.hello" && client.authenticated !== true) {
+        client.sendFrame(this.#buildBridgeErrorResponse(frame, {
+          code: BRIDGE_ERROR_CODES.NOT_AUTHENTICATED,
+          message: "Not authenticated — send session.hello first",
+        }));
+        return;
+      }
+      if (frame.method !== "session.hello" && this.#bridgeReady !== true) {
+        client.sendFrame(this.#buildBridgeErrorResponse(frame, {
+          code: BRIDGE_ERROR_CODES.NOT_READY,
+          message: "Server not ready",
+        }));
+        return;
+      }
+      if (frame.method === "session.hello" && this.#bridgeToken) {
+        const helloParams = frame.params && typeof frame.params === "object" ? frame.params : {};
+        const clientToken = typeof helloParams.bridgeToken === "string" ? helloParams.bridgeToken : "";
+        if (!this.#tokensMatch(clientToken, this.#bridgeToken)) {
+          client.sendFrame(this.#buildBridgeErrorResponse(frame, {
+            code: BRIDGE_ERROR_CODES.NOT_AUTHENTICATED,
+            message: "Invalid bridge token",
+          }));
+          return;
+        }
+      }
+      if (!this.#chatBridge || typeof this.#chatBridge.handle !== "function") {
+        client.sendFrame(this.#buildBridgeErrorResponse(frame, {
+          code: BRIDGE_ERROR_CODES.INTERNAL,
+          message: "No bridge handler",
+        }));
+        return;
+      }
+      const params = this.#router.rehydrateParams(frame);
+      const result = await this.#chatBridge.handle(client, frame.method, params);
+      client.sendFrame(new BridgeResponse({
+        ns: frame.ns,
+        reqId: frame.reqId,
+        ok: true,
+        method: frame.method,
+        data: result.toJSON(),
+      }));
+    } catch (err) {
+      client.sendFrame(this.#buildBridgeErrorResponse(frame, {
+        code: BRIDGE_ERROR_CODES.HANDLER_ERROR,
+        message: this.#toErrorMessage(err),
+      }));
+    }
+  }
+
+  #broadcastEvent(eventName, payload, EventClass) {
+    const record = payload instanceof EventClass ? payload : new EventClass(payload);
+    const eventFrame = new BridgeEvent({
+      ns: "chat",
+      event: eventName,
+      data: record.toJSON(),
+    });
+    for (const [, client] of this.#clients) {
+      if (client.authenticated !== true) continue;
+      try {
+        client.sendFrame(eventFrame);
+      } catch {
+        // ignore disconnected clients
+      }
+    }
+  }
+
+  #buildBridgeErrorResponse(frame, error) {
+    const ns = frame && typeof frame.ns === "string" ? frame.ns : "";
+    const reqId = frame && typeof frame.reqId === "string" ? frame.reqId : "";
+    const method = frame && typeof frame.method === "string" ? frame.method : "";
+    return new BridgeResponse({
+      ns,
+      reqId,
+      ok: false,
+      method,
+      error,
+    });
+  }
+
+  #sendRawBridgeError(ws, error) {
+    try {
+      ws.send(JSON.stringify({
+        type: "bridge.res",
+        ns: "",
+        reqId: "",
+        ok: false,
+        method: "",
+        data: null,
+        error,
+      }));
+    } catch {
+      // ignore closed socket
+    }
+  }
+
+  #toErrorMessage(err) {
+    if (err && typeof err.message === "string" && err.message.trim().length > 0) {
+      return err.message;
+    }
+    return String(err);
+  }
+
+  #normalizePathname(urlRaw) {
+    try {
+      const url = new URL(urlRaw, "http://localhost");
+      return url.pathname || "/";
+    } catch {
+      return "/";
+    }
+  }
+
+  #isLoopbackHost(hostHeader) {
+    if (!hostHeader || typeof hostHeader !== "string") return false;
+    const hostname = hostHeader.replace(/:\d+$/, "").toLowerCase();
+    return LOOPBACK_HOSTS.has(hostname);
+  }
+
+  #isLoopbackOrigin(origin) {
+    if (!origin || typeof origin !== "string") return false;
+    try {
+      const url = new URL(origin);
+      return LOOPBACK_HOSTS.has(url.hostname.toLowerCase());
+    } catch {
+      return false;
+    }
+  }
+
+  #tokensMatch(left, right) {
+    return String(left || "") === String(right || "");
+  }
+}
