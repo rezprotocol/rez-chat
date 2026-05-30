@@ -156,7 +156,9 @@ publish:
 asar: true
 asarUnpack:
   - electron/preload.cjs
-  - node_modules/better-sqlite3/**/*.node
+  # Match every native .node binary once. Listing
+  # node_modules/better-sqlite3/**/*.node separately caused electron-builder
+  # to attempt linking better_sqlite3.node twice and fail with EEXIST.
   - node_modules/**/*.node
 # electron-builder's host-platform npm rebuild would overwrite the prebuild
 # we deliberately installed for the target platform/arch via

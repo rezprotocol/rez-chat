@@ -89,24 +89,32 @@ jobs:
         working-directory: rez-chat
 
       - name: Build desktop (${{ matrix.platform }})
-        run: npx electron-builder --config electron-builder.yml --${{ matrix.platform }} --publish never
+        # Empty code-signing env vars trip electron-builder ("cannot resolve
+        # '' as a file"). We pipe each secret through the env block, then
+        # unset any that came in empty before invoking electron-builder.
+        # The `shell: bash` directive applies on Windows too via Git Bash.
+        shell: bash
         working-directory: rez-chat
         env:
-          # electron-updater needs an auth token to know which repo to read.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS code-signing + notarization. If unset, electron-builder
-          # falls back to an unsigned build (Gatekeeper users right-click →
-          # Open to bypass). Friends-test builds can ship unsigned; once you
-          # set the four secrets, the next tagged release is notarized.
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          # Refuse silently-discovered keychain identities when CSC_LINK is
-          # unset — we want either a deliberate signed build (CSC_LINK set)
-          # or a clearly-unsigned build, never a half-signed surprise.
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          # Never silently sign with a keychain identity that happens to be
+          # on the runner — only sign when CSC_LINK / WIN_CSC_LINK is set.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          for var in APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID \
+                     CSC_LINK CSC_KEY_PASSWORD WIN_CSC_LINK WIN_CSC_KEY_PASSWORD; do
+            if [ -z "${!var}" ]; then
+              unset "$var"
+            fi
+          done
+          npx electron-builder --config electron-builder.yml --${{ matrix.platform }} --publish never
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
