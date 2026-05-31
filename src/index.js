@@ -7,7 +7,7 @@ import { loadRezConfig, ChatShellHost, bootstrapChatServer } from "./server/inde
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHAT_ROOT = path.resolve(__dirname, "..");
-const DEFAULT_UI_ROOT = path.resolve(CHAT_ROOT, "../artifacts/rez-chat");
+const DEFAULT_UI_ROOT = path.resolve(CHAT_ROOT, "artifacts/rez-chat");
 const DEFAULT_NODE_DATA_DIR = path.join(".local", "rez-node-data");
 const SHELL_PORT = parseInt(process.env.CHAT_PORT || "3000", 10);
 const SHELL_HOST = process.env.CHAT_BIND_HOST || "127.0.0.1";

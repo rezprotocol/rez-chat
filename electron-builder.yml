@@ -38,6 +38,7 @@ files:
     to: node_modules/rez-ui
     filter:
       - src/**/*
+      - branding/**/*
       - package.json
   # npm-installed prod deps are picked up by electron-builder's automatic
   # production-dependency walk over package.json — we don't need explicit

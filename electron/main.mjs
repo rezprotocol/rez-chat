@@ -14,8 +14,15 @@ import { DesktopTray } from "./runtime/DesktopTray.mjs";
 import { DesktopUpdater } from "./runtime/DesktopUpdater.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(__dirname, "../..");
-const DEFAULT_UI_ROOT = path.resolve(REPO_ROOT, "artifacts", "rez-chat");
+// Standalone rez-chat repo: electron/ lives at the package root. CHAT_ROOT
+// is the rez-chat directory in dev; in the packaged Electron app it's the
+// asar root (Contents/Resources/app.asar/) where rez-chat's files were
+// bundled to.
+const CHAT_ROOT = path.resolve(__dirname, "..");
+// vite outputs to <rez-chat>/artifacts/rez-chat in dev; electron-builder
+// bundles that directory into the asar at the same relative path, so
+// CHAT_ROOT/artifacts/rez-chat resolves correctly in both modes.
+const DEFAULT_UI_ROOT = path.join(CHAT_ROOT, "artifacts", "rez-chat");
 const DEFAULT_DESKTOP_SHELL_PORT = 3410;
 
 const scryptAsync = promisify(scrypt);
@@ -29,7 +36,12 @@ let desktopTray = null;
 let desktopUpdater = null;
 const desktopCrypto = new NodeCryptoProvider();
 
-const TRAY_ICON_PATH = path.resolve(REPO_ROOT, "rez-ui/branding/filled-silhouette/rez-icon-mark-transparent-filled.png");
+// Tray icon: in dev, pull from the sibling rez-ui repo's branding directory.
+// In the packaged app the icon ships under node_modules/rez-ui/branding/ (the
+// electron-builder.yml filter includes branding/** for rez-ui).
+const TRAY_ICON_PATH = app.isPackaged
+  ? path.join(app.getAppPath(), "node_modules", "rez-ui", "branding", "filled-silhouette", "rez-icon-mark-transparent-filled.png")
+  : path.resolve(CHAT_ROOT, "..", "rez-ui", "branding", "filled-silhouette", "rez-icon-mark-transparent-filled.png");
 // Cap how far we look for unread when summing — must be >= ChatThreadIndex MAX_INDEX_SIZE.
 const UNREAD_SUM_LIMIT = 500;
 
@@ -69,14 +81,14 @@ function bindTrayToChatApp(app) {
 function resolveUserDataOverride() {
   const envValue = String(process.env.REZ_CHAT_USER_DATA_DIR || "").trim();
   if (envValue) {
-    return path.isAbsolute(envValue) ? envValue : path.resolve(REPO_ROOT, envValue);
+    return path.isAbsolute(envValue) ? envValue : path.resolve(CHAT_ROOT, envValue);
   }
   const prefix = "--rez-user-data-dir=";
   const arg = process.argv.find((item) => typeof item === "string" && item.startsWith(prefix));
   if (!arg) return null;
   const value = String(arg.slice(prefix.length) || "").trim();
   if (!value) return null;
-  return path.isAbsolute(value) ? value : path.resolve(REPO_ROOT, value);
+  return path.isAbsolute(value) ? value : path.resolve(CHAT_ROOT, value);
 }
 
 function applyUserDataOverride() {
@@ -93,7 +105,7 @@ function isDesktopDev() {
 function resolveUiRoot() {
   const raw = String(process.env.CHAT_UI_ROOT || "").trim();
   if (!raw) return DEFAULT_UI_ROOT;
-  return path.isAbsolute(raw) ? raw : path.resolve(REPO_ROOT, raw);
+  return path.isAbsolute(raw) ? raw : path.resolve(CHAT_ROOT, raw);
 }
 
 function resolveDesktopShellPort() {
