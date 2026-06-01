@@ -18,6 +18,10 @@ export class DesktopAccountListEntry extends RRecord {
     this.label = nonEmptyString(raw.label) || "Account";
     this.accountIdHint = nonEmptyString(raw.accountIdHint);
     this.deviceUnlockEnabled = raw.deviceUnlockEnabled === true;
+    // recoveryEnabled: false ONLY when the bridge explicitly reports a pre-BIP39
+    // account (no recovery phrase). Defaults true when absent so a missing field
+    // never mass-flags valid accounts into the destructive re-create migration.
+    this.recoveryEnabled = raw.recoveryEnabled !== false;
     this._seal();
   }
 

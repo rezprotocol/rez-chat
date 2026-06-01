@@ -87,15 +87,32 @@ export class DesktopSupervisor {
         this.#logger.warn("[desktop] runtime disconnect during stop failed", err && err.message ? err.message : err);
       }
     });
+    // Full chat-app teardown: node + shell. disconnect() already stopped
+    // chat-server (if started) but kept node+shell up for re-login; stop()
+    // means we're done for good.
+    if (this.#chatApp && typeof this.#chatApp.stop === "function") {
+      try {
+        await this.#chatApp.stop();
+      } catch (err) {
+        if (this.#logger && typeof this.#logger.warn === "function") {
+          this.#logger.warn("[desktop] chatApp.stop failed", err && err.message ? err.message : err);
+        }
+      }
+    }
+    this.#chatApp = null;
     this.#vault.close();
     this.#started = false;
   }
 
   status() {
     const vaultStatus = this.#vault.status();
+    // "connected" tracks whether chat-server is actually running, not whether
+    // the chatApp shell is alive. After the deferred-bootstrap refactor the
+    // chatApp survives disconnect (node + shell stay up for re-login); the
+    // chat-server is what comes and goes per unlock.
     return {
       started: this.#started === true,
-      runtimeConnected: this.#chatApp != null,
+      runtimeConnected: this.#chatApp != null && this.#chatApp.chatServer != null,
       vault: vaultStatus,
     };
   }
@@ -163,6 +180,67 @@ export class DesktopSupervisor {
     return this.#vault.getAvatarDataB64(params);
   }
 
+  // ---- BIP39 recovery + change-password + purge --------------------------
+
+  revealMnemonic(params = {}) {
+    return this.#vault.revealMnemonic(params);
+  }
+
+  async resetPasswordWithMnemonic(params = {}) {
+    // Auto-disconnects any live chat-server session since the password reset
+    // also clears device-unlock and re-wraps every envelope; subsequent unlock
+    // is mandatory.
+    if (this.#chatApp) {
+      await this.disconnect();
+    }
+    return this.#vault.resetPasswordWithMnemonic(params);
+  }
+
+  async changePassword(params = {}) {
+    // Same disconnect-first pattern: the vault auto-locks after a successful
+    // change so the user has to unlock with the new password.
+    if (this.#chatApp) {
+      await this.disconnect();
+    }
+    return this.#vault.changePassword(params);
+  }
+
+  exportBackup(params = {}) {
+    // Pure read: produces the encrypted envelope from the active/specified
+    // account. No runtime teardown — the session stays as-is.
+    return this.#vault.exportBackup(params);
+  }
+
+  async importBackup(params = {}) {
+    // Import creates + unlocks a NEW active account; disconnect any live
+    // session first (mirrors resetPasswordWithMnemonic/changePassword).
+    if (this.#chatApp) {
+      await this.disconnect();
+    }
+    return this.#vault.importBackup(params);
+  }
+
+  async purgeAccount(params = {}) {
+    if (this.#chatApp) {
+      await this.disconnect();
+    }
+    // Wipe the chat-server data dir (identity blob, ratchets, messages,
+    // peer-link state) BEFORE deleting the vault row. Otherwise the next
+    // account-create on this device hits a stored chat-server identity
+    // mismatch from the purged account. removeChatServerData is optional on
+    // the chatApp so tests with a minimal fake don't have to implement it.
+    if (this.#chatApp && typeof this.#chatApp.removeChatServerData === "function") {
+      try {
+        this.#chatApp.removeChatServerData();
+      } catch (err) {
+        if (this.#logger && typeof this.#logger.warn === "function") {
+          this.#logger.warn("[desktop] removeChatServerData failed", err && err.message ? err.message : err);
+        }
+      }
+    }
+    return this.#vault.purgeAccount(params);
+  }
+
   async connect() {
     this.#requireUnlocked();
     let chatAppChanged = false;
@@ -172,6 +250,31 @@ export class DesktopSupervisor {
       }
       this.#chatApp = await this.#startRezChat(this.#rezChatOptions);
       chatAppChanged = true;
+    }
+    // Lazy chat-server bootstrap rooted in the vault's BIP39-derived identity.
+    // Optional on the chatApp so test fakes (which pre-populate chatServer)
+    // continue to work. When supported AND chat-server isn't already running,
+    // require an identity from the vault — otherwise we'd silently fall back
+    // to a random identity that doesn't match the user's mnemonic.
+    if (typeof this.#chatApp.startChatServer === "function" && this.#chatApp.chatServer == null) {
+      const chatServerIdentity = typeof this.#vault.getChatServerIdentity === "function"
+        ? this.#vault.getChatServerIdentity()
+        : null;
+      if (!chatServerIdentity) {
+        throw new Error(
+          "DesktopSupervisor.connect: vault has no chat-server identity. "
+          + "Pre-BIP39 accounts must be re-created (Phase 6 migration).",
+        );
+      }
+      // allowChatServerIdentityRotation=true so that pre-existing chat-server
+      // data dirs (carried over from before this refactor) get rotated to the
+      // mnemonic-derived identity instead of throwing on mismatch. Once
+      // Phase 6's pre-BIP39 wipe lands at launch time, this can tighten to
+      // false in steady-state.
+      await this.#chatApp.startChatServer({
+        chatServerIdentity,
+        allowChatServerIdentityRotation: true,
+      });
     }
     if (!this.#busBridge) {
       this.#busBridge = new DesktopBusBridge({ chatApp: this.#chatApp });
@@ -185,13 +288,23 @@ export class DesktopSupervisor {
       this.#busBridge.close();
       this.#busBridge = null;
     }
-    const app = this.#chatApp;
-    const hadChatApp = app != null;
-    this.#chatApp = null;
-    if (app && typeof app.stop === "function") {
-      await app.stop();
+    if (!this.#chatApp) {
+      return this.#runtimeSummary();
     }
-    if (hadChatApp) this.#notifyChatAppListeners();
+    // New lifecycle: stopChatServer keeps node+shell up so the next unlock
+    // doesn't pay full boot cost. Legacy/test path falls back to full stop()
+    // which means chatApp won't survive the disconnect — we null it out so
+    // supervisor.stop() doesn't double-stop.
+    if (typeof this.#chatApp.stopChatServer === "function") {
+      await this.#chatApp.stopChatServer();
+    } else {
+      const app = this.#chatApp;
+      this.#chatApp = null;
+      if (typeof app.stop === "function") {
+        await app.stop();
+      }
+    }
+    this.#notifyChatAppListeners();
     return this.#runtimeSummary();
   }
 
@@ -222,7 +335,7 @@ export class DesktopSupervisor {
     const ownerAccountId = chatOwnerAccountId
       || (active && active.accountId ? active.accountId : null);
     return {
-      connected: this.#chatApp != null,
+      connected: this.#chatApp != null && this.#chatApp.chatServer != null,
       accountId: active && active.accountId ? active.accountId : null,
       deviceId: active && active.deviceId ? active.deviceId : null,
       localInboxId: localInboxId || null,

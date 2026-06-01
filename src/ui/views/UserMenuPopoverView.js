@@ -1,4 +1,4 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 import { materialIcon } from "../base/icon.js";
 
 // Floating popover anchored to a trigger element. Mounted into document.body

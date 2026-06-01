@@ -3,7 +3,7 @@
  */
 import "./styles/fonts.css";
 import "./styles/tailwind.css";
-import "rez-ui/framework/theme.css";
+import "@rezprotocol/ui/framework/theme.css";
 import "./ui/styles.css";
 import { ChatRuntimeConfig } from "./ui/records/ChatRuntimeConfig.js";
 import { ChatRuntimeClient } from "./client/runtime/ChatRuntimeClient.js";

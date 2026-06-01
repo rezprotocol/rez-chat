@@ -7,9 +7,9 @@ export default defineConfig({
     sourcemap: true,
   },
   resolve: {
-    dedupe: ["@rezprotocol/core", "@rezprotocol/sdk", "rez-ui"],
+    dedupe: ["@rezprotocol/core", "@rezprotocol/sdk", "@rezprotocol/ui"],
   },
   optimizeDeps: {
-    include: ["@rezprotocol/core", "@rezprotocol/sdk", "rez-ui"],
+    include: ["@rezprotocol/core", "@rezprotocol/sdk", "@rezprotocol/ui"],
   },
 });

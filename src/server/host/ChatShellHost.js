@@ -121,6 +121,25 @@ export class ChatShellHost {
     }
   }
 
+  /**
+   * Late-attach a chat-server to the running shell's WS uplink. Used by the
+   * deferred-bootstrap path so the shell can serve the login UI before the
+   * vault is unlocked, then have chat-server wired through after unlock.
+   */
+  attachChatServer(chatServer) {
+    if (!this.#bridge) throw new Error("ChatShellHost.attachChatServer: shell not started");
+    this.#chatServer = chatServer;
+    this.#chatBridge = chatServer && chatServer.bridge ? chatServer.bridge : null;
+    this.#bridge.attachChatServer(chatServer);
+  }
+
+  detachChatServer() {
+    if (!this.#bridge) return;
+    this.#bridge.detachChatServer();
+    this.#chatServer = null;
+    this.#chatBridge = null;
+  }
+
   async #assertUiRoot() {
     if (this.#skipUiRootCheck) return;
     const indexPath = path.resolve(this.#uiRoot, "index.html");

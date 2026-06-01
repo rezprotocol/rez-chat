@@ -68,6 +68,64 @@ export class ChatWebsocketUplink {
     this.#bridgeReady = flag === true;
   }
 
+  /**
+   * Late-attach a chat-server after `start()`. Used by the deferred-bootstrap
+   * path: at boot the shell comes up with no chat-server (so the login UI can
+   * render before vault unlock); once the vault unlocks and chat-server has
+   * bootstrapped against the BIP39-derived identity, the supervisor calls this
+   * to wire bus events through and flip ready=true.
+   *
+   * Idempotent: re-attaching the same chat-server is a no-op; attaching a new
+   * chat-server detaches the old one first.
+   */
+  attachChatServer(chatServer) {
+    if (!chatServer || typeof chatServer !== "object") {
+      throw new Error("ChatWebsocketUplink.attachChatServer requires chatServer");
+    }
+    if (this.#chatServer === chatServer) {
+      return;
+    }
+    if (this.#chatServer != null) {
+      this.detachChatServer();
+    }
+    const bridge = chatServer.bridge && typeof chatServer.bridge.getSpec === "function" ? chatServer.bridge : null;
+    if (!bridge) {
+      throw new Error("ChatWebsocketUplink.attachChatServer: chatServer.bridge with getSpec() is required");
+    }
+    const bus = chatServer.bus && typeof chatServer.bus === "object" ? chatServer.bus : null;
+    if (!bus && typeof chatServer.on !== "function") {
+      throw new Error("ChatWebsocketUplink.attachChatServer: chatServer must expose bus or on/off");
+    }
+    this.#chatServer = chatServer;
+    this.#chatBridge = bridge;
+    this.#bus = bus;
+    this.#router.register(bridge.getSpec());
+    this.#subscribeBridgeEvents();
+    this.#bridgeReady = true;
+  }
+
+  /**
+   * Tear down the current chat-server attachment: unsubscribe events, clear
+   * refs, and flip ready=false so in-flight frames get NOT_READY back. Does
+   * NOT close client sockets — they stay connected and can re-handshake once
+   * a new chat-server attaches.
+   */
+  detachChatServer() {
+    for (const off of this.#serverEventUnsubs.splice(0)) {
+      try {
+        off();
+      } catch (err) {
+        if (this.#logger && typeof this.#logger.warn === "function") {
+          this.#logger.warn("[uplink] event-unsub failed", err && err.message ? err.message : err);
+        }
+      }
+    }
+    this.#chatServer = null;
+    this.#chatBridge = null;
+    this.#bus = null;
+    this.#bridgeReady = false;
+  }
+
   async close() {
     for (const off of this.#serverEventUnsubs.splice(0)) {
       try {

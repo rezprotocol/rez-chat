@@ -1,4 +1,4 @@
-import { Component } from "rez-ui/framework";
+import { Component } from "@rezprotocol/ui/framework";
 
 /**
  * BusComponent: a Component that has access to the application bus.

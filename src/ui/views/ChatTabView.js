@@ -1,4 +1,4 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { ThreadListFilterView } from "./ThreadListFilterView.js";
 import { ThreadListView } from "./ThreadListView.js";

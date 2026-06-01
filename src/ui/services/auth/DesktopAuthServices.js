@@ -229,6 +229,70 @@ export class DesktopAccountAuthService {
     return result;
   }
 
+  async revealMnemonic({ accountId = null, password = "" } = {}) {
+    if (!this._desktop.vault || typeof this._desktop.vault.revealMnemonic !== "function") {
+      throw new Error("Recovery phrase unavailable: bridge does not expose vault.revealMnemonic");
+    }
+    return this._desktop.vault.revealMnemonic({ accountId, password });
+  }
+
+  async resetPasswordWithMnemonic({ accountId = null, mnemonic = "", newPassword = "" } = {}) {
+    if (!this._desktop.vault || typeof this._desktop.vault.resetPasswordWithMnemonic !== "function") {
+      throw new Error("Recovery unavailable: bridge does not expose vault.resetPasswordWithMnemonic");
+    }
+    const result = await this._desktop.vault.resetPasswordWithMnemonic({ accountId, mnemonic, newPassword });
+    // Vault auto-locks after reset; refresh account list so the UI can show
+    // the cleared device-unlock state.
+    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    return result;
+  }
+
+  async exportBackup({ accountId = null, password = "" } = {}) {
+    if (!this._desktop.vault || typeof this._desktop.vault.exportBackup !== "function") {
+      throw new Error("Backup unavailable: bridge does not expose vault.exportBackup");
+    }
+    return this._desktop.vault.exportBackup({ accountId, password });
+  }
+
+  async importBackup({ encryptedBackup = null, mnemonic = "", newPassword = "" } = {}) {
+    if (!this._desktop.vault || typeof this._desktop.vault.importBackup !== "function") {
+      throw new Error("Restore unavailable: bridge does not expose vault.importBackup");
+    }
+    // Import creates + unlocks the restored account; complete auth the same way
+    // createAccount/unlock do so the session lands UNLOCKED.
+    const result = await this._desktop.vault.importBackup({ encryptedBackup, mnemonic, newPassword });
+    await this.#completeAuth(result);
+    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    return result;
+  }
+
+  async changePassword({ accountId = null, oldPassword = "", newPassword = "" } = {}) {
+    if (!this._desktop.vault || typeof this._desktop.vault.changePassword !== "function") {
+      throw new Error("Change password unavailable: bridge does not expose vault.changePassword");
+    }
+    const result = await this._desktop.vault.changePassword({ accountId, oldPassword, newPassword });
+    this._account = null;
+    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    this._authStore.setLocked({ keystoreMeta: null });
+    return result;
+  }
+
+  async purgeAccount({ accountId = null, password = "" } = {}) {
+    if (!this._desktop.vault || typeof this._desktop.vault.purgeAccount !== "function") {
+      throw new Error("Delete account unavailable: bridge does not expose vault.purgeAccount");
+    }
+    const result = await this._desktop.vault.purgeAccount({ accountId, password });
+    this._account = null;
+    const list = await this._authBootstrapService.listAccounts();
+    this._authStore.setAccountList(list);
+    if (list.length === 0) {
+      this._authStore.setNoKeystore();
+    } else {
+      this._authStore.setLocked({ keystoreMeta: null });
+    }
+    return result;
+  }
+
   async logout() {
     this._account = null;
     await this._desktop.vault.lock();

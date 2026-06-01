@@ -32,6 +32,109 @@ export class SessionService extends BaseBusService {
     this._register("session", "inspectBootstrap", () => this.inspectBootstrap());
     this._register("session", "updateProfile", (payload) => this.updateProfile(payload));
     this._register("session", "getOwnAvatar", (payload) => this.getOwnAvatar(payload));
+    this._register("session", "revealMnemonic", (payload) => this.revealMnemonic(payload));
+    this._register("session", "changePassword", (payload) => this.changePassword(payload));
+    this._register("session", "resetPasswordWithMnemonic", (payload) => this.resetPasswordWithMnemonic(payload));
+    this._register("session", "exportBackup", (payload) => this.exportBackup(payload));
+    this._register("session", "importBackup", (payload) => this.importBackup(payload));
+    this._register("session", "purgeAccount", (payload) => this.purgeAccount(payload));
+  }
+
+  async exportBackup({ password = "" } = {}) {
+    const accountId = this._resolveAccountId();
+    if (!accountId) throw new Error("exportBackup: no active account");
+    return this._accountAuthService.exportBackup({ accountId, password });
+  }
+
+  async importBackup({ encryptedBackup = null, mnemonic = "", newPassword = "" } = {}) {
+    // Import creates + unlocks a new active account (fresh-device restore).
+    // Tear down any stale runtime first, then complete unlock + connect the
+    // same way unlock() does.
+    this._runtimeConnectSeq += 1;
+    try {
+      await this.bus.call("runtime", "disconnect", {});
+    } catch (err) {
+      if (this._logger && typeof this._logger.warn === "function") {
+        this._logger.warn("runtime disconnect failed during importBackup", err && err.message ? err.message : err);
+      }
+    }
+    this._sessionStore.setUnlocking();
+    try {
+      const unlocked = await this._accountAuthService.importBackup({ encryptedBackup, mnemonic, newPassword });
+      this._completeUnlock(unlocked);
+      return this._sessionStore.snapshot();
+    } catch (err) {
+      const message = err && err.message ? err.message : "Restore failed.";
+      this._syncFromAuth();
+      if (this._sessionStore.snapshot().status === SESSION_STATUS.UNLOCKING) {
+        this._sessionStore.setLocked({ error: message });
+      }
+      this.bus.emit("session.restore.failed", { message });
+      throw err;
+    }
+  }
+
+  async revealMnemonic({ password = "" } = {}) {
+    const accountId = this._resolveAccountId();
+    if (!accountId) throw new Error("revealMnemonic: no active account");
+    return this._accountAuthService.revealMnemonic({ accountId, password });
+  }
+
+  async changePassword({ oldPassword = "", newPassword = "" } = {}) {
+    const accountId = this._resolveAccountId();
+    if (!accountId) throw new Error("changePassword: no active account");
+    // ChangePassword auto-locks the vault; tear down runtime alongside so the
+    // UI is in a clean LOCKED state for the next unlock.
+    this._runtimeConnectSeq += 1;
+    try {
+      await this.bus.call("runtime", "disconnect", {});
+    } catch (err) {
+      if (this._logger && typeof this._logger.warn === "function") {
+        this._logger.warn("runtime disconnect failed during changePassword", err && err.message ? err.message : err);
+      }
+    }
+    const result = await this._accountAuthService.changePassword({ accountId, oldPassword, newPassword });
+    this._syncFromAuth();
+    this.bus.emit("session.passwordChanged", { accountId });
+    return result;
+  }
+
+  async resetPasswordWithMnemonic({ accountId: explicitId = null, mnemonic = "", newPassword = "" } = {}) {
+    const accountId = String(explicitId == null ? "" : explicitId).trim() || this._resolveAccountId();
+    if (!accountId) throw new Error("resetPasswordWithMnemonic: accountId is required");
+    this._runtimeConnectSeq += 1;
+    try {
+      await this.bus.call("runtime", "disconnect", {});
+    } catch (err) {
+      if (this._logger && typeof this._logger.warn === "function") {
+        this._logger.warn("runtime disconnect failed during resetPasswordWithMnemonic", err && err.message ? err.message : err);
+      }
+    }
+    const result = await this._accountAuthService.resetPasswordWithMnemonic({ accountId, mnemonic, newPassword });
+    this._syncFromAuth();
+    this.bus.emit("session.passwordReset", { accountId });
+    return result;
+  }
+
+  async purgeAccount({ accountId = null, password = "" } = {}) {
+    // Explicit accountId supports purging a LOCKED account (the Phase 6
+    // pre-BIP39 re-create migration, where nothing is unlocked). When omitted,
+    // fall back to the active account (the delete-from-settings flow).
+    const explicitId = String(accountId == null ? "" : accountId).trim();
+    const targetId = explicitId || this._resolveAccountId();
+    if (!targetId) throw new Error("purgeAccount: no account specified");
+    this._runtimeConnectSeq += 1;
+    try {
+      await this.bus.call("runtime", "disconnect", {});
+    } catch (err) {
+      if (this._logger && typeof this._logger.warn === "function") {
+        this._logger.warn("runtime disconnect failed during purgeAccount", err && err.message ? err.message : err);
+      }
+    }
+    const result = await this._accountAuthService.purgeAccount({ accountId: targetId, password });
+    this._syncFromAuth();
+    this.bus.emit("session.purged", { accountId: targetId });
+    return result;
   }
 
   async init() {

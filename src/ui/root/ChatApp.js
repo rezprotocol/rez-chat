@@ -1,4 +1,4 @@
-import { Host } from "rez-ui/framework";
+import { Host } from "@rezprotocol/ui/framework";
 import { IndexedDbStorageProvider } from "@rezprotocol/sdk/client";
 import { ChatBus } from "./ChatBus.js";
 import { SessionStore, SESSION_STATUS } from "../stores/SessionStore.js";

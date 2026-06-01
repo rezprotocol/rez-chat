@@ -1,7 +1,10 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { materialIcon } from "../base/icon.js";
 import { OwnAvatarView } from "./OwnAvatarView.js";
+import { ResetPasswordWithPhraseModal } from "./ResetPasswordWithPhraseModal.js";
+import { ImportBackupModal } from "./ImportBackupModal.js";
+import { LegacyAccountMigrationModal } from "./LegacyAccountMigrationModal.js";
 import { SESSION_STATUS } from "../stores/SessionStore.js";
 
 const REZ_FULL_LOGO_URL = new URL(
@@ -39,6 +42,9 @@ export class LoginUnlockView extends BusComponent {
     if (!selectedAccountId) return;
     const selected = sessionStore.accountEntry(selectedAccountId);
     if (!selected || selected.deviceUnlockEnabled !== true) return;
+    // Never auto-unlock a pre-BIP39 account — it would succeed at the vault but
+    // fail at connect(). The lock screen routes it through re-create instead.
+    if (selected.recoveryEnabled === false) return;
     this.#autoPromptAttempted = true;
     this.bus.call("session", "unlockWithDevice", { accountId: selectedAccountId }).catch((err) => {
       const code = err && err.code ? String(err.code) : "";
@@ -57,6 +63,9 @@ export class LoginUnlockView extends BusComponent {
     const accountList = sessionStore.accountList();
     const selectedAccount = sessionStore.selectedAccountEntry();
     const selectedDeviceUnlockEnabled = !!(selectedAccount && selectedAccount.deviceUnlockEnabled === true);
+    // Pre-BIP39 account selected: no recovery phrase, no backup, no unlock path
+    // that survives connect(). Refuse the unlock form and route to re-create.
+    const selectedIsLegacy = !!(selectedAccount && selectedAccount.recoveryEnabled === false);
     const otherAccounts = sessionStore.otherAccountEntries();
     const busy = status === SESSION_STATUS.UNLOCKING || status === SESSION_STATUS.INITIALIZING;
 
@@ -133,6 +142,16 @@ export class LoginUnlockView extends BusComponent {
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "session.disableDeviceUnlock",
       }, "FORGET_DEVICE_UNLOCK") : null,
+      selectedAccountId && !selectedIsLegacy ? h("button", {
+        type: "button",
+        className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
+        "data-action": "session.forgotPassword",
+      }, "FORGOT_PASSWORD") : null,
+      h("button", {
+        type: "button",
+        className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
+        "data-action": "session.restoreBackup",
+      }, "RESTORE_FROM_BACKUP"),
       accountList.length === 0 ? h("button", {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
@@ -151,10 +170,32 @@ export class LoginUnlockView extends BusComponent {
       ]),
     ]);
 
+    // Pre-BIP39 account: swap the password/DECRYPT controls for a re-create
+    // notice + button. The unlock form is deliberately absent so the account
+    // cannot be unlocked into a broken (connect-failing) state.
+    const legacyPanel = selectedIsLegacy ? h("div", { className: "w-full flex flex-col gap-space-sm" }, [
+      h("div", {
+        className: "w-full px-space-md py-space-sm rounded-lg border border-error/40 bg-error/10 text-error font-label-technical text-label-technical",
+      }, "This account predates recovery phrases and can't be unlocked. Re-create it to enable recovery — its local data on this device will be deleted."),
+      h("button", {
+        type: "button",
+        className: "decrypt-glow w-full bg-error/90 text-on-error font-label-technical text-label-technical py-2.5 rounded-lg flex items-center justify-center space-x-2 active:scale-[0.98] transition-all duration-200 group",
+        "data-action": "session.migrateLegacy",
+      }, [
+        materialIcon("autorenew", { size: 18, className: "group-hover:animate-pulse" }),
+        h("span", { className: "font-extrabold tracking-widest" }, "RE-CREATE ACCOUNT"),
+      ]),
+    ]) : null;
+
     const form = h("form", {
       className: "w-full space-y-space-md",
       "data-role": "unlock-form",
-    }, [
+    }, selectedIsLegacy ? [
+      identityPill,
+      switchList,
+      legacyPanel,
+      footerLinks,
+    ] : [
       identityPill,
       switchList,
       passcodeField,
@@ -196,7 +237,7 @@ export class LoginUnlockView extends BusComponent {
       h("div", { className: "w-full max-w-[420px] z-10" }, [card]),
     ]);
 
-    this.#wireFormHandlers(main, passwordInput, selectedAccountId, status);
+    this.#wireFormHandlers(main, passwordInput, selectedAccountId, status, selectedIsLegacy);
 
     this._rootEl.replaceChildren(main);
     this.#mountAvatarViews(main, accountList);
@@ -254,7 +295,7 @@ export class LoginUnlockView extends BusComponent {
     ]);
   }
 
-  #wireFormHandlers(rootEl, passwordInput, selectedAccountId, status) {
+  #wireFormHandlers(rootEl, passwordInput, selectedAccountId, status, selectedIsLegacy) {
     rootEl.querySelectorAll("[data-account-id]").forEach((el) => {
       el.addEventListener("click", () => {
         const accountId = el.getAttribute("data-account-id");
@@ -269,6 +310,8 @@ export class LoginUnlockView extends BusComponent {
     if (unlockForm) {
       unlockForm.addEventListener("submit", (event) => {
         event.preventDefault();
+        // A legacy account has no password field; ignore a stray Enter-submit.
+        if (selectedIsLegacy) return;
         if (status === SESSION_STATUS.UNLOCKING || status === SESSION_STATUS.INITIALIZING) return;
         const rememberEl = rootEl.querySelector("[data-role='remember-device']");
         const enableDeviceUnlock = !!(rememberEl && rememberEl.checked);
@@ -290,6 +333,27 @@ export class LoginUnlockView extends BusComponent {
           console.error("[LoginUnlockView] disable device unlock failed", err);
           this.bus.emit("app.error", { source: "LoginUnlockView", message: "disable device unlock failed", severity: "warn", err });
         });
+      });
+    }
+
+    const forgotPasswordButton = rootEl.querySelector("[data-action='session.forgotPassword']");
+    if (forgotPasswordButton) {
+      forgotPasswordButton.addEventListener("click", () => {
+        new ResetPasswordWithPhraseModal({ bus: this.bus, accountId: selectedAccountId || "" }).open();
+      });
+    }
+
+    const restoreBackupButton = rootEl.querySelector("[data-action='session.restoreBackup']");
+    if (restoreBackupButton) {
+      restoreBackupButton.addEventListener("click", () => {
+        new ImportBackupModal({ bus: this.bus }).open();
+      });
+    }
+
+    const migrateLegacyButton = rootEl.querySelector("[data-action='session.migrateLegacy']");
+    if (migrateLegacyButton) {
+      migrateLegacyButton.addEventListener("click", () => {
+        new LegacyAccountMigrationModal({ bus: this.bus, accountId: selectedAccountId || "" }).open();
       });
     }
 

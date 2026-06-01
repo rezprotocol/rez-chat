@@ -93,35 +93,30 @@ export async function startRezChat(options = {}) {
   // Shape A ships and a hosted node is allowed, chat-server's storage and
   // identity stay on the user's device while the node's storage moves to
   // the operator's host.
-  let chatServer = null;
-  let ownerAccountId = "";
+  // Capture the node's identity pubkey now so chat-server bootstrap later can
+  // pin against it (defeating cross-node session-auth forwarding —
+  // docs/SECURITY_AUDIT.md CRITICAL-2).
+  let expectedNodePublicKeyB64 = "";
   if (nodeApp) {
-    // Pin the chat-server's SDK to this in-process node's identity pubkey.
-    // The SDK refuses to authenticate against any node whose challenge
-    // claims a different pubkey, defeating cross-node session-auth
-    // forwarding (docs/SECURITY_AUDIT.md CRITICAL-2).
     const nodeIdentity = nodeApp.runtime && typeof nodeApp.runtime.getIdentity === "function"
       ? nodeApp.runtime.getIdentity()
       : null;
-    const expectedNodePublicKeyB64 = nodeIdentity && typeof nodeIdentity.nodePublicKeyB64 === "string"
+    expectedNodePublicKeyB64 = nodeIdentity && typeof nodeIdentity.nodePublicKeyB64 === "string"
       ? nodeIdentity.nodePublicKeyB64.trim()
       : "";
     if (!expectedNodePublicKeyB64) {
       throw new Error("rez-chat bootstrap: launched node missing nodePublicKeyB64 — cannot pin SDK to node identity");
     }
-    const bootstrapped = await bootstrapChatServer({
-      nodeDataDir: config.node.storage.dataDir,
-      wsUrl,
-      expectedNodePublicKeyB64,
-    });
-    chatServer = bootstrapped.chatServer;
-    ownerAccountId = bootstrapped.ownerAccountId;
   }
 
   const bridgeToken = randomBytes(32).toString("base64url");
 
   const shellPort = options.shellPort ?? SHELL_PORT;
   const shellHost = options.shellHost ?? SHELL_HOST;
+  // Shell comes up with chatServer=null so the login UI can render before
+  // vault unlock. Chat-server is bootstrapped lazily via startChatServer()
+  // below, after the vault yields the BIP39-derived identity. The WS uplink
+  // returns NOT_READY for any chat directive until then.
   const shell = await new ChatShellHost({
     uiRoot,
     wsUrl,
@@ -129,22 +124,9 @@ export async function startRezChat(options = {}) {
     host: shellHost,
     skipUiRootCheck,
     e2eDebug: String(process.env.REZ_E2E_DEBUG || "").trim() === "1",
-    chatServer,
+    chatServer: null,
     bridgeToken,
   }).start();
-
-  // Start chatServer in background — shell is already serving, browser can load
-  if (chatServer) {
-    chatServer.start()
-      .then(() => {
-        shell.bridge.setReady(true);
-        chatLog("log", "chatServer started, bridge ready");
-      })
-      .catch((err) => {
-        const msg = err && err.message ? err.message : String(err);
-        chatLog("error", "chatServer start failed:", msg);
-      });
-  }
 
   const shellAddr = shell.address || {};
   const resolvedShellHost =
@@ -156,26 +138,95 @@ export async function startRezChat(options = {}) {
     : shellPort;
   chatLog("log", `${process.env.CHAT_ID || "rez-chat"} shell http://${resolvedShellHost}:${resolvedShellPort} ws ${wsUrl}`);
 
-  return {
+  // chatServerState is mutated by start/stopChatServer; the chatServer getter
+  // surfaces its current value to consumers (DesktopSupervisor, tests).
+  // chatAppStopped guards the full stop() against double-teardown — the
+  // supervisor calls stop() during its own stop(), but tests sometimes also
+  // call chatApp.stop() directly afterwards.
+  let chatServerState = null;
+  let chatAppStopped = false;
+
+  const chatApp = {
     config,
     configPath,
     configCreated: created,
     nodeApp,
-    chatServer,
     shell,
     wsUrl,
-    async stop() {
-      if (chatServer) {
-        await chatServer.stop().catch((err) => {
-          chatLog("warn", "chatServer stop failed:", err && err.message ? err.message : err);
-        });
+    get chatServer() {
+      return chatServerState ? chatServerState.chatServer : null;
+    },
+    get ownerAccountId() {
+      return chatServerState ? chatServerState.ownerAccountId : "";
+    },
+
+    /**
+     * Bootstraps and starts chat-server using the BIP39-derived identity from
+     * the vault. Idempotent: if chat-server is already running, returns the
+     * existing state. The shell's WS uplink late-attaches and flips ready=true
+     * once chat-server.start() resolves.
+     *
+     * `chatServerIdentity` MUST come from `DesktopVaultService.getChatServerIdentity()`
+     * — that's the only source that derives it from the user's mnemonic.
+     */
+    async startChatServer({ chatServerIdentity = null, allowChatServerIdentityRotation = false } = {}) {
+      if (chatServerState) return chatServerState;
+      if (!chatServerIdentity || !chatServerIdentity.accountId || !chatServerIdentity.publicKeyB64 || !chatServerIdentity.privateKeyB64) {
+        throw new Error("startChatServer requires chatServerIdentity with accountId/publicKeyB64/privateKeyB64");
       }
+      const bootstrapped = await bootstrapChatServer({
+        nodeDataDir: config.node.storage.dataDir,
+        wsUrl,
+        expectedNodePublicKeyB64,
+        expectedChatServerIdentity: chatServerIdentity,
+        allowChatServerIdentityRotation: allowChatServerIdentityRotation === true,
+      });
+      await bootstrapped.chatServer.start();
+      shell.attachChatServer(bootstrapped.chatServer);
+      chatServerState = bootstrapped;
+      chatLog("log", "chatServer started, bridge ready (acct=" + bootstrapped.ownerAccountId + ")");
+      return chatServerState;
+    },
+
+    /**
+     * Stops chat-server but keeps node + shell up so a subsequent
+     * startChatServer (e.g. re-login after logout) doesn't have to rebuild
+     * everything. Idempotent.
+     */
+    async stopChatServer() {
+      if (!chatServerState) return;
+      const state = chatServerState;
+      chatServerState = null;
+      shell.detachChatServer();
+      try {
+        await state.chatServer.stop();
+      } catch (err) {
+        chatLog("warn", "chatServer stop failed:", err && err.message ? err.message : err);
+      }
+    },
+
+    /**
+     * Recursively delete the chat-server data dir (identity blob, ratchets,
+     * messages, etc.). Caller MUST have already called stopChatServer().
+     * Used by DesktopSupervisor.purgeAccount.
+     */
+    removeChatServerData() {
+      const dir = path.join(config.node.storage.dataDir, "chat-server");
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+
+    async stop() {
+      if (chatAppStopped) return;
+      chatAppStopped = true;
+      await this.stopChatServer();
       await shell.stop();
       if (nodeApp && typeof nodeApp.stop === "function") {
         await nodeApp.stop();
       }
     },
   };
+
+  return chatApp;
 }
 
 export async function start() {

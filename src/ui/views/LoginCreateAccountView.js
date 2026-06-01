@@ -1,6 +1,8 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { materialIcon } from "../base/icon.js";
+import { RecoveryPhraseDisplayModal } from "./RecoveryPhraseDisplayModal.js";
+import { ImportBackupModal } from "./ImportBackupModal.js";
 
 const REZ_FULL_LOGO_URL = new URL(
   "../../../../rez-ui/branding/filled-silhouette/rez-icon-full-transparent-filled.png",
@@ -93,6 +95,11 @@ export class LoginCreateAccountView extends BusComponent {
       h("button", {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
+        "data-action": "session.restoreBackup",
+      }, "Restore From Backup"),
+      h("button", {
+        type: "button",
+        className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "session.inspectBootstrap",
       }, "AUTH_DEBUG"),
     ]);
@@ -166,10 +173,26 @@ export class LoginCreateAccountView extends BusComponent {
     if (createForm) {
       createForm.addEventListener("submit", (event) => {
         event.preventDefault();
+        // Capture the password before the await: create() unlocks the session,
+        // which switches the scene to 'main' and tears down this view's inputs.
+        const capturedPassword = String(createPasswordInput.value || "");
         this.bus.call("session", "create", {
           name: nameInput.value,
-          password: createPasswordInput.value,
+          password: capturedPassword,
           confirmPassword: confirmInput.value,
+        }).then(() => {
+          // Session is now UNLOCKED. Reveal the freshly-minted mnemonic with the
+          // captured password and show it for confirmation. The modal mounts on
+          // document.body (outside the scene Host), so it survives the scene
+          // switch to 'main'.
+          return this.bus.call("session", "revealMnemonic", { password: capturedPassword });
+        }).then((result) => {
+          const mnemonic = result && typeof result.mnemonic === "string" ? result.mnemonic : "";
+          // A reveal failure is non-fatal: the account already exists and the
+          // user can show the phrase later from Profile Settings. Only open the
+          // confirmation modal when we actually have a phrase to show.
+          if (!mnemonic) return;
+          new RecoveryPhraseDisplayModal({ bus: this.bus, initialMnemonic: mnemonic }).open();
         }).catch((err) => {
           console.error("[LoginCreateAccountView] create account failed", err);
           this.bus.emit("app.error", { source: "LoginCreateAccountView", message: "create account failed", severity: "warn", err });
@@ -185,6 +208,13 @@ export class LoginCreateAccountView extends BusComponent {
         });
       });
     }
+    const restoreBackupButton = rootEl.querySelector("[data-action='session.restoreBackup']");
+    if (restoreBackupButton) {
+      restoreBackupButton.addEventListener("click", () => {
+        new ImportBackupModal({ bus: this.bus }).open();
+      });
+    }
+
     const inspectButton = rootEl.querySelector("[data-action='session.inspectBootstrap']");
     if (inspectButton) {
       inspectButton.addEventListener("click", () => {

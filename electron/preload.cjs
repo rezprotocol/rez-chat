@@ -89,6 +89,16 @@ contextBridge.exposeInMainWorld("rezDesktop", {
     getAvatarFileHash: (params) => unwrap(ipcRenderer.invoke("desktop:vault:getAvatarFileHash", params || {})),
     setAvatarDataB64: (params) => unwrap(ipcRenderer.invoke("desktop:vault:setAvatarDataB64", params || {})),
     getAvatarDataB64: (params) => unwrap(ipcRenderer.invoke("desktop:vault:getAvatarDataB64", params || {})),
+    revealMnemonic: (params) => unwrap(ipcRenderer.invoke("desktop:vault:revealMnemonic", params || {})),
+    resetPasswordWithMnemonic: (params) => unwrap(ipcRenderer.invoke("desktop:vault:resetPasswordWithMnemonic", params || {})),
+    changePassword: (params) => unwrap(ipcRenderer.invoke("desktop:vault:changePassword", params || {})),
+    exportBackup: (params) => unwrap(ipcRenderer.invoke("desktop:vault:exportBackup", params || {})),
+    importBackup: (params) => unwrap(ipcRenderer.invoke("desktop:vault:importBackup", params || {})),
+    purgeAccount: (params) => unwrap(ipcRenderer.invoke("desktop:vault:purgeAccount", params || {})),
+  },
+  backup: {
+    saveToFile: (params) => unwrap(ipcRenderer.invoke("desktop:backup:saveToFile", params || {})),
+    openFile: () => unwrap(ipcRenderer.invoke("desktop:backup:openFile")),
   },
   runtime: {
     connect: () => unwrap(ipcRenderer.invoke("desktop:runtime:connect")),

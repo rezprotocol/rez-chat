@@ -85,6 +85,12 @@ export function registerDesktopRuntimeIpc({ ipcMain, supervisor, biometricGate =
   ipcMain.handle("desktop:vault:getAvatarFileHash", (_event, args = {}) => invoke((params) => supervisor.getAvatarFileHash(params), args));
   ipcMain.handle("desktop:vault:setAvatarDataB64", (_event, args = {}) => invoke((params) => supervisor.setAvatarDataB64(params), args));
   ipcMain.handle("desktop:vault:getAvatarDataB64", (_event, args = {}) => invoke((params) => supervisor.getAvatarDataB64(params), args));
+  ipcMain.handle("desktop:vault:revealMnemonic", (_event, args = {}) => invoke((params) => supervisor.revealMnemonic(params), args));
+  ipcMain.handle("desktop:vault:resetPasswordWithMnemonic", (_event, args = {}) => invoke((params) => supervisor.resetPasswordWithMnemonic(params), args));
+  ipcMain.handle("desktop:vault:changePassword", (_event, args = {}) => invoke((params) => supervisor.changePassword(params), args));
+  ipcMain.handle("desktop:vault:exportBackup", (_event, args = {}) => invoke((params) => supervisor.exportBackup(params), args));
+  ipcMain.handle("desktop:vault:importBackup", (_event, args = {}) => invoke((params) => supervisor.importBackup(params), args));
+  ipcMain.handle("desktop:vault:purgeAccount", (_event, args = {}) => invoke((params) => supervisor.purgeAccount(params), args));
 
   ipcMain.handle("desktop:runtime:status", () => invoke(() => supervisor.status()));
   ipcMain.handle("desktop:runtime:connect", () => invoke(async () => {

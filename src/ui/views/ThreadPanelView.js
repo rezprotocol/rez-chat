@@ -1,4 +1,4 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { materialIcon } from "../base/icon.js";
 import { ChatHeaderView } from "./ChatHeaderView.js";

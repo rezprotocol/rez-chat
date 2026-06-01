@@ -1,4 +1,4 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 import { ModalView } from "./ModalView.js";
 import { materialIcon } from "../base/icon.js";
 

@@ -34,8 +34,8 @@ files:
     filter:
       - src/**/*
       - package.json
-  - from: node_modules/rez-ui
-    to: node_modules/rez-ui
+  - from: node_modules/@rezprotocol/ui
+    to: node_modules/@rezprotocol/ui
     filter:
       - src/**/*
       - branding/**/*

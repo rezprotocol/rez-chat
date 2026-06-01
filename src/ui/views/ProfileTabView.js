@@ -1,4 +1,4 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { ProfileSettingsView } from "./ProfileSettingsView.js";
 
@@ -21,7 +21,7 @@ export class ProfileTabView extends BusComponent {
         h("h1", { className: "text-headline-md font-headline-md text-on-surface" }, "Profile"),
       ]),
     ]);
-    const main = h("section", { className: "flex-1 min-w-0 flex flex-col relative" }, []);
+    const main = h("section", { className: "flex-1 min-w-0 flex flex-col relative chat-canvas-recessed" }, []);
 
     this._rootEl.replaceChildren(h("div", { className: "flex h-full w-full min-h-0" }, [sidebar, main]));
 

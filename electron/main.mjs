@@ -36,11 +36,12 @@ let desktopTray = null;
 let desktopUpdater = null;
 const desktopCrypto = new NodeCryptoProvider();
 
-// Tray icon: in dev, pull from the sibling rez-ui repo's branding directory.
-// In the packaged app the icon ships under node_modules/rez-ui/branding/ (the
-// electron-builder.yml filter includes branding/** for rez-ui).
+// Tray icon: in dev, pull from the sibling rez-ui repo's branding directory
+// (the on-disk folder is still named rez-ui). In the packaged app the icon
+// ships under node_modules/@rezprotocol/ui/branding/ (the electron-builder.yml
+// filter includes branding/** for @rezprotocol/ui).
 const TRAY_ICON_PATH = app.isPackaged
-  ? path.join(app.getAppPath(), "node_modules", "rez-ui", "branding", "filled-silhouette", "rez-icon-mark-transparent-filled.png")
+  ? path.join(app.getAppPath(), "node_modules", "@rezprotocol", "ui", "branding", "filled-silhouette", "rez-icon-mark-transparent-filled.png")
   : path.resolve(CHAT_ROOT, "..", "rez-ui", "branding", "filled-silhouette", "rez-icon-mark-transparent-filled.png");
 // Cap how far we look for unread when summing — must be >= ChatThreadIndex MAX_INDEX_SIZE.
 const UNREAD_SUM_LIMIT = 500;
@@ -288,6 +289,57 @@ function registerDesktopIpc() {
 
     const keyBuffer = await scryptAsync(password, Buffer.from(salt), keyLen, { N, r, p, maxmem });
     return new Uint8Array(keyBuffer);
+  });
+
+  /**
+   * Encrypted-backup file I/O. The vault produces/consumes the ciphertext
+   * envelope (pure crypto, no fs); these two channels are the ONLY place that
+   * touches the disk + native file dialogs. Kept in main.mjs (not
+   * registerDesktopIpc.mjs) so the transport-generality allowlist there stays
+   * vault/runtime-only. The envelope is already encrypted under the seed KEK,
+   * so the plaintext bundle never crosses this boundary.
+   */
+  ipcMain.handle("desktop:backup:saveToFile", async (_event, args = {}) => {
+    try {
+      const envelope = args && args.envelope != null ? args.envelope : null;
+      if (!envelope || typeof envelope !== "object") {
+        throw new Error("desktop:backup:saveToFile requires an envelope object");
+      }
+      const suggestedName = String(args && args.suggestedName ? args.suggestedName : "rez-backup.json");
+      const res = await dialog.showSaveDialog(mainWindow || null, {
+        title: "Save Rez backup",
+        defaultPath: suggestedName,
+        filters: [{ name: "Rez Backup", extensions: ["json"] }],
+      });
+      if (res.canceled || !res.filePath) return { ok: true, result: { canceled: true } };
+      fs.writeFileSync(res.filePath, JSON.stringify(envelope, null, 2), { encoding: "utf8" });
+      return { ok: true, result: { canceled: false, filePath: res.filePath } };
+    } catch (err) {
+      return { ok: false, error: { message: err && err.message ? String(err.message) : "Could not save backup" } };
+    }
+  });
+
+  ipcMain.handle("desktop:backup:openFile", async () => {
+    try {
+      const res = await dialog.showOpenDialog(mainWindow || null, {
+        title: "Restore Rez backup",
+        properties: ["openFile"],
+        filters: [{ name: "Rez Backup", extensions: ["json"] }],
+      });
+      if (res.canceled || !res.filePaths || res.filePaths.length === 0) {
+        return { ok: true, result: { canceled: true } };
+      }
+      const text = fs.readFileSync(res.filePaths[0], { encoding: "utf8" });
+      let envelope = null;
+      try {
+        envelope = JSON.parse(text);
+      } catch (parseErr) {
+        throw new Error("Selected file is not a valid Rez backup (JSON parse failed)");
+      }
+      return { ok: true, result: { canceled: false, envelope } };
+    } catch (err) {
+      return { ok: false, error: { message: err && err.message ? String(err.message) : "Could not open backup" } };
+    }
   });
 }
 

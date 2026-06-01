@@ -1,4 +1,4 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 
 const CARD_CLASS = "rounded-lg border border-outline-variant/30 bg-surface-container-low p-space-lg flex flex-col gap-space-md";

@@ -1,5 +1,5 @@
-import { h } from "rez-ui";
-import { Host } from "rez-ui/framework";
+import { h } from "@rezprotocol/ui";
+import { Host } from "@rezprotocol/ui/framework";
 import { BusComponent } from "../base/BusComponent.js";
 import { ChatTabView } from "./ChatTabView.js";
 import { ContactsTabView } from "./ContactsTabView.js";

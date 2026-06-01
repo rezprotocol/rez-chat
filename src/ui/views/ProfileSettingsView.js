@@ -1,6 +1,10 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { shortId, avatarInitials } from "../presenters/labels.js";
+import { RecoveryPhraseDisplayModal } from "./RecoveryPhraseDisplayModal.js";
+import { ChangePasswordModal } from "./ChangePasswordModal.js";
+import { ExportBackupModal } from "./ExportBackupModal.js";
+import { TypedConfirmModalView } from "./TypedConfirmModalView.js";
 
 const MAX_AVATAR_SIZE = 256;
 const JPEG_QUALITY = 0.85;
@@ -114,6 +118,56 @@ export class ProfileSettingsView extends BusComponent {
       });
     });
 
+    // ---- Security section (recovery phrase + change password + delete) ----
+    const securityBtnClass = "bg-surface-container border border-outline-variant/40 px-space-md py-2 rounded-lg text-on-surface-variant font-label-technical text-label-technical font-bold hover:border-primary/40 hover:text-primary transition-all cursor-pointer text-left";
+    const dangerBtnClass = "bg-surface-container border border-error/40 px-space-md py-2 rounded-lg text-error font-label-technical text-label-technical font-bold hover:bg-error/10 hover:border-error/60 transition-all cursor-pointer text-left";
+
+    const showPhraseBtn = h("button", { type: "button", className: securityBtnClass }, "Show recovery phrase");
+    showPhraseBtn.addEventListener("click", () => {
+      new RecoveryPhraseDisplayModal({ bus: this.bus }).open();
+    });
+
+    const changePasswordBtn = h("button", { type: "button", className: securityBtnClass }, "Change password");
+    changePasswordBtn.addEventListener("click", () => {
+      new ChangePasswordModal({ bus: this.bus }).open();
+    });
+
+    const exportBackupBtn = h("button", { type: "button", className: securityBtnClass }, "Export encrypted backup");
+    exportBackupBtn.addEventListener("click", () => {
+      new ExportBackupModal({ bus: this.bus }).open();
+    });
+
+    const deleteAccountBtn = h("button", { type: "button", className: dangerBtnClass }, "Delete account");
+    deleteAccountBtn.addEventListener("click", () => {
+      new TypedConfirmModalView({
+        bus: this.bus,
+        title: "Delete this account",
+        message:
+          "Permanently deletes your local vault and all of this account's data on this device. "
+          + "Cannot be undone. If you have your 24-word recovery phrase you can restore the account "
+          + "on this or another device; otherwise it is gone forever.",
+        requiredText: accountLabel,
+        requiredTextLabel: 'Type your display name to confirm',
+        passwordPlaceholder: "Vault password",
+        confirmLabel: "Delete account",
+        onConfirm: async ({ password }) => {
+          await this.bus.call("session", "purgeAccount", { password });
+          // The bus.call rejects on failure; on success the supervisor has
+          // already disconnected runtime, locked the vault, and removed the
+          // account from the list. SessionService's resync flips status to
+          // NO_KEYSTORE or LOCKED automatically.
+        },
+      }).open();
+    });
+
+    const securitySection = h("section", { className: "flex flex-col gap-space-sm mt-space-md pt-space-md border-t border-outline-variant/30" }, [
+      h("label", { className: "text-label-micro font-label-technical text-outline uppercase tracking-wider" }, "Security"),
+      changePasswordBtn,
+      showPhraseBtn,
+      exportBackupBtn,
+      deleteAccountBtn,
+    ]);
+
     const content = h("div", { className: "p-space-xl flex flex-col gap-space-lg max-w-lg overflow-y-auto custom-scrollbar h-full" }, [
       h("h3", { className: "text-headline-md font-headline-md text-on-surface" }, "Profile Settings"),
       h("div", { className: "flex flex-col items-center gap-space-sm" }, [
@@ -132,6 +186,7 @@ export class ProfileSettingsView extends BusComponent {
       ]),
       statusEl,
       h("div", { className: "flex gap-space-md mt-space-sm" }, [saveBtn, backBtn]),
+      securitySection,
     ]);
 
     this._rootEl.replaceChildren(content);

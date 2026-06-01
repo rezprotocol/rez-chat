@@ -1,4 +1,4 @@
-import { h } from "rez-ui";
+import { h } from "@rezprotocol/ui";
 
 /**
  * Create a Material Symbols Outlined icon element.

@@ -126,7 +126,14 @@ export async function selfProvisionAccountBinding({ peerLinkService, identity, c
  * from chat-server's OWN private key, so a future hosted-node operator with
  * disk access to the node dir cannot decrypt them (Shape A).
  */
-export async function bootstrapChatServer({ nodeDataDir, wsUrl, expectedNodePublicKeyB64 = "", logger = console } = {}) {
+export async function bootstrapChatServer({
+  nodeDataDir,
+  wsUrl,
+  expectedNodePublicKeyB64 = "",
+  logger = console,
+  expectedChatServerIdentity = null,
+  allowChatServerIdentityRotation = false,
+} = {}) {
   if (typeof nodeDataDir !== "string" || nodeDataDir.trim().length === 0) {
     throw new Error("bootstrapChatServer requires nodeDataDir");
   }
@@ -140,6 +147,8 @@ export async function bootstrapChatServer({ nodeDataDir, wsUrl, expectedNodePubl
   const identity = await ensureChatServerIdentity({
     storageProvider: bootstrapProvider,
     cryptoProvider,
+    expectedIdentity: expectedChatServerIdentity,
+    allowOverwrite: allowChatServerIdentityRotation,
   });
   const ownerAccountId = identity.accountId;
 
