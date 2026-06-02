@@ -19,6 +19,11 @@ import assert from "node:assert/strict";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupOpPayloadV1 } from "../src/records/payloads/GroupOpPayloadV1.js";
 import { SYSTEM_EVENT_KIND } from "../src/records/payloads/ChatSystemEventPayloadV1.js";
+import { encodeInviteCodeV3 } from "@rezprotocol/sdk/client";
+
+// Realistic DER-SPKI Ed25519 key the v3 code commits to; the inner envelope
+// must be signed by the same identity (signerRef.signerPublicKeyB64).
+const INVITER_PUB = "MCowBQYDK2VwAyEA2crNvu+ZeiFMoMNP/imhLa/HIyYg6x96US6AyOqijPg=";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -98,13 +103,13 @@ test("acceptor side: invite.accept emits a member.join op to the inviter", async
       groupId,
       title: "Alpha Group",
       creatorDisplayName: "Alice",
+      signerRef: { signerPublicKeyB64: INVITER_PUB },
     },
     signatureB64: "sig",
   };
   const fakePeerLinks = {
     ownerAccountId: acceptorAccountId,
     getStoredInviteEnvelope: async () => inviteEnvelope,
-    claimInviteAsRemote: async () => inviteEnvelope,
     acceptInvite: async () => ({ snapshot: groupSnapshot, event: null }),
   };
 
@@ -114,7 +119,7 @@ test("acceptor side: invite.accept emits a member.join op to the inviter", async
     sdk, peerLinks: fakePeerLinks,
   });
 
-  const inviteCode = "rez:inv:v2:" + inviteId + ".inbox:alice";
+  const inviteCode = encodeInviteCodeV3({ inviteId, publisherPublicKeyB64: INVITER_PUB });
   const accepted = await server.bus.call("invite", "accept", {
     inviteCode,
     acceptorDisplayName: "Bob",
@@ -159,6 +164,10 @@ async function setupInviterServerForJoin({ inviterAccountId, groupId, inviteId, 
   const fakePeerLinks = {
     ownerAccountId: inviterAccountId,
     getStoredInviteEnvelope: async (_owner, id) => (id === inviteId ? inviteRecord : null),
+    // The invite-ledger authorization (expiry + maxUses) is exercised
+    // separately; here we authorize so these tests focus on membership +
+    // fan-out behavior.
+    authorizeInviteJoin: async () => ({ authorized: true, reason: "CONSUMED" }),
   };
   let now = 5000;
   const server = createServer({
@@ -425,4 +434,226 @@ test("forwarded member.join: dropped when forwarder is not an active group membe
   });
   const ids = members.map((m) => m.accountId);
   assert.equal(ids.includes(bobAccountId), false, "Mallory's forward is not honored");
+});
+
+// --- member.join authorization + anti-resurrection (M3 / M4 / scenario-2) ---
+
+function makeInviterServerWithInvites({ inviterAccountId, groupId, invites, authorize, clockRef }) {
+  const sends = [];
+  const sdk = {
+    getIdentity: () => ({ localInboxId: "inbox:" + inviterAccountId }),
+    mailbox: { deposit: async () => ({ eventId: "evt" }) },
+    sendEncryptedDeposit: async (opts) => { sends.push(opts); return { ok: true }; },
+    peerLinks: { getPeerLink: async () => null },
+  };
+  const fakePeerLinks = {
+    ownerAccountId: inviterAccountId,
+    getStoredInviteEnvelope: async (_o, id) => {
+      const inv = invites[id];
+      if (!inv) return null;
+      return {
+        envelope: {
+          inviteId: id, kind: "group", groupId,
+          creatorAccountId: inviterAccountId, title: "G",
+          createdAtMs: inv.createdAtMs,
+        },
+        signatureB64: "sig",
+      };
+    },
+    authorizeInviteJoin: authorize || (async () => ({ authorized: true, reason: "CONSUMED" })),
+  };
+  const server = createServer({
+    identity: { accountId: inviterAccountId, deviceId: "dev:" + inviterAccountId },
+    clock: () => clockRef.now,
+    sdk, peerLinks: fakePeerLinks,
+  });
+  return { server, sends };
+}
+
+test("inviter side: member.join is dropped when invite authorization fails (expired/used-up)", async () => {
+  const clockRef = { now: 5000 };
+  const inviterAccountId = "rez:acct:alice";
+  const joiner = "rez:acct:bob";
+  const groupId = "grp_authz_mj";
+  const inviteId = "plinv_authz";
+  const { server } = makeInviterServerWithInvites({
+    inviterAccountId, groupId,
+    invites: { [inviteId]: { createdAtMs: 100 } },
+    authorize: async () => ({ authorized: false, reason: "INVITE_USED_UP" }),
+    clockRef,
+  });
+  await server.bus.services.threads.ensureGroupThread({ groupId, title: "G", createdAtMs: 100 });
+  await server.bus.stores.groupStore.ensureMembership({
+    ownerAccountId: inviterAccountId, groupId, accountId: inviterAccountId, role: "admin",
+  });
+
+  await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
+    op: "member.join", groupId, accountId: joiner, inviteId, displayName: "Bob",
+    actedAtMs: 6000, groupOpId: "gop_authz",
+  }), { senderAccountId: joiner });
+
+  const m = await server.bus.stores.groupStore.getMembership({
+    ownerAccountId: inviterAccountId, groupId, accountId: joiner,
+  });
+  assert.ok(!m, "joiner is NOT added when the invite-ledger authorization fails");
+});
+
+test("inviter side: a kicked member is re-admitted ONLY by an invite issued AFTER the kick", async () => {
+  const clockRef = { now: 100 };
+  const inviterAccountId = "rez:acct:alice";
+  const joiner = "rez:acct:bob";
+  const groupId = "grp_resurrect";
+  const staleInvite = "plinv_stale"; // createdAtMs 100 — predates the kick
+  const freshInvite = "plinv_fresh"; // createdAtMs 300 — issued after the kick
+  const { server } = makeInviterServerWithInvites({
+    inviterAccountId, groupId,
+    invites: { [staleInvite]: { createdAtMs: 100 }, [freshInvite]: { createdAtMs: 300 } },
+    clockRef,
+  });
+  await server.bus.services.threads.ensureGroupThread({ groupId, title: "G", createdAtMs: 100 });
+  await server.bus.stores.groupStore.ensureMembership({
+    ownerAccountId: inviterAccountId, groupId, accountId: inviterAccountId, role: "admin",
+  });
+
+  // Bob joins originally.
+  clockRef.now = 150;
+  await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
+    op: "member.join", groupId, accountId: joiner, inviteId: staleInvite, displayName: "Bob",
+    actedAtMs: 150, groupOpId: "gop_j1",
+  }), { senderAccountId: joiner });
+  let bob = await server.bus.stores.groupStore.getMembership({
+    ownerAccountId: inviterAccountId, groupId, accountId: joiner,
+  });
+  assert.equal(bob.state, "active", "Bob joined");
+
+  // Alice kicks Bob at t=200 → Bob.updatedAtMs = 200.
+  clockRef.now = 200;
+  await server.bus.stores.groupStore.removeMember({
+    ownerAccountId: inviterAccountId, groupId, accountId: joiner,
+  });
+
+  // Replay the STALE invite (createdAtMs 100 < removal 200) → REFUSED.
+  clockRef.now = 250;
+  await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
+    op: "member.join", groupId, accountId: joiner, inviteId: staleInvite, displayName: "Bob",
+    actedAtMs: 250, groupOpId: "gop_replay",
+  }), { senderAccountId: joiner });
+  bob = await server.bus.stores.groupStore.getMembership({
+    ownerAccountId: inviterAccountId, groupId, accountId: joiner,
+  });
+  assert.equal(bob.state, "removed", "a stale invite predating the kick CANNOT resurrect Bob");
+
+  // Use the FRESH invite (createdAtMs 300 > removal 200) → RE-ADMITTED.
+  clockRef.now = 350;
+  await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
+    op: "member.join", groupId, accountId: joiner, inviteId: freshInvite, displayName: "Bob",
+    actedAtMs: 350, groupOpId: "gop_fresh",
+  }), { senderAccountId: joiner });
+  bob = await server.bus.stores.groupStore.getMembership({
+    ownerAccountId: inviterAccountId, groupId, accountId: joiner,
+  });
+  assert.equal(bob.state, "active", "a fresh post-kick invite re-admits Bob");
+});
+
+test("forwarded member.join CANNOT resurrect a removed member (only adds new ones)", async () => {
+  // Carol's view: Alice (active member) forwards a member.join for Bob, whom
+  // Carol has locally as removed. The forward must not revive Bob — only the
+  // inviter's freshness-gated self-announce can.
+  const carol = "rez:acct:carol";
+  const alice = "rez:acct:alice";
+  const bob = "rez:acct:bob";
+  const groupId = "grp_fwd_noresurrect";
+  const sdk = {
+    getIdentity: () => ({ localInboxId: "inbox:carol" }),
+    sendEncryptedDeposit: async () => ({ ok: true }),
+    peerLinks: { getPeerLink: async () => null },
+  };
+  const fakePeerLinks = { ownerAccountId: carol, getStoredInviteEnvelope: async () => null };
+  let now = 9000;
+  const server = createServer({
+    identity: { accountId: carol, deviceId: "dev:carol" },
+    clock: () => (now += 1),
+    sdk, peerLinks: fakePeerLinks,
+  });
+  await server.bus.services.threads.ensureGroupThread({ groupId, title: "g", createdAtMs: 9000 });
+  await server.bus.stores.groupStore.ensureMembership({
+    ownerAccountId: carol, groupId, accountId: alice, role: "admin",
+  });
+  await server.bus.stores.groupStore.ensureMembership({
+    ownerAccountId: carol, groupId, accountId: bob, role: "member",
+  });
+  await server.bus.stores.groupStore.removeMember({ ownerAccountId: carol, groupId, accountId: bob });
+
+  await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
+    op: "member.join", groupId, accountId: bob, inviteId: "plinv_w",
+    actedAtMs: 9100, groupOpId: "gop_fwd",
+  }), { senderAccountId: alice });
+
+  const m = await server.bus.stores.groupStore.getMembership({
+    ownerAccountId: carol, groupId, accountId: bob,
+  });
+  assert.equal(m.state, "removed", "a forwarded join cannot resurrect a kicked member");
+});
+
+// --- Rejected group-invite teardown ---------------------------------------
+
+test("discardGroupForRejectedInvite removes only the group joined via that one invite", async () => {
+  const inviter = "rez:acct:alice";
+  const me = "rez:acct:bob";
+  const server = createServer({
+    identity: { accountId: me },
+    sdk: { getIdentity: () => ({ localInboxId: "inbox:bob" }) },
+    peerLinks: { ownerAccountId: me },
+    clock: () => 5000,
+  });
+
+  // Two groups joined via DIFFERENT invites from the SAME inviter, plus a group
+  // we created ourselves. Only the rejected invite's group must be torn down.
+  await server.bus.services.threads.ensureGroupThread({
+    groupId: "grp_rejected", peerAccountId: inviter, title: "Rejected group",
+    createdAtMs: 1000, joinedViaInviteId: "plinv_rejected",
+  });
+  await server.bus.services.threads.ensureGroupThread({
+    groupId: "grp_other", peerAccountId: inviter, title: "Other group from Alice",
+    createdAtMs: 1000, joinedViaInviteId: "plinv_other",
+  });
+  await server.bus.services.threads.ensureGroupThread({
+    groupId: "grp_mine", peerAccountId: null, title: "My group", createdAtMs: 1000,
+  });
+
+  const rejectedThreadId = server.bus.services.threads.groupThreadId("grp_rejected");
+  const otherThreadId = server.bus.services.threads.groupThreadId("grp_other");
+  const mineThreadId = server.bus.services.threads.groupThreadId("grp_mine");
+  assert.ok(await server.bus.stores.threadStore.getThread(rejectedThreadId), "rejected group thread exists");
+
+  const removedEvents = [];
+  server.bus.on("group.removed", (e) => removedEvents.push(e));
+
+  const res = await server.bus.services.groups.discardGroupForRejectedInvite({ inviteId: "plinv_rejected" });
+
+  assert.deepEqual(res.removed, ["grp_rejected"], "only the rejected invite's group is discarded");
+  assert.ok(!(await server.bus.stores.threadStore.getThread(rejectedThreadId)),
+    "the rejected invite's group thread is deleted");
+  assert.ok(await server.bus.stores.threadStore.getThread(otherThreadId),
+    "a different group from the same inviter is NOT touched (bound to the one invite)");
+  assert.ok(await server.bus.stores.threadStore.getThread(mineThreadId),
+    "a group we created ourselves is NOT touched");
+
+  const selfMembership = await server.bus.stores.groupStore.getMembership({
+    ownerAccountId: me, groupId: "grp_rejected", accountId: me,
+  });
+  assert.equal(selfMembership.state, "removed", "self-membership in the rejected group is removed");
+  assert.equal(removedEvents.length, 1, "group.removed emitted once");
+  assert.equal(removedEvents[0].groupId, "grp_rejected");
+});
+
+test("discardGroupForRejectedInvite is a no-op when no group matches the invite", async () => {
+  const server = createServer({
+    identity: { accountId: "rez:acct:bob" },
+    sdk: { getIdentity: () => ({ localInboxId: "inbox:bob" }) },
+    peerLinks: { ownerAccountId: "rez:acct:bob" },
+    clock: () => 5000,
+  });
+  const res = await server.bus.services.groups.discardGroupForRejectedInvite({ inviteId: "plinv_nope" });
+  assert.deepEqual(res.removed, []);
 });

@@ -1,8 +1,6 @@
 import { bytesToBase64, base64ToBytes } from "@rezprotocol/sdk/client";
 import { BaseServerService } from "../base/BaseServerService.js";
 
-const DEFAULT_CLAIM_TIMEOUT_MS = 10_000;
-
 /**
  * ServerPeerLinkProtocolService — chat-server-side handler for peer-link
  * protocol messages flowing over mailbox deposits (Shape A).
@@ -11,9 +9,6 @@ const DEFAULT_CLAIM_TIMEOUT_MS = 10_000;
  * parsed and routed by kind:
  *
  *   - Plaintext JSON:
- *     - `rez.peerlink.claim.req` — look up envelope in local PeerLinkService,
- *       send `claim.res` back via `sdk.mailbox.deposit`.
- *     - `rez.peerlink.claim.res` — resolve the registered claim waiter.
  *     - `rez.peerlink.handshake.ack` — handleIncomingHandshakeAck.
  *
  *   - E2EE packets:
@@ -28,22 +23,13 @@ const DEFAULT_CLAIM_TIMEOUT_MS = 10_000;
  *     - regular E2EE deposit — decrypt via PeerLinkService; if inner is a
  *       `rez.delivery.ack` emit `delivery.ack` on the chat bus; otherwise
  *       emit `peerlink.user.message` carrying plaintext for ServerEventService.
- *
- * Also owns `bus.runtime.claimWaiter` used by ServerInvitesService.acceptInvite
- * for cross-network invite envelope resolution.
  */
 export class ServerPeerLinkProtocolService extends BaseServerService {
   #clock;
-  #claimWaiters;
 
   constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
     this.#clock = clock;
-    this.#claimWaiters = new Map();
-    this.bus.runtime.claimWaiter = {
-      register: (requestId, timeoutMs) => this._registerClaimWaiter(requestId, timeoutMs),
-      resolve: (requestId, data, error) => this._resolveClaimWaiter(requestId, data, error),
-    };
   }
 
   async start() {
@@ -51,49 +37,6 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     // emit on this one bus event; we no longer subscribe to the SDK
     // directly. See MailboxPushBridge.js for the bridge contract.
     this._listen("runtime.event.mailbox.deposited", (event) => this._handleMailboxDeposited(event));
-  }
-
-  async stop() {
-    for (const [, entry] of this.#claimWaiters.entries()) {
-      clearTimeout(entry.timer);
-      entry.reject(Object.assign(new Error("service stopped"), { code: "SERVICE_STOPPED" }));
-    }
-    this.#claimWaiters.clear();
-    if (this.bus.runtime && this.bus.runtime.claimWaiter) {
-      this.bus.runtime.claimWaiter = null;
-    }
-    await super.stop();
-  }
-
-  _registerClaimWaiter(requestId, timeoutMs = DEFAULT_CLAIM_TIMEOUT_MS) {
-    if (typeof requestId !== "string" || !requestId.trim()) {
-      throw new Error("claimWaiter.register requires non-empty requestId");
-    }
-    const id = requestId.trim();
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.#claimWaiters.delete(id);
-        reject(Object.assign(new Error("claim request timed out"), { code: "CLAIM_TIMEOUT" }));
-      }, timeoutMs);
-      this.#claimWaiters.set(id, { resolve, reject, timer });
-    });
-  }
-
-  _resolveClaimWaiter(requestId, data, error) {
-    const id = typeof requestId === "string" ? requestId.trim() : "";
-    if (!id) return false;
-    const entry = this.#claimWaiters.get(id);
-    if (!entry) return false;
-    clearTimeout(entry.timer);
-    this.#claimWaiters.delete(id);
-    if (error) {
-      entry.reject(error instanceof Error
-        ? error
-        : Object.assign(new Error(error.message || "claim failed"), { code: error.code || "CLAIM_FAILED" }));
-    } else {
-      entry.resolve(data);
-    }
-    return true;
   }
 
   async _handleMailboxDeposited(event) {
@@ -124,18 +67,6 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     if (!bodyObj) return;
 
     // --- Plaintext peer-link protocol messages ---
-
-    if (bodyObj.kind === "rez.peerlink.claim.res" && bodyObj.requestId) {
-      const data = bodyObj.envelope
-        ? { envelope: bodyObj.envelope, signatureB64: bodyObj.signatureB64 || null }
-        : null;
-      this._resolveClaimWaiter(bodyObj.requestId, data, bodyObj.error || null);
-      return;
-    }
-    if (bodyObj.kind === "rez.peerlink.claim.req" && bodyObj.inviteId && bodyObj.replyInboxId) {
-      await this._handleInboundClaimRequest(bodyObj);
-      return;
-    }
 
     const peerLinks = this._peerLinkService();
     if (!peerLinks) return;
@@ -186,6 +117,21 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         return;
       }
       if (!handled) return;
+      // Lazy maxUses enforcement declined this handshake (invite used up or
+      // expired). No session was established and the inviter holds no
+      // peer-link for it — deposit a signed reject so the acceptor can roll
+      // back its optimistic peer-link.
+      if (handled.rejected) {
+        const rejectInboxId = String(handled.acceptorInboxId || "").trim();
+        if (rejectInboxId) {
+          await this._sendHandshakeReject({
+            deliverInboxId: rejectInboxId,
+            reason: handled.reason || "INVITE_REJECTED",
+            ackNonce: handled.ackNonce || null,
+          });
+        }
+        return;
+      }
       this._emitPeerLinkUpdated(handled.snapshot, handled.remoteDisplayName);
       const acceptorInboxId = handled.snapshot
         ? String(handled.snapshot.peerInboxId || "").trim()
@@ -257,6 +203,26 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       return;
     }
 
+    // Handshake reject (signed envelope from inviter → acceptor). Authenticated
+    // the same way as the ack; rolls back the acceptor's optimistic peer-link
+    // when the inviter's lazy maxUses check declined the handshake.
+    if (bodyObj.kind === "rez.peerlink.handshake.reject.v1") {
+      if (typeof peerLinks.handleHandshakeReject !== "function") return;
+      let handled;
+      try {
+        handled = await peerLinks.handleHandshakeReject({
+          ownerAccountId: this.ownerAccountId,
+          rejectPacketBytes: payloadBytes,
+        });
+      } catch (rejErr) {
+        this.logger.error("[ServerPeerLinkProtocolService] handshake.reject processing failed", rejErr && rejErr.message ? rejErr.message : rejErr);
+        return;
+      }
+      if (!handled) return;
+      this._emitPeerLinkUpdated(handled.snapshot);
+      return;
+    }
+
     // E2EE direct message (user content or delivery ack inside ciphertext).
     if (bodyObj.e2ee === 1 && typeof bodyObj.v === "number" && typeof bodyObj.payload === "string") {
       if (typeof peerLinks.decryptDirectMessageAnyPeer !== "function") return;
@@ -318,64 +284,6 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     }
   }
 
-  async _handleInboundClaimRequest(bodyObj) {
-    const peerLinks = this._peerLinkService();
-    if (!peerLinks || typeof peerLinks.claimInviteAsRemote !== "function") {
-      this.logger.warn("[ServerPeerLinkProtocolService] claim.req received but peerLinkService unavailable");
-      return;
-    }
-    const inviteId = String(bodyObj.inviteId || "").trim();
-    const replyInboxId = String(bodyObj.replyInboxId || "").trim();
-    const requestId = String(bodyObj.requestId || "").trim();
-    if (!inviteId || !replyInboxId || !requestId) return;
-
-    // Atomic check-and-spend: claimInviteAsRemote increments the use counter
-    // and flips status → "used" before returning the envelope. This is the
-    // only enforcement point for maxUses on cross-network accepts. A second
-    // claim of a single-use invite — including by a freshly created account
-    // — surfaces here as INVITE_USED_UP and is returned to the acceptor in
-    // the claim.res error field.
-    let envelopeData = null;
-    let error = null;
-    try {
-      envelopeData = await peerLinks.claimInviteAsRemote({
-        ownerAccountId: this.ownerAccountId,
-        inviteId,
-      });
-    } catch (claimErr) {
-      const code = claimErr && typeof claimErr.code === "string" && claimErr.code
-        ? claimErr.code : "INVITE_NOT_FOUND";
-      const message = claimErr && typeof claimErr.message === "string" && claimErr.message
-        ? claimErr.message : "invite claim failed";
-      this.logger.warn("[ServerPeerLinkProtocolService] invite claim refused", code, message);
-      error = { code, message };
-    }
-
-    const responseBody = JSON.stringify({
-      kind: "rez.peerlink.claim.res",
-      requestId,
-      envelope: envelopeData ? envelopeData.envelope : null,
-      signatureB64: envelopeData ? envelopeData.signatureB64 : null,
-      error,
-    });
-
-    const sdk = this._sdk();
-    if (!sdk || !sdk.mailbox) {
-      this.logger.warn("[ServerPeerLinkProtocolService] cannot send claim.res — sdk.mailbox unavailable");
-      return;
-    }
-    try {
-      await sdk.mailbox.deposit({
-        mailboxId: replyInboxId,
-        objectId: "clmres_" + requestId,
-        ciphertextB64: bytesToBase64(new TextEncoder().encode(responseBody)),
-        metadata: {},
-      });
-    } catch (sendErr) {
-      this.logger.error("[ServerPeerLinkProtocolService] claim.res send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
-    }
-  }
-
   async _sendHandshakeAck({ deliverInboxId, ownerDisplayName = "", ackNonce = null }) {
     const sdk = this._sdk();
     if (!sdk || !sdk.mailbox) return;
@@ -411,6 +319,42 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       });
     } catch (sendErr) {
       this.logger.error("[ServerPeerLinkProtocolService] handshake.ack send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
+    }
+  }
+
+  async _sendHandshakeReject({ deliverInboxId, reason, ackNonce = null }) {
+    const sdk = this._sdk();
+    if (!sdk || !sdk.mailbox) return;
+    if (typeof ackNonce !== "string" || ackNonce.length === 0) {
+      this.logger.warn("[ServerPeerLinkProtocolService] handshake.reject send skipped — missing ackNonce");
+      return;
+    }
+    const peerLinks = this._peerLinkService();
+    if (!peerLinks || typeof peerLinks.createSignedHandshakeReject !== "function") {
+      this.logger.warn("[ServerPeerLinkProtocolService] handshake.reject send skipped — SDK missing createSignedHandshakeReject");
+      return;
+    }
+    let rejectBytes;
+    try {
+      const result = await peerLinks.createSignedHandshakeReject({
+        ownerAccountId: this.ownerAccountId,
+        reason: typeof reason === "string" && reason.length > 0 ? reason : "INVITE_REJECTED",
+        ackNonce,
+      });
+      rejectBytes = result.rejectBytes;
+    } catch (signErr) {
+      this.logger.error("[ServerPeerLinkProtocolService] handshake.reject sign failed", signErr && signErr.message ? signErr.message : signErr);
+      return;
+    }
+    try {
+      await sdk.mailbox.deposit({
+        mailboxId: deliverInboxId,
+        objectId: "hsrej_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
+        ciphertextB64: bytesToBase64(rejectBytes),
+        metadata: {},
+      });
+    } catch (sendErr) {
+      this.logger.error("[ServerPeerLinkProtocolService] handshake.reject send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
     }
   }
 
@@ -456,6 +400,9 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       peerAccountId: snapshot.peerAccountId || null,
       remoteDisplayName: typeof remoteDisplayName === "string" ? remoteDisplayName : "",
       peerInboxId: snapshot.peerInboxId || null,
+      // The invite this peer-link was opened for. Forwarded so a rejected
+      // peer-link can tear down exactly the group joined via this one invite.
+      activeInviteId: snapshot.activeInviteId || null,
       lastErrorCode: snapshot.lastErrorCode,
       lastErrorMessage: snapshot.lastErrorMessage,
       updatedAtMs: snapshot.updatedAtMs,

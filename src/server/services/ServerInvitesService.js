@@ -6,19 +6,20 @@ import {
 } from "../../records/index.js";
 import { BaseServerService } from "../base/BaseServerService.js";
 import {
+  base64ToBytes,
   bytesToBase64,
-  encodeInviteCodeV2,
-  isInviteCodeV2,
-  parseInviteCodeV2,
+  encodeInviteCodeV3,
+  isInviteCodeV3,
+  parseInviteCodeV3,
+  PEERLINK_INVITE_RECORD_KIND,
 } from "@rezprotocol/sdk/client";
-
-const CLAIM_RES_TIMEOUT_MS = 10_000;
 
 /**
  * ServerInvitesService — chat-server-side peer-link invite create + accept
  * (Shape A). Uses the local PeerLinkService (`bus.runtime.peerLinks`) so
- * records land in chat-server storage. Cross-network invite resolution uses
- * `bus.runtime.claimWaiter` (owned by ServerPeerLinkProtocolService).
+ * records land in chat-server storage. The signed invite envelope is
+ * published to / fetched from the durable signed-record store
+ * (`sdk.durableRecords`), so accepts succeed with the inviter offline.
  */
 export class ServerInvitesService extends BaseServerService {
   constructor({ bus, logger = console } = {}) {
@@ -42,6 +43,42 @@ export class ServerInvitesService extends BaseServerService {
 
     const kind = params.kind === "group" ? "group" : "direct";
     const groupId = kind === "group" && typeof params.groupId === "string" && params.groupId.trim() ? params.groupId.trim() : null;
+
+    // SECURITY (audit pass 5, H2): only an ACTIVE member may mint a group
+    // invite, and the invite must carry the group's TRUE founder so the
+    // acceptor doesn't stamp the inviter as createdBy (which the founder rule
+    // would turn into permanent admin). Both are derived from our own group
+    // state — the single authority for who founded/belongs to the group.
+    let groupCreatedBy = null;
+    let groupSalt = null;
+    if (kind === "group") {
+      if (!groupId) {
+        const err = new Error("createInvite: group invite requires groupId");
+        err.code = "INVALID_GROUP";
+        throw err;
+      }
+      const groupStore = this.bus.stores && this.bus.stores.groupStore ? this.bus.stores.groupStore : null;
+      if (!groupStore) throw new Error("createInvite: groupStore unavailable");
+      // The node's own account — the key the group store is owned/membered
+      // under (ServerInvitesService isn't constructed with ownerAccountId).
+      const selfAccountId = peerLinks.ownerAccountId;
+      const self = await groupStore.getMembership({
+        ownerAccountId: selfAccountId, groupId, accountId: selfAccountId,
+      });
+      if (!self || String(self.state || "").toLowerCase() !== "active") {
+        const err = new Error("createInvite: only an active member can invite to a group");
+        err.code = "NOT_A_MEMBER";
+        throw err;
+      }
+      const group = await groupStore.getGroup({ ownerAccountId: selfAccountId, groupId });
+      groupCreatedBy = group && typeof group.createdBy === "string" && group.createdBy.trim()
+        ? group.createdBy.trim() : selfAccountId;
+      // The salt that lets the acceptor verify groupCreatedBy against groupId.
+      // Relayed from our own group state (we received + verified it when we
+      // joined, or minted it if we are the founder).
+      groupSalt = group && typeof group.creatorSalt === "string" && group.creatorSalt.trim()
+        ? group.creatorSalt.trim() : null;
+    }
     const maxUses = Number.isInteger(params.maxUses) && params.maxUses > 0 ? params.maxUses : 1;
     const expiresInDays = Number.isInteger(params.expiresInDays) && params.expiresInDays > 0 ? params.expiresInDays : 7;
     const creatorDisplayName = typeof params.creatorDisplayName === "string" && params.creatorDisplayName.trim()
@@ -53,16 +90,26 @@ export class ServerInvitesService extends BaseServerService {
       creatorDisplayName,
       kind,
       groupId,
+      groupCreatedBy,
+      groupSalt,
       title,
       maxUses,
       expiresAtMs: Date.now() + expiresInDays * 24 * 60 * 60 * 1000,
       peerInboxId: ownInboxId,
     });
 
-    const inviteCode = encodeInviteCodeV2({
+    const inviteCode = encodeInviteCodeV3({
       inviteId: result.inviteId,
-      creatorInboxId: ownInboxId,
+      publisherPublicKeyB64: result.publisherPublicKeyB64,
     });
+
+    // Publish the signed envelope as a durable record so acceptors can fetch
+    // it while the inviter is offline. The inviter is, by definition, online
+    // here at create time — putRecord pushes it to the k-closest backbone
+    // nodes, which keep it alive thereafter. Local-only fallback (replicas=0)
+    // still lets same-node accepts resolve via the stored invite record.
+    const sdk = this._sdk();
+    await sdk.durableRecords.put({ record: result.durableRecord });
 
     return new InviteCreateResult({
       peerLinkId: result.peerLinkId,
@@ -83,30 +130,40 @@ export class ServerInvitesService extends BaseServerService {
     if (!inviteCode) {
       throw new Error("acceptInvite: inviteCode required");
     }
-    if (!isInviteCodeV2(inviteCode)) {
-      throw new Error("acceptInvite: only v2 short codes are supported");
+    if (!isInviteCodeV3(inviteCode)) {
+      throw new Error("acceptInvite: only v3 short codes are supported");
     }
-    const { inviteId, creatorInboxId } = parseInviteCodeV2(inviteCode);
+    const { inviteId, publisherPublicKeyB64 } = parseInviteCodeV3(inviteCode);
 
-    // 1. Resolve envelope: local-first (atomic spend), then cross-network
-    // claim (the remote inviter spends inside its claim.req handler). Both
-    // paths now enforce maxUses — local via claimInviteAsRemote directly,
-    // remote via claim.res error propagation through _resolveClaimWaiter.
+    // 1. Resolve envelope: local-first (the inviter's own stored record, for
+    // same-node accepts), else fetch the inviter's durable invite record from
+    // the DHT. The durable record is self-authenticating and reachable with
+    // the inviter offline — no live claim round-trip. maxUses is NOT spent at
+    // accept time; it is enforced lazily, once, by the inviter's handshake
+    // responder (the single enforcement point).
     const ownerAccountId = peerLinks.ownerAccountId;
-    let envelopeData = null;
-    const localRecord = await peerLinks.getStoredInviteEnvelope(ownerAccountId, inviteId);
-    if (localRecord) {
-      envelopeData = await peerLinks.claimInviteAsRemote({
-        ownerAccountId, inviteId,
-      });
-    } else {
-      envelopeData = await this._claimRemoteInviteEnvelope({
-        sdk, inviteId, creatorInboxId, replyInboxId: this._ownInboxId(),
+    let envelopeData = await peerLinks.getStoredInviteEnvelope(ownerAccountId, inviteId);
+    if (!envelopeData) {
+      envelopeData = await this._fetchDurableInviteEnvelope({
+        sdk, inviteId, publisherPublicKeyB64,
       });
     }
     if (!envelopeData || !envelopeData.envelope) {
       const err = new Error("acceptInvite: invite envelope not found");
       err.code = "INVITE_NOT_FOUND";
+      throw err;
+    }
+
+    // Substitution safety: the fetched envelope MUST be signed by the same
+    // identity the invite code commits to. The node already bound the record
+    // to publisherPublicKeyB64; this binds the inner envelope's signer too,
+    // so a record publisher cannot wrap a different inviter's envelope.
+    const envelopeSignerPub = envelopeData.envelope.signerRef
+      && typeof envelopeData.envelope.signerRef.signerPublicKeyB64 === "string"
+      ? envelopeData.envelope.signerRef.signerPublicKeyB64 : "";
+    if (envelopeSignerPub !== publisherPublicKeyB64) {
+      const err = new Error("acceptInvite: invite envelope signer does not match invite code");
+      err.code = "PUBLISHER_KEY_MISMATCH";
       throw err;
     }
 
@@ -164,11 +221,39 @@ export class ServerInvitesService extends BaseServerService {
     }
 
     if (groupId) {
+      // Stamp the invite this group was joined via so a later handshake.reject
+      // can tear down exactly this group (bound to the one invite). Matches the
+      // peer-link's activeInviteId (envelope.inviteId).
+      const joinedViaInviteId = typeof envelopeObj.inviteId === "string" ? envelopeObj.inviteId.trim() : null;
+      // The TRUE founder, carried (signed) in the envelope — NOT the inviter.
+      // Stamping the inviter as createdBy let the founder rule grant them
+      // permanent admin over us (audit pass 5, H2).
+      const groupCreatedBy = typeof envelopeObj.groupCreatedBy === "string" && envelopeObj.groupCreatedBy.trim()
+        ? envelopeObj.groupCreatedBy.trim() : null;
+      const groupSalt = typeof envelopeObj.groupSalt === "string" && envelopeObj.groupSalt.trim()
+        ? envelopeObj.groupSalt.trim() : null;
+      // VERIFY the founder against the groupId itself: groupId must equal
+      // hash(groupCreatedBy + ":" + groupSalt). This closes the H2 residual —
+      // a malicious inviter cannot self-stamp as creator, because they can't
+      // produce a (createdBy, salt) pair that hashes to a group they didn't
+      // found. Fail closed: a group invite whose founder binding doesn't
+      // verify is rejected outright.
+      const verifiedCreatedBy = groupCreatedBy && groupSalt
+        && this.bus.services.threads.groupIdForCreator(groupCreatedBy, groupSalt) === groupId
+        ? groupCreatedBy : null;
+      if (groupCreatedBy && !verifiedCreatedBy) {
+        const err = new Error("acceptInvite: group founder does not match the groupId (binding failed)");
+        err.code = "GROUP_CREATOR_BINDING_INVALID";
+        throw err;
+      }
       await this.bus.services.threads.ensureGroupThread({
         groupId,
         peerAccountId,
+        groupCreatedBy: verifiedCreatedBy,
+        creatorSalt: verifiedCreatedBy ? groupSalt : null,
         createdAtMs: Date.now(),
         title,
+        joinedViaInviteId,
       }).catch((err) => {
         this.logger.error("[ServerInvitesService] group thread ensure failed", err && err.message ? err.message : err);
         this._emit("app.error", { source: "ServerInvitesService", message: "group thread ensure failed", severity: "warn", err });
@@ -277,31 +362,36 @@ export class ServerInvitesService extends BaseServerService {
     return claimant ? claimant.inboxId : "";
   }
 
-  async _claimRemoteInviteEnvelope({ sdk, inviteId, creatorInboxId, replyInboxId }) {
-    const claimWaiter = this.bus.runtime && this.bus.runtime.claimWaiter
-      ? this.bus.runtime.claimWaiter : null;
-    if (!claimWaiter || typeof claimWaiter.register !== "function") {
-      throw new Error("acceptInvite: cross-network claim requires bus.runtime.claimWaiter (ServerPeerLinkProtocolService)");
-    }
-    if (!replyInboxId) {
-      throw new Error("acceptInvite: cannot send claim.req without own localInboxId");
-    }
-    const requestId = "clm_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
-    const waiter = claimWaiter.register(requestId, CLAIM_RES_TIMEOUT_MS);
-    const claimBody = JSON.stringify({
-      kind: "rez.peerlink.claim.req",
-      inviteId,
-      replyInboxId,
-      requestId,
+  /**
+   * Fetch the inviter's signed invite envelope from the durable-record store
+   * (DHT). Self-authenticating and reachable with the inviter offline — the
+   * node has already verified the record's signature + slot-binding against
+   * `publisherPublicKeyB64` before returning it. Returns `{ envelope,
+   * signatureB64 }` or null if absent/malformed.
+   */
+  async _fetchDurableInviteEnvelope({ sdk, inviteId, publisherPublicKeyB64 }) {
+    const record = await sdk.durableRecords.get({
+      recordKind: PEERLINK_INVITE_RECORD_KIND,
+      recordId: inviteId,
+      publisherPublicKeyB64,
     });
-    const ciphertextB64 = bytesToBase64(new TextEncoder().encode(claimBody));
-    const objectId = "clmreq_" + requestId;
-    await sdk.mailbox.deposit({
-      mailboxId: creatorInboxId,
-      objectId,
-      ciphertextB64,
-      metadata: {},
-    });
-    return waiter;
+    if (!record || typeof record.payloadB64 !== "string") {
+      return null;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(new TextDecoder().decode(base64ToBytes(record.payloadB64)));
+    } catch (err) {
+      this.logger.warn("[ServerInvitesService] durable invite record payload malformed",
+        err && err.message ? err.message : err);
+      return null;
+    }
+    if (!payload || typeof payload !== "object" || !payload.envelope) {
+      return null;
+    }
+    return {
+      envelope: payload.envelope,
+      signatureB64: typeof payload.signatureB64 === "string" ? payload.signatureB64 : null,
+    };
   }
 }

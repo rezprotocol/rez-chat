@@ -58,7 +58,7 @@ export class GroupStore {
     });
   }
 
-  async ensureGroup({ ownerAccountId, groupId, createdBy, title = null } = {}) {
+  async ensureGroup({ ownerAccountId, groupId, createdBy, title = null, joinedViaInviteId = null, creatorSalt = null } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const id = requireId(groupId, "groupId");
     const creator = requireId(createdBy, "createdBy");
@@ -72,6 +72,8 @@ export class GroupStore {
       updatedAtMs: now,
       title,
       createdBy: creator,
+      joinedViaInviteId: typeof joinedViaInviteId === "string" ? joinedViaInviteId.trim() : "",
+      creatorSalt: typeof creatorSalt === "string" ? creatorSalt.trim() : "",
     });
     if (!created) throw new Error("ChatGroupStore.ensureGroup produced invalid row");
     await this.groups.set(created, owner, id);
@@ -109,6 +111,35 @@ export class GroupStore {
     if (!created) throw new Error("ChatGroupStore.ensureMembership produced invalid row");
     await this.memberships.set(created, owner, gid, member);
     return { membership: created, created: true };
+  }
+
+  /**
+   * Explicitly revive a previously-removed member (kicked or left) back to
+   * "active". This is a PRIVILEGED, EXPLICIT operation — deliberately separate
+   * from ensureMembership, which must never resurrect a removed member as a
+   * side effect (that was a security hole: a re-sent message/op silently
+   * re-admitted kicked members). Callers must authorize the revival first
+   * (e.g. against a fresh post-removal invite). No-op (revived:false) when the
+   * row is absent or already active. Rejoin restores the supplied role.
+   */
+  async reviveMembership({ ownerAccountId, groupId, accountId, role = "member" } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const gid = requireId(groupId, "groupId");
+    const member = requireId(accountId, "accountId");
+    const existing = await this.memberships.get(owner, gid, member);
+    if (!existing || String(existing.state || "").toLowerCase() !== "removed") {
+      return { membership: existing || null, revived: false };
+    }
+    const now = asInt(this.clock(), Date.now());
+    const revived = this.memberships.coerce({
+      ...existing.toJSON(),
+      role,
+      state: "active",
+      updatedAtMs: now,
+    });
+    if (!revived) throw new Error("ChatGroupStore.reviveMembership produced invalid row");
+    await this.memberships.set(revived, owner, gid, member);
+    return { membership: revived, revived: true };
   }
 
   async getMembership({ ownerAccountId, groupId, accountId } = {}) {

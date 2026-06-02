@@ -2,7 +2,7 @@ import {
   MessageDepositedEvent,
   PeerLinkUpdatedEvent,
 } from "../../records/index.js";
-import { getPayloadEntry } from "../../records/payloads/index.js";
+import { getPayloadEntry, GROUP_OP_KIND } from "../../records/payloads/index.js";
 import { MESSAGE_KIND as CHAT_MESSAGE_KIND } from "../../records/payloads/ChatMessagePayloadV1.js";
 import { E2eeDeliveryAckV1 } from "@rezprotocol/sdk/client";
 import { BaseServerService } from "../base/BaseServerService.js";
@@ -88,6 +88,38 @@ export class ServerEventService extends BaseServerService {
           peerInboxId,
         }).catch((err) => {
           this.logger.error("[ServerEventService] profile send to new peer failed", err && err.message ? err.message : err);
+        });
+      }
+    }
+
+    // Rollback: the inviter's handshake responder rejected this acceptor
+    // (invite used up / expired) and the SDK rolled the peer-link back to
+    // "rejected". Tear down the optimistic state acceptInvite created so the
+    // user isn't left looking at a contact/conversation that will never work.
+    if (body.state === "rejected" && peerAccountId) {
+      if (this.bus.services.threads && typeof this.bus.services.threads.directThreadIdForPeerLink === "function") {
+        const rejectedThreadId = threadId
+          || this.bus.services.threads.directThreadIdForPeerLink(peerLinkId, peerAccountId);
+        if (rejectedThreadId) {
+          await this.bus.services.threads.deleteThread({ threadId: rejectedThreadId }).catch((err) => {
+            this.logger.error("[ServerEventService] rejected peer-link thread delete failed", err && err.message ? err.message : err);
+          });
+        }
+      }
+      if (this.bus.services.contacts && typeof this.bus.services.contacts.deleteContact === "function") {
+        await this.bus.services.contacts.deleteContact({ accountId: peerAccountId }).catch((err) => {
+          this.logger.error("[ServerEventService] rejected peer-link contact delete failed", err && err.message ? err.message : err);
+        });
+      }
+      // A rejected GROUP invite leaves an optimistic group thread that can never
+      // deliver (no session to the inviter). Tear down exactly the group joined
+      // via THIS invite (bound to the one invite, not everything the inviter
+      // set up). activeInviteId is the peer-link's invite — group-agnostic
+      // boundary preserved (no groupId on the snapshot).
+      const rejectedInviteId = typeof body.activeInviteId === "string" ? body.activeInviteId : "";
+      if (rejectedInviteId && this.bus.services.groups && typeof this.bus.services.groups.discardGroupForRejectedInvite === "function") {
+        await this.bus.services.groups.discardGroupForRejectedInvite({ inviteId: rejectedInviteId }).catch((err) => {
+          this.logger.error("[ServerEventService] rejected peer-link group teardown failed", err && err.message ? err.message : err);
         });
       }
     }
@@ -184,6 +216,35 @@ export class ServerEventService extends BaseServerService {
     }
     const peerAcct = thread && typeof thread.peerAccountId === "string" ? thread.peerAccountId.trim() : "";
 
+    // SECURITY — authoritative group-content authorization (audit pass 5, H1).
+    // Before ANY group content is dispatched (reactions/edits/tombstones/media),
+    // persisted (messages), or rendered, the sender MUST be an active member of
+    // the target group. The only trustworthy sender identity is `envelopeSender`
+    // — the account from the decrypted peer-link snapshot (cryptographically
+    // authenticated). The payload's self-declared `senderAccountId` is NOT
+    // trusted for group threads (it is attacker-controllable). Group-management
+    // ops (GroupOpPayloadV1) self-authorize inside handleIncomingGroupOp
+    // (member.join is the bootstrap exception), so they are exempt here. Fail
+    // closed: an unauthenticated or non-active sender is dropped.
+    const inboundKind = decodedPayload && typeof decodedPayload.kind === "string" ? decodedPayload.kind : "";
+    if (thread && thread.threadType === "group" && inboundKind !== GROUP_OP_KIND) {
+      const groupId = typeof thread.groupId === "string" ? thread.groupId.trim() : "";
+      const authedSender = envelopeSender;
+      const membership = groupId && authedSender
+        ? await this.bus.stores.groupStore.getMembership({
+            ownerAccountId: this.ownerAccountId,
+            groupId,
+            accountId: authedSender,
+          }).catch(() => null)
+        : null;
+      if (!membership || String(membership.state || "").toLowerCase() !== "active") {
+        this.logger.warn("[ServerEventService] dropped group "
+          + (inboundKind || "message") + " from non-member "
+          + (authedSender || "<unauthenticated>") + " for group " + groupId);
+        return;
+      }
+    }
+
     // Registry-driven dispatch: look up the kind in PAYLOAD_KIND_REGISTRY
     // and let the entry's handler consume it. The default rez.chat.message.v1
     // entry returns `false` so the deposit flows through to the message-
@@ -220,7 +281,11 @@ export class ServerEventService extends BaseServerService {
       }
     }
 
-    const senderAccountId = peerAcct || payloadSender || null;
+    // Prefer the cryptographically-authenticated sender (peerAcct from a direct
+    // thread's peer-link, or envelopeSender from the decrypted snapshot) over
+    // the payload's self-declared sender, which a peer can forge. payloadSender
+    // is only a last resort for non-E2EE/system deposits that carry no peer.
+    const senderAccountId = peerAcct || envelopeSender || payloadSender || null;
     const messageId = decodedPayload && typeof decodedPayload.messageId === "string"
       ? decodedPayload.messageId.trim()
       : "";
@@ -290,14 +355,11 @@ export class ServerEventService extends BaseServerService {
     }
 
     if (thread && thread.threadType === "group" && thread.groupId && senderAccountId) {
-      await this.bus.stores.groupStore.ensureMembership({
-        ownerAccountId: this.ownerAccountId,
-        groupId: thread.groupId,
-        accountId: senderAccountId,
-      }).catch(err => {
-        this.logger.error("[ServerEventService] group membership sync failed",
-          err && err.message ? err.message : err);
-      });
+      // NOTE: membership is NOT (re)established here. Receiving a message must
+      // never confer or restore group membership — that was a phantom-member /
+      // kicked-member-resurrection hole (audit pass 5, H1). The sender was
+      // already proven to be an active member by the gate above; membership is
+      // established only via the authorized member.join op.
       const observedChannelId = decodedPayload && typeof decodedPayload.channelId === "string"
         ? decodedPayload.channelId.trim() : "";
       if (observedChannelId) {

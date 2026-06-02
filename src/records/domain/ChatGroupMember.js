@@ -1,14 +1,17 @@
 import { RRecord } from "@rezprotocol/sdk/client";
 import { nonEmptyString, toFiniteNumber } from "./coerce.js";
 
-export const GROUP_ROLES = Object.freeze(["admin", "member"]);
+// "creator" is the immutable group founder (group.createdBy): the highest
+// role, above admin. It cannot be assigned via setRole, nor removed/demoted —
+// enforced in ServerGroupsService. "admin" manages members; "member" is base.
+export const GROUP_ROLES = Object.freeze(["creator", "admin", "member"]);
 export const GROUP_MEMBER_STATES = Object.freeze(["active", "left", "removed"]);
 const VALID_ROLES = new Set(GROUP_ROLES);
 const VALID_STATES = new Set(GROUP_MEMBER_STATES);
 
 export function coerceGroupRole(value, fallback = "member") {
   const role = nonEmptyString(value) || fallback;
-  if (!VALID_ROLES.has(role)) throw new Error("role must be admin|member");
+  if (!VALID_ROLES.has(role)) throw new Error("role must be creator|admin|member");
   return role;
 }
 

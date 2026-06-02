@@ -24,6 +24,7 @@ import { SYSTEM_EVENT_KIND } from "../../records/payloads/ChatSystemEventPayload
 import { BaseServerService } from "../base/BaseServerService.js";
 
 const ADMIN_ROLE = "admin";
+const CREATOR_ROLE = "creator";
 
 function nowOpId() {
   return "gop_" + randomUUID().replace(/-/g, "");
@@ -65,21 +66,24 @@ export class ServerGroupsService extends BaseServerService {
     const params = this._coerceParams(payload, GroupCreateParams);
     const title = typeof params.title === "string" ? params.title.trim() : "";
     const now = this.#clock();
-    const groupId = this.bus.services.threads.groupThreadId(
-      this.ownerAccountId + ":" + now + ":" + randomUUID()
-    ).replace(/^th_/, "grp_");
+    // Salt that binds this group to its creator: groupId = hash(createdBy +
+    // ":" + creatorSalt). Carried (signed) in invites so acceptors can verify
+    // the founder against the groupId (audit pass 5, H2 closure).
+    const creatorSalt = now + ":" + randomUUID();
+    const groupId = this.bus.services.threads.groupIdForCreator(this.ownerAccountId, creatorSalt);
     const threadId = this.bus.services.threads.groupThreadId(groupId);
     await this.#groupStore.ensureGroup({
       ownerAccountId: this.ownerAccountId,
       groupId,
       createdBy: this.ownerAccountId,
       title: title || null,
+      creatorSalt,
     });
     await this.#groupStore.ensureMembership({
       ownerAccountId: this.ownerAccountId,
       groupId,
       accountId: this.ownerAccountId,
-      role: "admin",
+      role: "creator",
     });
     await this.#threadStore.ensureThread({
       threadId,
@@ -128,6 +132,50 @@ export class ServerGroupsService extends BaseServerService {
     return new GroupLeaveResult({ groupId, threadId, left: true });
   }
 
+  /**
+   * Discard the locally-optimistic group the acceptor joined via a SINGLE
+   * invite (`inviteId`) that the inviter then rejected (invite used up /
+   * expired). The teardown is bound to that one invite — it removes only the
+   * group stamped with `joinedViaInviteId === inviteId`, never other groups the
+   * same inviter set up. The rejected group would silently fail to deliver (no
+   * session to the only other member), so we remove its thread + index and drop
+   * self-membership. We do NOT fan out a `leave` op: there is no session and we
+   * were never truly a member.
+   *
+   * @param {{ inviteId: string }} opts
+   * @returns {Promise<{ removed: string[] }>}
+   */
+  async discardGroupForRejectedInvite({ inviteId } = {}) {
+    const invite = typeof inviteId === "string" ? inviteId.trim() : "";
+    if (!invite) return { removed: [] };
+    const groups = await this.#groupStore.listGroups({ ownerAccountId: this.ownerAccountId });
+    const removed = [];
+    for (const group of groups) {
+      if (group.joinedViaInviteId !== invite) continue;
+      const groupId = group.groupId;
+      const threadId = this.bus.services.threads.groupThreadId(groupId);
+      const deleted = await this.#threadStore.deleteThread(threadId).catch((err) => {
+        this.logger.error("[ServerGroupsService] rejected group thread delete failed", err && err.message ? err.message : err);
+        return false;
+      });
+      if (deleted) {
+        await this.#threadIndex.removeThread({ threadId }).catch((err) => {
+          this.logger.error("[ServerGroupsService] rejected group index removal failed", err && err.message ? err.message : err);
+        });
+      }
+      await this.#groupStore.removeMember({
+        ownerAccountId: this.ownerAccountId,
+        groupId,
+        accountId: this.ownerAccountId,
+      }).catch((err) => {
+        this.logger.error("[ServerGroupsService] rejected group membership remove failed", err && err.message ? err.message : err);
+      });
+      this._emit("group.removed", new GroupRemovedEvent({ groupId }));
+      removed.push(groupId);
+    }
+    return { removed };
+  }
+
   async renameGroup(payload = {}) {
     const params = this._coerceParams(payload, GroupRenameParams);
     params.validate();
@@ -162,6 +210,14 @@ export class ServerGroupsService extends BaseServerService {
     const params = this._coerceParams(payload, GroupKickParams);
     params.validate();
     await this.requireSelfAdmin(params.groupId, "group.kick");
+    // The creator is the immutable group anchor — no admin (and not even the
+    // creator) may kick them. Without this, a promoted admin could remove the
+    // founder and take over the group.
+    if (await this.#isCreator(params.groupId, params.accountId)) {
+      const err = new Error("group.kick: the group creator cannot be removed");
+      err.code = "CREATOR_PROTECTED";
+      throw err;
+    }
     const peersBefore = await this.#listOtherActiveMembers(params.groupId);
     const { removed } = await this.#groupStore.removeMember({
       ownerAccountId: this.ownerAccountId,
@@ -196,6 +252,19 @@ export class ServerGroupsService extends BaseServerService {
     const params = this._coerceParams(payload, GroupSetRoleParams);
     params.validate();
     await this.requireSelfAdmin(params.groupId, "group.setRole");
+    // The creator's role is immutable, and "creator" can never be assigned to
+    // anyone else (there is exactly one creator = the founder). Both protect
+    // against a promoted admin demoting the founder or minting a rival creator.
+    if (await this.#isCreator(params.groupId, params.accountId)) {
+      const err = new Error("group.setRole: the group creator's role cannot be changed");
+      err.code = "CREATOR_PROTECTED";
+      throw err;
+    }
+    if (String(params.role || "").toLowerCase() === CREATOR_ROLE) {
+      const err = new Error("group.setRole: the creator role cannot be assigned");
+      err.code = "INVALID_ROLE";
+      throw err;
+    }
     const { membership } = await this.#groupStore.setMemberRole({
       ownerAccountId: this.ownerAccountId,
       groupId: params.groupId,
@@ -241,11 +310,12 @@ export class ServerGroupsService extends BaseServerService {
     return new GroupMembersListResult({ items: enriched });
   }
 
-  // The founder (group.createdBy) is always admin regardless of how the
-  // member row was persisted. Stamp role="admin" on the founder's row when
+  // The founder (group.createdBy) is always the CREATOR regardless of how the
+  // member row was persisted. Stamp role="creator" on the founder's row when
   // returning to callers, so display + downstream checks stay consistent.
   // Public so ServerThreadsService can apply the same rule to its own
   // members-updated emits — single source of truth for the founder rule.
+  // (Name retained for callers; it now stamps "creator".)
   async stampFounderAsAdmin(groupId, items) {
     return this.#stampFounderAsAdmin(groupId, items);
   }
@@ -261,13 +331,27 @@ export class ServerGroupsService extends BaseServerService {
     const out = [];
     for (const member of list) {
       const mid = String(member && member.accountId || "").trim();
-      if (mid === founder && String(member.role || "").toLowerCase() !== ADMIN_ROLE) {
-        out.push(new ChatGroupMember({ ...member.toJSON(), role: ADMIN_ROLE }));
+      if (mid === founder && String(member.role || "").toLowerCase() !== CREATOR_ROLE) {
+        out.push(new ChatGroupMember({ ...member.toJSON(), role: CREATOR_ROLE }));
       } else {
         out.push(member);
       }
     }
     return out;
+  }
+
+  // The creator is the immutable founder: group.createdBy (authoritative,
+  // cryptographically bound to the groupId — see acceptInvite). We key
+  // protection on createdBy, NOT the stored role string, so a stale/tampered
+  // role can't strip creator protection.
+  async #isCreator(groupId, accountId) {
+    const id = typeof accountId === "string" ? accountId.trim() : "";
+    if (!id) return false;
+    const group = await this.#groupStore.getGroup({
+      ownerAccountId: this.ownerAccountId,
+      groupId,
+    }).catch(() => null);
+    return Boolean(group && typeof group.createdBy === "string" && group.createdBy === id);
   }
 
   async handleIncomingGroupOp(record, { senderAccountId } = {}) {
@@ -466,6 +550,13 @@ export class ServerGroupsService extends BaseServerService {
   }
 
   async #applyIncomingKick(op) {
+    // Authoritative creator protection on every receiving node: ignore a kick
+    // targeting the group creator no matter who sent it (a compromised/colluding
+    // admin could craft this op directly). Each node knows its own createdBy.
+    if (await this.#isCreator(op.groupId, op.accountId)) {
+      this.logger.warn("[ServerGroupsService] ignoring kick targeting the group creator " + op.accountId);
+      return;
+    }
     const targetIsSelf = op.accountId === this.ownerAccountId;
     const { removed } = await this.#groupStore.removeMember({
       ownerAccountId: this.ownerAccountId,
@@ -486,6 +577,16 @@ export class ServerGroupsService extends BaseServerService {
   }
 
   async #applyIncomingSetRole(op) {
+    // Authoritative creator protection: never let an inbound op change the
+    // creator's role or mint a second creator, regardless of sender.
+    if (await this.#isCreator(op.groupId, op.accountId)) {
+      this.logger.warn("[ServerGroupsService] ignoring setRole targeting the group creator " + op.accountId);
+      return;
+    }
+    if (String(op.role || "").toLowerCase() === CREATOR_ROLE) {
+      this.logger.warn("[ServerGroupsService] ignoring setRole that would assign the creator role");
+      return;
+    }
     const { membership } = await this.#groupStore.setMemberRole({
       ownerAccountId: this.ownerAccountId,
       groupId: op.groupId,
@@ -533,24 +634,77 @@ export class ServerGroupsService extends BaseServerService {
     if (!sender || !joiner) return;
     if (joiner === this.ownerAccountId) return;
     const isSelfAnnounce = sender === joiner;
+
+    // Current local membership for the joiner drives add-vs-revive and the
+    // anti-resurrection rules below.
+    const existingMembership = await this.#getMembership(op.groupId, joiner);
+    const wasRemoved = existingMembership
+      && String(existingMembership.state || "").toLowerCase() === "removed";
+
     let shouldForward = false;
     if (isSelfAnnounce) {
-      // Authorize via our local invite record. Only the inviter has it;
-      // forward recipients skip this check (they trust the sender's
-      // group membership).
-      const ok = await this.#verifyJoinAgainstInvite({
+      // Direct self-announce: WE are the inviter, so we authorize against our
+      // own invite record (forward recipients can't — they have no invite).
+      const envelope = await this.#resolveJoinInviteEnvelope({
         inviteId: op.inviteId,
         groupId: op.groupId,
       });
-      if (!ok) {
+      if (!envelope) {
         this.logger.warn(
           "[ServerGroupsService] dropping member.join from " + joiner
             + ": no matching local invite for group " + op.groupId,
         );
         return;
       }
+      // Anti-resurrection — clock-safe HERE because we (the inviter) stamped
+      // BOTH the invite's createdAtMs and the membership's removal time on our
+      // own clock. A kicked/departed member may only be re-admitted by an
+      // invite issued AFTER their removal; a stale invite predating the kick
+      // cannot undo it.
+      if (wasRemoved) {
+        const inviteCreatedAtMs = Number(envelope.createdAtMs) || 0;
+        const removedAtMs = Number(existingMembership.updatedAtMs) || 0;
+        if (!(inviteCreatedAtMs > removedAtMs)) {
+          this.logger.warn(
+            "[ServerGroupsService] dropping member.join from removed member " + joiner
+              + ": invite predates removal (stale-invite reuse) for group " + op.groupId,
+          );
+          return;
+        }
+      }
+      // Invite-level authorization: expiry + maxUses, against the invite ledger
+      // (single source of truth with the handshake responder). This is the ONLY
+      // maxUses enforcement point when the joiner already has an established
+      // peer-link (no fresh handshake runs in that case).
+      const peerLinks = this.bus.runtime && this.bus.runtime.peerLinks ? this.bus.runtime.peerLinks : null;
+      if (!peerLinks || typeof peerLinks.authorizeInviteJoin !== "function") {
+        this.logger.warn("[ServerGroupsService] member.join: peerLinks.authorizeInviteJoin unavailable");
+        return;
+      }
+      const verdict = await peerLinks.authorizeInviteJoin({
+        ownerAccountId: this.ownerAccountId,
+        inviteId: op.inviteId,
+        joinerAccountId: joiner,
+        nowMs: this.#clock(),
+      }).catch((err) => {
+        this.logger.warn("[ServerGroupsService] member.join authorize failed",
+          err && err.message ? err.message : err);
+        return { authorized: false, reason: "AUTHORIZE_ERROR" };
+      });
+      if (!verdict || !verdict.authorized) {
+        this.logger.warn(
+          "[ServerGroupsService] dropping unauthorized member.join from " + joiner
+            + " for group " + op.groupId + " (" + (verdict ? verdict.reason : "no-verdict") + ")",
+        );
+        return;
+      }
       shouldForward = true;
     } else {
+      // Forwarded by another member (likely the inviter). We trust the
+      // forwarder's active membership — but a forward may only ADD a new
+      // member, NEVER resurrect a removed one. Reviving a kicked member
+      // requires the inviter's freshness-gated self-announce path above;
+      // otherwise a single colluding member could re-admit anyone we kicked.
       const forwarderMembership = await this.#getMembership(op.groupId, sender);
       if (!forwarderMembership || forwarderMembership.state !== "active") {
         this.logger.warn(
@@ -559,23 +713,41 @@ export class ServerGroupsService extends BaseServerService {
         );
         return;
       }
+      if (wasRemoved) {
+        this.logger.warn(
+          "[ServerGroupsService] dropping forwarded member.join for removed member " + joiner
+            + ": forwards cannot resurrect a kicked member (group " + op.groupId + ")",
+        );
+        return;
+      }
     }
 
-    // Just add the joiner to our local groupStore. We deliberately do NOT
-    // call ensureGroupThread here — that helper is the full bootstrap path
-    // run when the LOCAL owner joins a group (it re-asserts the owner's
-    // membership as "member" which would silently downgrade an admin and
-    // always emits an extra group.members.updated). By the time we receive
-    // member.join we already have the group + thread locally (either we
-    // issued the invite, or we were added to the group when WE joined).
-    const { created } = await this.#groupStore.ensureMembership({
-      ownerAccountId: this.ownerAccountId,
-      groupId: op.groupId,
-      accountId: joiner,
-      role: "member",
-    }).catch(() => ({ created: false }));
+    // Apply locally. We deliberately do NOT call ensureGroupThread here — that
+    // helper is the full bootstrap path run when the LOCAL owner joins a group
+    // (it re-asserts the owner's membership and emits extra events). By the
+    // time we receive member.join we already have the group + thread locally.
+    // Revival is an explicit, authorized transition (never a side effect of
+    // ensureMembership); a brand-new joiner is added.
+    let changed = false;
+    if (wasRemoved) {
+      const { revived } = await this.#groupStore.reviveMembership({
+        ownerAccountId: this.ownerAccountId,
+        groupId: op.groupId,
+        accountId: joiner,
+        role: "member",
+      }).catch(() => ({ revived: false }));
+      changed = revived;
+    } else {
+      const { created } = await this.#groupStore.ensureMembership({
+        ownerAccountId: this.ownerAccountId,
+        groupId: op.groupId,
+        accountId: joiner,
+        role: "member",
+      }).catch(() => ({ created: false }));
+      changed = created;
+    }
 
-    if (created) {
+    if (changed) {
       await this.#emitMembersUpdated(op.groupId);
       await this.#persistJoinSystemMessage({
         groupId: op.groupId,
@@ -636,15 +808,20 @@ export class ServerGroupsService extends BaseServerService {
     await this.#fanOutGroupOp({ targets: [inviter], payload });
   }
 
-  async #verifyJoinAgainstInvite({ inviteId, groupId } = {}) {
+  // Resolve + structurally validate the local invite envelope authorizing a
+  // self-announced join (we are the inviter). Returns the signed envelope (so
+  // the caller can read its createdAtMs for the anti-resurrection check) or
+  // null if no matching active invite for this group exists.
+  async #resolveJoinInviteEnvelope({ inviteId, groupId } = {}) {
     const peerLinks = this.bus.runtime && this.bus.runtime.peerLinks ? this.bus.runtime.peerLinks : null;
-    if (!peerLinks || typeof peerLinks.getStoredInviteEnvelope !== "function") return false;
+    if (!peerLinks || typeof peerLinks.getStoredInviteEnvelope !== "function") return null;
     const lookup = await peerLinks.getStoredInviteEnvelope(this.ownerAccountId, inviteId).catch(() => null);
-    if (!lookup || !lookup.envelope) return false;
+    if (!lookup || !lookup.envelope) return null;
     const envelope = lookup.envelope;
-    if (envelope.kind !== "group") return false;
+    if (envelope.kind !== "group") return null;
     const envGroupId = typeof envelope.groupId === "string" ? envelope.groupId.trim() : "";
-    return envGroupId === groupId;
+    if (envGroupId !== groupId) return null;
+    return envelope;
   }
 
   async #persistJoinSystemMessage({ groupId, actorAccountId, actorDisplayName, actedAtMs, groupOpId } = {}) {
@@ -716,7 +893,9 @@ export class ServerGroupsService extends BaseServerService {
 
   async #isEffectiveAdmin(groupId, membership) {
     if (!membership) return false;
-    if (String(membership.role || "").toLowerCase() === ADMIN_ROLE) return true;
+    const role = String(membership.role || "").toLowerCase();
+    // The creator has all admin powers (and more); admin manages members.
+    if (role === ADMIN_ROLE || role === CREATOR_ROLE) return true;
     const group = await this.#groupStore.getGroup({
       ownerAccountId: this.ownerAccountId,
       groupId,

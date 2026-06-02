@@ -67,6 +67,16 @@ export class ServerThreadsService extends BaseServerService {
     return "th_" + b64;
   }
 
+  // Deterministically derive a groupId from its creator + a per-group salt.
+  // This is the COMMITMENT that binds the founder to the groupId: only the real
+  // (createdBy, creatorSalt) pair hashes to the real groupId, so an acceptor can
+  // verify a claimed founder against the groupId itself and a malicious inviter
+  // cannot substitute a different createdBy (audit pass 5, H2 closure). The
+  // founder uses this to mint the groupId; acceptors use it to verify.
+  groupIdForCreator(createdBy, creatorSalt) {
+    return this.groupThreadId(String(createdBy || "") + ":" + String(creatorSalt || "")).replace(/^th_/, "grp_");
+  }
+
   directThreadIdForPeerLink(peerLinkId, peerAccountId = "") {
     const id = String(peerLinkId || "").trim();
     if (!id) return "";
@@ -239,17 +249,39 @@ export class ServerThreadsService extends BaseServerService {
     return this.getThread({ threadId: id });
   }
 
-  async ensureGroupThread({ groupId, title = null, peerAccountId = null, createdAtMs = null } = {}) {
+  async ensureGroupThread({ groupId, title = null, peerAccountId = null, groupCreatedBy = null, creatorSalt = null, createdAtMs = null, joinedViaInviteId = null } = {}) {
     const id = typeof groupId === "string" ? groupId.trim() : "";
     if (!id) return null;
     const threadId = this.groupThreadId(id);
     await this.#groupStore.ensureGroup({
       ownerAccountId: this.ownerAccountId,
       groupId: id,
-      createdBy: peerAccountId || this.ownerAccountId,
+      // Prefer the TRUE founder carried in the signed invite envelope (already
+      // VERIFIED against the groupId by acceptInvite); fall back to the inviter
+      // only when unknown (e.g. legacy/self-created). The founder rule
+      // (createdBy → effective admin/creator) must not be hijackable by whoever
+      // happened to invite us (audit pass 5, H2).
+      createdBy: (typeof groupCreatedBy === "string" && groupCreatedBy.trim())
+        ? groupCreatedBy.trim()
+        : (peerAccountId || this.ownerAccountId),
+      // Store the verified salt so WE can relay it when inviting others.
+      creatorSalt: typeof creatorSalt === "string" ? creatorSalt.trim() : null,
       title,
+      joinedViaInviteId,
     });
     await this.#groupStore.ensureMembership({
+      ownerAccountId: this.ownerAccountId,
+      groupId: id,
+      accountId: this.ownerAccountId,
+      role: "member",
+    });
+    // Re-joining after a kick/leave: revive our own removed membership so our
+    // local view reflects the rejoin. Authoritative re-admission on every OTHER
+    // member's node is gated by the inviter's freshness-checked member.join;
+    // this local revival is optimistic UI only, and is contained by the
+    // receive-side membership gate (a not-yet-readmitted sender's group
+    // messages are dropped by peers).
+    await this.#groupStore.reviveMembership({
       ownerAccountId: this.ownerAccountId,
       groupId: id,
       accountId: this.ownerAccountId,
@@ -269,6 +301,11 @@ export class ServerThreadsService extends BaseServerService {
       threadType: "group",
       title,
       createdAtMs: createdAtMs == null ? this.#clock() : createdAtMs,
+      // Rejoining must unlock a thread an earlier kick/leave set to "locked";
+      // a first join is already "open" so this is a no-op there. Safe because
+      // the receive-side membership gate (H1) drops content from senders the
+      // group hasn't actually re-admitted.
+      accessState: "open",
     });
     await this.#emitGroupUpdated(id);
     await this.#emitGroupMembersUpdated(id);
