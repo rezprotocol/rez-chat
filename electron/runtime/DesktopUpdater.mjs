@@ -1,6 +1,5 @@
 import electronUpdater from "electron-updater";
 
-const { autoUpdater } = electronUpdater;
 
 const CHECK_DELAY_MS = 30_000;
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -27,8 +26,9 @@ export class DesktopUpdater {
   #intervalHandle;
   #initialTimerHandle;
   #lastStatus;
+  #updater;
 
-  constructor({ app, logger, getWindow } = {}) {
+  constructor({ app, logger, getWindow, updater } = {}) {
     if (!app || typeof app.isPackaged !== "boolean") {
       throw new Error("DesktopUpdater requires the Electron app");
     }
@@ -38,10 +38,96 @@ export class DesktopUpdater {
     this.#app = app;
     this.#logger = logger && typeof logger.warn === "function" ? logger : console;
     this.#getWindow = getWindow;
+    // The electron-updater autoUpdater by default; injectable for tests.
+    this.#updater = updater || electronUpdater.autoUpdater;
     this.#started = false;
     this.#intervalHandle = null;
     this.#initialTimerHandle = null;
     this.#lastStatus = { state: "idle" };
+  }
+
+  /**
+   * Load-phase update gate. Check for an update and, if one exists, download +
+   * install it (the app relaunches) BEFORE the caller connects to reznet —
+   * so a stale client updates here instead of failing against relays it's no
+   * longer compatible with.
+   *
+   * Resolves `{ applying: true }` when an update is being applied (the app is
+   * about to quit + relaunch into the new version), or `{ applying: false }`
+   * when there is nothing to do: no update, dev mode, or a failed/offline/
+   * slow check. It NEVER rejects — a failed update check must not block
+   * startup; the app should still open (offline).
+   *
+   * @param {{ setStatus?: (message: string) => void, timeoutMs?: number }} [opts]
+   * @returns {Promise<{ applying: boolean }>}
+   */
+  async checkAndApplyDuringLoad({ setStatus = () => {}, timeoutMs = 20_000 } = {}) {
+    if (!this.#app.isPackaged) {
+      this.#logger.log("[rez-chat:updater] dev mode — skipping load-phase update gate");
+      return { applying: false };
+    }
+    const up = this.#updater;
+    up.logger = this.#buildAutoUpdaterLogger();
+    up.autoDownload = true;
+    up.autoInstallOnAppQuit = false;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let checkTimer = setTimeout(() => {
+        this.#logger.warn("[rez-chat:updater] load-phase update check timed out — continuing (offline)");
+        finish({ applying: false });
+      }, timeoutMs);
+
+      const cleanup = () => {
+        up.removeListener("update-not-available", onNotAvailable);
+        up.removeListener("download-progress", onProgress);
+        up.removeListener("update-downloaded", onDownloaded);
+        up.removeListener("error", onError);
+        if (checkTimer) { clearTimeout(checkTimer); checkTimer = null; }
+      };
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      };
+      const onNotAvailable = () => {
+        this.#emit({ state: "not-available" });
+        finish({ applying: false });
+      };
+      const onProgress = (p) => {
+        // An update was found and is downloading — drop the check timeout and
+        // let it finish, surfacing progress on the splash (downloads can be
+        // large and slow).
+        if (checkTimer) { clearTimeout(checkTimer); checkTimer = null; }
+        const percent = p && Number.isFinite(p.percent) ? Math.round(p.percent) : 0;
+        this.#emit({ state: "downloading", percent });
+        setStatus(`Downloading update… ${percent}%`);
+      };
+      const onDownloaded = (info) => {
+        this.#emit({ state: "downloaded", version: info && info.version ? String(info.version) : null });
+        setStatus("Installing update…");
+        finish({ applying: true });
+        // Let the splash paint "Installing…" before we quit + relaunch.
+        setTimeout(() => {
+          try { up.quitAndInstall(true, true); }
+          catch (err) { this.#logger.error("[rez-chat:updater] quitAndInstall failed", err && err.message ? err.message : err); }
+        }, 250);
+      };
+      const onError = (err) => {
+        const message = err && err.message ? err.message : String(err);
+        this.#logger.warn(`[rez-chat:updater] load-phase update check failed: ${message}`);
+        this.#emit({ state: "error", message });
+        finish({ applying: false }); // never block startup on a failed check
+      };
+
+      up.on("update-not-available", onNotAvailable);
+      up.on("download-progress", onProgress);
+      up.on("update-downloaded", onDownloaded);
+      up.on("error", onError);
+      setStatus("Checking for updates…");
+      Promise.resolve(up.checkForUpdates()).catch((err) => onError(err));
+    });
   }
 
   start() {
@@ -51,9 +137,9 @@ export class DesktopUpdater {
       return;
     }
     this.#started = true;
-    autoUpdater.logger = this.#buildAutoUpdaterLogger();
-    autoUpdater.autoDownload = true;
-    autoUpdater.autoInstallOnAppQuit = false;
+    this.#updater.logger = this.#buildAutoUpdaterLogger();
+    this.#updater.autoDownload = true;
+    this.#updater.autoInstallOnAppQuit = false;
     this.#wireEvents();
     this.#initialTimerHandle = setTimeout(() => {
       this.#initialTimerHandle = null;
@@ -96,7 +182,7 @@ export class DesktopUpdater {
       );
       return;
     }
-    autoUpdater.quitAndInstall(true, true);
+    this.#updater.quitAndInstall(true, true);
   }
 
   async checkNow() {
@@ -106,7 +192,7 @@ export class DesktopUpdater {
 
   async #runCheck(reason) {
     try {
-      const result = await autoUpdater.checkForUpdates();
+      const result = await this.#updater.checkForUpdates();
       return result;
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
@@ -117,22 +203,22 @@ export class DesktopUpdater {
   }
 
   #wireEvents() {
-    autoUpdater.on("checking-for-update", () => {
+    this.#updater.on("checking-for-update", () => {
       this.#emit({ state: "checking" });
     });
-    autoUpdater.on("update-available", (info) => {
+    this.#updater.on("update-available", (info) => {
       this.#emit({
         state: "available",
         version: info && info.version ? String(info.version) : null,
       });
     });
-    autoUpdater.on("update-not-available", (info) => {
+    this.#updater.on("update-not-available", (info) => {
       this.#emit({
         state: "not-available",
         version: info && info.version ? String(info.version) : null,
       });
     });
-    autoUpdater.on("download-progress", (progress) => {
+    this.#updater.on("download-progress", (progress) => {
       const percent = progress && Number.isFinite(progress.percent) ? progress.percent : 0;
       const transferred = progress && Number.isFinite(progress.transferred) ? progress.transferred : 0;
       const total = progress && Number.isFinite(progress.total) ? progress.total : 0;
@@ -143,14 +229,14 @@ export class DesktopUpdater {
         total,
       });
     });
-    autoUpdater.on("update-downloaded", (info) => {
+    this.#updater.on("update-downloaded", (info) => {
       this.#emit({
         state: "downloaded",
         version: info && info.version ? String(info.version) : null,
         releaseName: info && info.releaseName ? String(info.releaseName) : null,
       });
     });
-    autoUpdater.on("error", (err) => {
+    this.#updater.on("error", (err) => {
       const message = err && err.message ? err.message : String(err);
       this.#logger.warn(`[rez-chat:updater] autoUpdater error: ${message}`);
       this.#emit({ state: "error", message });

@@ -12,6 +12,7 @@ import { registerDesktopRuntimeIpc } from "./runtime/registerDesktopIpc.mjs";
 import { BiometricGate } from "./runtime/BiometricGate.mjs";
 import { DesktopTray } from "./runtime/DesktopTray.mjs";
 import { DesktopUpdater } from "./runtime/DesktopUpdater.mjs";
+import { DesktopBootstrap } from "./runtime/DesktopBootstrap.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Standalone rez-chat repo: electron/ lives at the package root. CHAT_ROOT
@@ -29,6 +30,7 @@ const scryptAsync = promisify(scrypt);
 
 let chatApp = null;
 let mainWindow = null;
+let splashWindow = null;
 let trustedOrigin = null;
 let stopping = null;
 let desktopSupervisor = null;
@@ -343,6 +345,63 @@ function registerDesktopIpc() {
   });
 }
 
+// A self-contained splash page (no network, no preload). The main process
+// pushes status text into it via webContents.executeJavaScript(window.__setStatus).
+const SPLASH_HTML = `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<style>
+  html,body{margin:0;height:100%;background:#0b0d12;color:#e7e9ee;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
+  .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;-webkit-app-region:drag}
+  .mark{font-size:30px;font-weight:700;letter-spacing:.5px}
+  .spin{width:26px;height:26px;border:3px solid #2a2f3a;border-top-color:#5b8cff;border-radius:50%;animation:r .8s linear infinite}
+  #msg{min-height:20px;color:#aab2c5;text-align:center;max-width:320px;padding:0 16px}
+  .wrap.error #msg{color:#ff6b6b;font-weight:600}
+  .wrap.error .spin{display:none}
+  @keyframes r{to{transform:rotate(360deg)}}
+</style></head><body>
+<div class="wrap" id="wrap"><div class="mark">Rez</div><div class="spin" id="spin"></div><div id="msg">Starting…</div></div>
+<script>
+  window.__setStatus = function(s){
+    try{
+      document.getElementById('msg').textContent = (s && s.message) || '';
+      document.getElementById('wrap').classList.toggle('error', !!(s && s.phase === 'error'));
+    }catch(e){}
+  };
+</script></body></html>`;
+
+function createSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) return;
+  splashWindow = new BrowserWindow({
+    width: 420,
+    height: 300,
+    resizable: false,
+    frame: false,
+    show: true,
+    center: true,
+    alwaysOnTop: true,
+    skipTaskbar: false,
+    title: "Rez",
+    backgroundColor: "#0b0d12",
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  splashWindow.on("closed", () => { splashWindow = null; });
+  splashWindow.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(SPLASH_HTML));
+}
+
+function setSplashStatus(phase, message) {
+  if (!splashWindow || splashWindow.isDestroyed() || !splashWindow.webContents) return;
+  const payload = JSON.stringify({ phase: String(phase || ""), message: String(message || "") });
+  splashWindow.webContents.executeJavaScript(`window.__setStatus(${payload})`).catch(() => {});
+}
+
+function closeSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) {
+    const w = splashWindow;
+    splashWindow = null;
+    w.close();
+  }
+}
+
 function createMainWindow(shellUrl) {
   trustedOrigin = new URL(shellUrl).origin;
   const windowBounds = resolveWindowBounds();
@@ -398,15 +457,24 @@ function createMainWindow(shellUrl) {
     }
   });
 
-  mainWindow.once("ready-to-show", () => {
-    if (mainWindow) mainWindow.show();
-  });
-
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
 
-  mainWindow.loadURL(shellUrl);
+  // Resolve once the main window is on screen, so the bootstrap can retire the
+  // splash only after the real UI is visible (no flash of empty desktop).
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    mainWindow.once("ready-to-show", () => {
+      if (mainWindow) mainWindow.show();
+      done();
+    });
+    // Safety net: if ready-to-show never fires (renderer trouble), don't wedge
+    // the bootstrap — show what we have and move on after a bound.
+    setTimeout(() => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show(); done(); }, 8000);
+    mainWindow.loadURL(shellUrl);
+  });
 }
 
 async function startDesktop() {
@@ -418,86 +486,129 @@ async function startDesktop() {
   const desktopPaths = defaultDesktopPaths(userDataDir);
   const configPath = desktopPaths.nodeConfigPath;
 
-  chatApp = await startRezChat({
-    shellHost: "127.0.0.1",
-    shellPort: resolveDesktopShellPort(),
-    uiRoot: resolveUiRoot(),
-    skipUiRootCheck: false,
-    configPath,
-  });
-
-  const vault = new DesktopVaultService({
-    dbPath: desktopPaths.vaultDbPath,
-    safeStorage,
-  }).open();
-  desktopSupervisor = new DesktopSupervisor({
-    vault,
-    chatApp,
-    logger: console,
-  });
-  await desktopSupervisor.start();
-  const biometricGate = new BiometricGate({ systemPreferences });
-  registerDesktopRuntimeIpc({
-    ipcMain,
-    supervisor: desktopSupervisor,
-    biometricGate,
-    getWindow: () => mainWindow,
-    // SECURITY_AUDIT MED-10: native confirmation dialog before biometric.
-    // The renderer cannot dismiss this dialog programmatically, so a
-    // compromised renderer cannot silently chain into a biometric unlock.
-    confirmUnlockWithDevice: async () => {
-      try {
-        const result = await dialog.showMessageBox(mainWindow || null, {
-          type: "question",
-          title: "Unlock Rez",
-          message: "Unlock Rez with device biometric?",
-          detail: "Rez is requesting to unlock your local account vault using "
-            + "this device's biometric (Touch ID / Windows Hello).\n\n"
-            + "If you did NOT just take an action that should require an unlock, "
-            + "click Cancel.",
-          buttons: ["Cancel", "Unlock"],
-          defaultId: 0,
-          cancelId: 0,
-          noLink: true,
-        });
-        return result && result.response === 1;
-      } catch (err) {
-        console.error("[rez-chat:desktop] unlock confirm dialog failed",
-          err && err.message ? err.message : err);
-        return false;
-      }
-    },
-  });
-
-  try {
-    desktopTray = new DesktopTray({
-      iconPath: TRAY_ICON_PATH,
-      getWindow: () => mainWindow,
-    });
-  } catch (err) {
-    console.warn("[rez-chat:desktop] failed to create tray icon", err && err.message ? err.message : err);
-    desktopTray = null;
-  }
-  let detachTrayBinding = () => {};
-  desktopSupervisor.onChatAppChange((app) => {
-    detachTrayBinding();
-    detachTrayBinding = bindTrayToChatApp(app);
-  });
-
-  const address = chatApp && chatApp.shell ? chatApp.shell.address || {} : {};
-  const host = address.host && address.host !== "0.0.0.0" ? address.host : "127.0.0.1";
-  const port = address.port;
-  if (!Number.isInteger(port) || port <= 0) {
-    throw new Error("Failed to resolve shell server port for desktop runtime");
-  }
-  createMainWindow(`http://${host}:${port}/`);
-
+  // Created up front: the load-phase update gate runs BEFORE reznet, so a stale
+  // client updates here rather than failing against relays it can't talk to.
+  // During load it targets the splash; after handoff, the main window.
   desktopUpdater = new DesktopUpdater({
     app,
     logger: console,
-    getWindow: () => mainWindow,
+    getWindow: () => mainWindow || splashWindow,
   });
-  desktopUpdater.start();
+
+  const startBackend = async () => {
+    chatApp = await startRezChat({
+      shellHost: "127.0.0.1",
+      shellPort: resolveDesktopShellPort(),
+      uiRoot: resolveUiRoot(),
+      skipUiRootCheck: false,
+      configPath,
+    });
+
+    const vault = new DesktopVaultService({
+      dbPath: desktopPaths.vaultDbPath,
+      safeStorage,
+    }).open();
+    desktopSupervisor = new DesktopSupervisor({
+      vault,
+      chatApp,
+      logger: console,
+    });
+    await desktopSupervisor.start();
+    const biometricGate = new BiometricGate({ systemPreferences });
+    registerDesktopRuntimeIpc({
+      ipcMain,
+      supervisor: desktopSupervisor,
+      biometricGate,
+      getWindow: () => mainWindow,
+      // SECURITY_AUDIT MED-10: native confirmation dialog before biometric.
+      // The renderer cannot dismiss this dialog programmatically, so a
+      // compromised renderer cannot silently chain into a biometric unlock.
+      confirmUnlockWithDevice: async () => {
+        try {
+          const result = await dialog.showMessageBox(mainWindow || null, {
+            type: "question",
+            title: "Unlock Rez",
+            message: "Unlock Rez with device biometric?",
+            detail: "Rez is requesting to unlock your local account vault using "
+              + "this device's biometric (Touch ID / Windows Hello).\n\n"
+              + "If you did NOT just take an action that should require an unlock, "
+              + "click Cancel.",
+            buttons: ["Cancel", "Unlock"],
+            defaultId: 0,
+            cancelId: 0,
+            noLink: true,
+          });
+          return result && result.response === 1;
+        } catch (err) {
+          console.error("[rez-chat:desktop] unlock confirm dialog failed",
+            err && err.message ? err.message : err);
+          return false;
+        }
+      },
+    });
+
+    try {
+      desktopTray = new DesktopTray({
+        iconPath: TRAY_ICON_PATH,
+        getWindow: () => mainWindow,
+      });
+    } catch (err) {
+      console.warn("[rez-chat:desktop] failed to create tray icon", err && err.message ? err.message : err);
+      desktopTray = null;
+    }
+    let detachTrayBinding = () => {};
+    desktopSupervisor.onChatAppChange((nextApp) => {
+      detachTrayBinding();
+      detachTrayBinding = bindTrayToChatApp(nextApp);
+    });
+    return chatApp;
+  };
+
+  const bootstrap = new DesktopBootstrap({
+    logger: console,
+    splash: {
+      show: () => createSplashWindow(),
+      setStatus: (phase, message) => setSplashStatus(phase, message),
+      close: () => closeSplashWindow(),
+    },
+    // 2. Update gate — before we touch reznet.
+    updateGate: ({ setStatus }) => desktopUpdater.checkAndApplyDuringLoad({ setStatus }),
+    // 3. Preconditions — make sure we have everything before connecting.
+    checkPreconditions: async () => {
+      const problems = [];
+      const uiRoot = resolveUiRoot();
+      if (!uiRoot || !fs.existsSync(path.join(uiRoot, "index.html"))) {
+        problems.push("UI bundle not found — try reinstalling Rez");
+      }
+      try {
+        fs.mkdirSync(userDataDir, { recursive: true });
+      } catch (err) {
+        problems.push("Can't write app data directory");
+      }
+      return problems;
+    },
+    // 4. Start the backend (node + shell). The reznet connection inside is
+    //    bounded + non-blocking — startup can't hang on an unreachable relay.
+    startBackend,
+    // 5. Hand off to the main window (awaits ready-to-show), then the splash
+    //    is closed by the state machine.
+    showMainWindow: async (app) => {
+      const address = app && app.shell ? app.shell.address || {} : {};
+      const host = address.host && address.host !== "0.0.0.0" ? address.host : "127.0.0.1";
+      const port = address.port;
+      if (!Number.isInteger(port) || port <= 0) {
+        throw new Error("Failed to resolve shell server port for desktop runtime");
+      }
+      await createMainWindow(`http://${host}:${port}/`);
+    },
+  });
+
+  const result = await bootstrap.run();
+  if (result && result.ok) {
+    // Periodic background update checks for the long-running session (the
+    // in-app "update downloaded — restart" banner flow).
+    desktopUpdater.start();
+  }
 }
 
 app.on("before-quit", () => {

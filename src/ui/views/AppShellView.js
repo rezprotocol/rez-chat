@@ -7,17 +7,20 @@ import { SettingsTabView } from "./SettingsTabView.js";
 import { ProfileTabView } from "./ProfileTabView.js";
 import { SidebarNavView } from "./SidebarNavView.js";
 import { MobileBottomBarView } from "./MobileBottomBarView.js";
+import { OfflineBannerView } from "./OfflineBannerView.js";
 
 export class AppShellView extends BusComponent {
   #sidebarNav;
   #mobileBar;
   #tabHost;
+  #offlineBanner;
 
   constructor({ bus } = {}) {
     super({ bus });
     this.#sidebarNav = null;
     this.#mobileBar = null;
     this.#tabHost = null;
+    this.#offlineBanner = null;
   }
 
   mount(parentEl) {
@@ -37,9 +40,19 @@ export class AppShellView extends BusComponent {
       "data-role": "mobile-bottom-bar",
     }, []);
 
+    // Full-width offline bar lives ABOVE the nav/main row so it spans the whole
+    // top of the chat screen.
+    const bannerSlot = h("div", { className: "shrink-0 w-full z-30", "data-role": "offline-banner-slot" }, []);
+    const contentRow = h("div", {
+      className: "flex flex-col lg:flex-row flex-1 min-h-0 w-full overflow-hidden",
+    }, [navSlot, mainArea, mobileBarSlot]);
+
     this._rootEl.replaceChildren(h("div", {
-      className: "flex flex-col lg:flex-row h-screen w-full overflow-hidden bg-gradient-mesh",
-    }, [navSlot, mainArea, mobileBarSlot]));
+      className: "flex flex-col h-screen w-full overflow-hidden bg-gradient-mesh",
+    }, [bannerSlot, contentRow]));
+
+    this.#offlineBanner = new OfflineBannerView({ bus: this.bus });
+    this.#offlineBanner.mount(bannerSlot);
 
     this.#sidebarNav = new SidebarNavView({ bus: this.bus });
     this.#sidebarNav.mount(navSlot);
@@ -73,6 +86,7 @@ export class AppShellView extends BusComponent {
     if (this.#tabHost) { this.#tabHost.unmount(); this.#tabHost = null; }
     if (this.#mobileBar) { this.#mobileBar.unmount(); this.#mobileBar = null; }
     if (this.#sidebarNav) { this.#sidebarNav.unmount(); this.#sidebarNav = null; }
+    if (this.#offlineBanner) { this.#offlineBanner.unmount(); this.#offlineBanner = null; }
     super.unmount();
   }
 }
