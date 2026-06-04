@@ -92,9 +92,11 @@ export class InboxCatchupService extends BaseServerService {
     }
     // Readiness signal (a true notification — emit is correct here): the inbox
     // is now fully drained and every missed deposit has been APPLIED (the drain
-    // awaits each through the serialized pipeline). The UI gates "show real
-    // state" on this so login never asserts the stale pre-catch-up snapshot.
-    this._emit("runtime.event.inbox.caughtup", { mailboxId: this.#inboxClaimant.inboxId });
+    // awaits each through the serialized pipeline). Emitted under the bare bridge
+    // spec key so the transport forwards it to the UI as
+    // `runtime.event.inbox.caughtup`; the UI gates "show real state" on it so
+    // login never asserts the stale pre-catch-up snapshot.
+    this._emit("inbox.caughtup", { mailboxId: this.#inboxClaimant.inboxId });
   }
 
   async #drainOnce() {

@@ -73,6 +73,11 @@ export class ChatHeaderView extends BusComponent {
         if (type === "session.accountListChanged") this.render();
       });
     }
+    if (stores.connection) {
+      // Re-render when inbox catch-up completes so the members panel stops
+      // showing "Syncing…" and reflects the now-authoritative roster.
+      this._subscribe(stores.connection, () => this.render());
+    }
     this.render();
   }
 
@@ -120,8 +125,13 @@ export class ChatHeaderView extends BusComponent {
 
     const contactStore = stores.contacts || null;
     const groupStore = stores.groups || null;
+    const connectionStore = stores.connection || null;
     const contact = thread.peerAccountId && contactStore ? contactStore.getContact(thread.peerAccountId) : null;
     const members = this.#membersOpen && thread.groupId && groupStore ? groupStore.getMembers(thread.groupId) : [];
+    // Until the post-login inbox catch-up has applied the missed backlog, the
+    // roster may be incomplete (a member's join op may not be drained yet), so
+    // the panel shows "Syncing…" rather than asserting a misleading short list.
+    const rosterSyncing = !!(connectionStore && !connectionStore.isInboxSynced());
     const title = (queries.threads ? queries.threads.displayLabel(threadId) : null) || shortId(threadId, 16);
     const locked = String(thread.accessState || "open").toLowerCase() === "locked";
     const archived = String(thread.visibilityState || "visible").toLowerCase() === "hidden";
@@ -192,7 +202,7 @@ export class ChatHeaderView extends BusComponent {
         ]),
       ]),
       this.#buildActions(thread, locked, archived),
-      this.#membersOpen && members.length > 0 ? this.#buildMembersPanel(members) : null,
+      this.#membersOpen && (members.length > 0 || rosterSyncing) ? this.#buildMembersPanel(members, rosterSyncing) : null,
       this.#overflowOpen ? this.#buildOverflowMenu(threadId, locked, archived, thread.groupId || null, this.#selectedChannelId(threadId), queries.groups ? queries.groups.isSelfAdmin(thread.groupId || "") : false) : null,
     ]);
 
@@ -304,7 +314,7 @@ export class ChatHeaderView extends BusComponent {
     ]);
   }
 
-  #buildMembersPanel(members) {
+  #buildMembersPanel(members, syncing = false) {
     const queries = this.bus.queries;
     return h("div", {
       className: "absolute right-2 top-[calc(100%+4px)] z-30 w-80 rounded-xl border border-outline-variant/30 bg-surface-container/95 backdrop-blur-md shadow-xl p-3",
@@ -316,6 +326,14 @@ export class ChatHeaderView extends BusComponent {
         const name = queries && queries.contacts ? queries.contacts.displayName(mid) : null;
         return name || shortId(mid, 12);
       }).join("\n")),
+      // While catch-up is still draining, the roster above may be incomplete —
+      // tell the user rather than letting a short list read as authoritative.
+      syncing
+        ? h("p", { className: "mt-2 text-label-micro font-label-technical text-outline uppercase tracking-[0.15em] flex items-center gap-1" }, [
+            materialIcon("sync", { size: 14 }),
+            "Syncing…",
+          ])
+        : null,
     ]);
   }
 

@@ -38,10 +38,12 @@ export class ConnectionService extends BaseBusService {
       });
     });
     this._listen("runtime.connected", () => {
-      this._connectionStore.setConnection({ status: "connected" });
+      // A fresh connection means catch-up will run again — mark unsynced until
+      // the server signals it has drained + applied the missed backlog.
+      this._connectionStore.setConnection({ status: "connected", inboxSynced: false });
     });
     this._listen("runtime.disconnected", () => {
-      this._connectionStore.setConnection({ status: "disconnected" });
+      this._connectionStore.setConnection({ status: "disconnected", inboxSynced: false });
     });
     this._listen("runtime.event.connection.state", (record) => {
       const status = record && record.status ? String(record.status).trim() : "";
@@ -51,6 +53,12 @@ export class ConnectionService extends BaseBusService {
         activeNode: record && record.activeUplink ? String(record.activeUplink) : "",
         lastError: record && record.reason ? String(record.reason) : null,
       });
+    });
+    // Inbox catch-up finished draining + applying every missed deposit. Now the
+    // displayed state (rosters, messages) is authoritative — let views stop
+    // showing "syncing" and assert real state.
+    this._listen("runtime.event.inbox.caughtup", () => {
+      this._connectionStore.setConnection({ inboxSynced: true });
     });
   }
 

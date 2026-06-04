@@ -6,6 +6,7 @@ export { ThreadIndexUpdatedEvent } from "./ThreadIndexUpdatedEvent.js";
 export { PeerLinkUpdatedEvent } from "./PeerLinkUpdatedEvent.js";
 export { ContactUpdatedEvent } from "./ContactUpdatedEvent.js";
 export { ConnectionStateEvent } from "./ConnectionStateEvent.js";
+export { InboxCaughtUpEvent } from "./InboxCaughtUpEvent.js";
 export { MeshStatusUpdatedEvent } from "./MeshStatusUpdatedEvent.js";
 export { GroupUpdatedEvent } from "./GroupUpdatedEvent.js";
 export { GroupRemovedEvent } from "./GroupRemovedEvent.js";
