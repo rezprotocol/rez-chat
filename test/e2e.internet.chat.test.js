@@ -112,10 +112,10 @@ async function startChatNode(label, knownRelays, routePolicy) {
       network: { participateInRouting: true, knownRelays },
       mesh: {
         enabled: true,
-        mode: "seeded-gossip",
+        mode: "seed-only",
         seeds: [],
-        minPeers: 3,
-        maxPeers: 10,
+        minPeers: 1,
+        maxPeers: 5,
         policy: routePolicy,
       },
       relay: {
