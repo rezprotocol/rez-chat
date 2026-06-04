@@ -99,6 +99,13 @@ export class ChatWebsocketUplink {
     this.#chatServer = chatServer;
     this.#chatBridge = bridge;
     this.#bus = bus;
+    // The shell keeps this uplink alive across logout/login, so a prior
+    // attachment leaves its namespace registered on the router. Re-attaching
+    // (re-login after logout) MUST start from a clean router — otherwise
+    // BridgeRouter.register throws "namespace 'chat' already registered",
+    // attachChatServer rejects, startChatServer fails, and the post-relogin
+    // runtime never connects (no catch-up, stale roster, dead group delivery).
+    this.#router = new BridgeRouter();
     this.#router.register(bridge.getSpec());
     this.#subscribeBridgeEvents();
     this.#bridgeReady = true;
