@@ -2,6 +2,7 @@ import { ThreadStoreService, ThreadIndexService, ContactStore, GroupStore, Chann
 import { ChatServerBus } from "./ChatServerBus.js";
 import { ChatBridge } from "../transport/ChatBridge.js";
 import { InboundDepositPipeline } from "../runtime/InboundDepositPipeline.js";
+import { ProcessedDepositLog } from "../inbox/ProcessedDepositLog.js";
 import {
   ServerRuntimeService,
   ServerSessionService,
@@ -287,9 +288,16 @@ export class ChatServerApp {
     // deposits through this one pipeline so each is fully applied before the
     // next — no fire-and-forget emit, no ordering race. Not a lifecycle service
     // (no start/stop); registered on the bus for the bridge + catch-up to reach.
+    // Persisted (mailbox,event) dedup shared by the pipeline (check + mark) and
+    // the catch-up drain (prune past the cursor). Stops a cold-boot drain from
+    // re-decrypting a deposit already consumed via the live push path — a
+    // re-decrypt fails the advanced double ratchet and used to swallow the next
+    // (genuinely new) offline message.
+    const processedLog = new ProcessedDepositLog({ kvStore: this.#storageProvider.getKeyValueStore(null) });
     const inboundPipeline = new InboundDepositPipeline({
       peerLinkProtocol: services.peerLinkProtocol,
       events: services.events,
+      processedLog,
       logger,
     });
     // Catchup is only meaningful when an inbox is claimed (production). In
@@ -302,6 +310,7 @@ export class ChatServerApp {
         storageProvider: this.#storageProvider,
         inboxClaimant,
         inboundPipeline,
+        processedLog,
         logger,
       });
     }

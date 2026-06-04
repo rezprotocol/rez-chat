@@ -29,10 +29,11 @@
 export class InboundDepositPipeline {
   #peerLinkProtocol;
   #events;
+  #processedLog;
   #logger;
   #tail;
 
-  constructor({ peerLinkProtocol, events, logger = console } = {}) {
+  constructor({ peerLinkProtocol, events, processedLog = null, logger = console } = {}) {
     if (!peerLinkProtocol || typeof peerLinkProtocol.processDeposit !== "function") {
       throw new Error("InboundDepositPipeline requires peerLinkProtocol.processDeposit");
     }
@@ -41,6 +42,13 @@ export class InboundDepositPipeline {
     }
     this.#peerLinkProtocol = peerLinkProtocol;
     this.#events = events;
+    // Optional persisted (mailbox,event) dedup. Prevents re-decrypting a deposit
+    // that was already consumed via the live push path when the catch-up drain
+    // re-fetches it on a later cold boot — a re-decrypt fails the double ratchet.
+    this.#processedLog = processedLog && typeof processedLog.has === "function"
+      && typeof processedLog.mark === "function"
+      ? processedLog
+      : null;
     this.#logger = logger;
     this.#tail = Promise.resolve();
   }
@@ -63,13 +71,49 @@ export class InboundDepositPipeline {
     return run;
   }
 
+  #frameIds(frame) {
+    const body = frame && frame.body && typeof frame.body === "object" ? frame.body : (frame || {});
+    const mailboxId = typeof body.mailboxId === "string" ? body.mailboxId : "";
+    const eventId = typeof body.eventId === "string" ? body.eventId : "";
+    return { mailboxId, eventId };
+  }
+
   async #processOne(frame) {
+    const { mailboxId, eventId } = this.#frameIds(frame);
+    // Skip a deposit already decrypted + consumed earlier (typically via the
+    // live push path) and now re-fetched by the catch-up drain. Re-decrypting it
+    // would fail the (already-advanced) double ratchet and could swallow the
+    // genuinely-new deposit that follows. Downstream applies are canonical-key
+    // idempotent; the decrypt is the one non-idempotent step, so dedup here.
+    if (this.#processedLog && eventId) {
+      let already = false;
+      try {
+        already = await this.#processedLog.has(mailboxId, eventId);
+      } catch (err) {
+        this.#logger.error("[InboundDepositPipeline] processed-log lookup failed: "
+          + (err && err.message ? err.message : err));
+      }
+      if (already) return;
+    }
     let decrypted = null;
+    let decryptOk = false;
     try {
       decrypted = await this.#peerLinkProtocol.processDeposit(frame);
+      decryptOk = true;
     } catch (err) {
       this.#logger.error("[InboundDepositPipeline] peer-link decrypt/handle failed: "
         + (err && err.message ? err.message : err));
+    }
+    // Mark processed immediately after a successful decrypt (the non-idempotent
+    // step), before the idempotent applies below — a crash mid-apply must not
+    // force a re-decrypt on the next boot.
+    if (this.#processedLog && eventId && decryptOk) {
+      try {
+        await this.#processedLog.mark(mailboxId, eventId);
+      } catch (err) {
+        this.#logger.error("[InboundDepositPipeline] processed-log mark failed: "
+          + (err && err.message ? err.message : err));
+      }
     }
     if (decrypted && decrypted.userMessage) {
       try {

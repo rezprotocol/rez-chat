@@ -24,8 +24,9 @@ export class InboxCatchupService extends BaseServerService {
   #pending;
   #offReconnect;
   #pipeline;
+  #processedLog;
 
-  constructor({ bus, storageProvider, inboxClaimant, inboundPipeline, pageLimit = DEFAULT_PAGE_LIMIT, logger = console } = {}) {
+  constructor({ bus, storageProvider, inboxClaimant, inboundPipeline, processedLog = null, pageLimit = DEFAULT_PAGE_LIMIT, logger = console } = {}) {
     super({ bus, logger });
     if (!storageProvider || typeof storageProvider.getKeyValueStore !== "function") {
       throw new Error("InboxCatchupService requires storageProvider");
@@ -39,6 +40,10 @@ export class InboxCatchupService extends BaseServerService {
     this.#cursor = new InboxCatchupCursor({ kvStore: storageProvider.getKeyValueStore(null) });
     this.#inboxClaimant = inboxClaimant;
     this.#pipeline = inboundPipeline;
+    // Optional dedup log shared with the pipeline. Once the cursor passes an
+    // eventId it is never re-fetched, so its processed-marker is redundant —
+    // forget it to keep the log bounded to "consumed-via-push since last drain".
+    this.#processedLog = processedLog && typeof processedLog.forget === "function" ? processedLog : null;
     this.#pageLimit = Number.isInteger(pageLimit) && pageLimit > 0 ? pageLimit : DEFAULT_PAGE_LIMIT;
     this.#draining = false;
     this.#pending = false;
@@ -134,6 +139,14 @@ export class InboxCatchupService extends BaseServerService {
         // a member.join is applied before any message that depends on it.
         await this.#pipeline.submit(frame);
         await this.#cursor.write(mailboxId, eventId);
+        // The event is now at/below the high-water mark and will never be
+        // re-fetched, so its dedup marker is redundant — drop it to keep the
+        // processed-log bounded.
+        if (this.#processedLog) {
+          await this.#processedLog.forget(mailboxId, eventId).catch((err) => {
+            this.logger.error("[InboxCatchupService] processed-log forget failed: " + (err && err.message ? err.message : err));
+          });
+        }
         cursor = eventId;
       }
       const nextCursor = page && typeof page.nextCursor === "string" ? page.nextCursor : null;
