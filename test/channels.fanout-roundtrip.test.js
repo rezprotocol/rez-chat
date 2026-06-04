@@ -1,8 +1,8 @@
 // channels.fanout-roundtrip.test.js
 //
 // Integration roundtrip for the channels feature. Drives two real
-// ChatServerApp instances side-by-side. Alice's mock SDK captures every
-// `sendEncryptedDeposit` and we bridge those bytes into Bob's chat bus
+// ChatServerApp instances side-by-side. Alice's SDK double captures every
+// seal-for-peer send and we bridge those bytes into Bob's chat bus
 // via `peerlink.user.message`, which is the exact bus event that
 // ServerPeerLinkProtocolService fires after decrypting an inbound user
 // payload. From there everything runs through the production
@@ -203,8 +203,8 @@ test("channels roundtrip: tagged message from alice causes bob to observe the ch
   await startBoth([alice, bob]);
 
   // Stub group fan-out so the group-message send-path's fan-out also bridges
-  // through our test bridge. ServerMessagesService uses
-  // sdk.sendEncryptedDeposit for group fan-out which our mock already captures.
+  // through our test bridge. ServerMessagesService uses sdk.sealForPeer +
+  // mesh.dispatch for group fan-out, which the shared double already captures.
   const bobUpserted = [];
   bob.bus.on("channel.upserted", (record) => bobUpserted.push(record));
 

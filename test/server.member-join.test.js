@@ -127,8 +127,8 @@ test("acceptor side: invite.accept emits a member.join op to the inviter", async
   });
   assert.equal(accepted.groupId, groupId);
 
-  // sendEncryptedDeposit should have been called once with a member.join
-  // op addressed to the inviter.
+  // a member.join op should have been sealed + dispatched once, addressed to
+  // the inviter.
   assert.equal(sends.length, 1, "exactly one outbound member.join send");
   assert.equal(sends[0].peerAccountId, inviterAccountId);
   const op = decodeGroupOpFromDeposit(sends[0]);

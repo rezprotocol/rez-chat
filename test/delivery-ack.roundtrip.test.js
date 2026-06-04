@@ -98,7 +98,7 @@ function nextEventId() {
   return "evt_" + nextEventId._counter;
 }
 
-// Drain sender's captured sendEncryptedDeposit buffer and route each to the
+// Drain sender's captured seal-for-peer buffer and route each to the
 // receiver's bus. Delivery acks (`kind === "rez.delivery.ack"`) are
 // dispatched via the `delivery.ack` bus event — that's what
 // ServerPeerLinkProtocolService does after decrypt. Everything else is
