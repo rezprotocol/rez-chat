@@ -66,8 +66,8 @@ export class ServerFileTransferService extends BaseServerService {
 
   async start() {
     const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
-    if (!sdk || typeof sdk.sendEncryptedDeposit !== "function") {
-      throw new Error("ServerFileTransferService requires sdk with sendEncryptedDeposit");
+    if (!sdk || typeof sdk.sealForPeer !== "function" || !sdk.mesh) {
+      throw new Error("ServerFileTransferService requires sdk with sealForPeer + mesh");
     }
 
     this.#fileTransferService = new FileTransferService({
@@ -113,11 +113,14 @@ export class ServerFileTransferService extends BaseServerService {
         if (groupTargets) {
           if (groupTargets.length === 0) return;
           const results = await Promise.allSettled(
-            groupTargets.map((accountId) => sdk.sendEncryptedDeposit({
+            groupTargets.map((accountId) => sdk.sealForPeer({
               peerAccountId: accountId,
               plaintextBodyBytes: bodyBytes,
               receiptInboxId: receiptInboxId || undefined,
-            })),
+            }).then((sealed) => sdk.mesh.dispatch(
+              sealed.object,
+              sealed.address,
+            ))),
           );
           let failedCount = 0;
           for (const r of results) {
@@ -134,12 +137,16 @@ export class ServerFileTransferService extends BaseServerService {
           }
           return;
         }
-        await sdk.sendEncryptedDeposit({
+        const sealed = await sdk.sealForPeer({
           peerAccountId,
           plaintextBodyBytes: bodyBytes,
           deliverInboxId,
           receiptInboxId: receiptInboxId || undefined,
         });
+        await sdk.mesh.dispatch(
+          sealed.object,
+          sealed.address,
+        );
       },
       onFileReceived: ({ transferId, manifest, fileBytes, senderAccountId, contextId }) => {
         this.#handleFileReceived({ transferId, manifest, fileBytes, senderAccountId, threadId: contextId }).catch((err) => {

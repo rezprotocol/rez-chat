@@ -102,7 +102,7 @@ export class ServerProfileService extends BaseServerService {
     });
 
     const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
-    if (!sdk || typeof sdk.sendEncryptedDeposit !== "function") {
+    if (!sdk || typeof sdk.sealForPeer !== "function" || !sdk.mesh) {
       this.logger.warn("[ServerProfileService] sdk unavailable, skipping broadcast");
       return new ProfileBroadcastResult({ sent: 0, failed: 0, avatarFileHash: avatarFileHash || "" });
     }
@@ -129,11 +129,15 @@ export class ServerProfileService extends BaseServerService {
             avatarFileHash,
           });
         }
-        await sdk.sendEncryptedDeposit({
+        const sealed = await sdk.sealForPeer({
           peerAccountId: peerAccountId,
           plaintextBodyBytes,
           deliverInboxId: peerInboxId,
         });
+        await sdk.mesh.dispatch(
+          sealed.object,
+          sealed.address,
+        );
         sent++;
       } catch (err) {
         failed++;
@@ -159,7 +163,7 @@ export class ServerProfileService extends BaseServerService {
     if (typeof threadId !== "string" || threadId.trim().length === 0) return;
 
     const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
-    if (!sdk || typeof sdk.sendEncryptedDeposit !== "function") return;
+    if (!sdk || typeof sdk.sealForPeer !== "function" || !sdk.mesh) return;
 
     const displayName = this.#ownerDisplayName;
     if (!displayName) return;
@@ -196,11 +200,15 @@ export class ServerProfileService extends BaseServerService {
       avatarFileHash: this.#ownerAvatarFileHash || "",
     });
 
-    await sdk.sendEncryptedDeposit({
+    const sealed = await sdk.sealForPeer({
       peerAccountId: peerAccountId.trim(),
       plaintextBodyBytes: payload.toBytes(),
       deliverInboxId: deliverTo,
     });
+    await sdk.mesh.dispatch(
+      sealed.object,
+      sealed.address,
+    );
   }
 
   async #sendAvatarFileToPeer({ sdk, peerAccountId, peerInboxId, avatarFileHash }) {
@@ -214,11 +222,15 @@ export class ServerProfileService extends BaseServerService {
       fileDataB64: b64,
     });
     const bodyBytes = new TextEncoder().encode(JSON.stringify(avatarPayload.toJSON()));
-    await sdk.sendEncryptedDeposit({
+    const sealed = await sdk.sealForPeer({
       peerAccountId: peerAccountId,
       plaintextBodyBytes: bodyBytes,
       deliverInboxId: peerInboxId,
     });
+    await sdk.mesh.dispatch(
+      sealed.object,
+      sealed.address,
+    );
   }
 
   async handleIncomingProfile(record, { senderAccountId } = {}) {

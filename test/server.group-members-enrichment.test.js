@@ -4,6 +4,7 @@ import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupStore } from "../src/server/storage/ChatGroupStore.js";
 import { ContactStore } from "../src/server/storage/ChatContactStore.js";
 import { GroupMembersListParams } from "../src/records/index.js";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -87,7 +88,7 @@ test("listGroupMembers enriches members with contact display names", async () =>
     ownerAccountId: OWNER,
     clock,
     sdk: {
-      sendEncryptedDeposit: async () => ({ ok: true }),
+      ...makeSealDispatch(),
       getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
     },
   });
@@ -139,7 +140,7 @@ test("listGroupMembers returns null displayName when no contact exists", async (
     ownerAccountId: OWNER,
     clock,
     sdk: {
-      sendEncryptedDeposit: async () => ({ ok: true }),
+      ...makeSealDispatch(),
       getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
     },
   });

@@ -19,6 +19,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { REZ_CONTRACT_TYPES } from "@rezprotocol/sdk/client";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -52,7 +53,7 @@ const ALICE_DM_THREAD = "th_dm_alice_bob_a";
 
 function makeServer({ ownerAccountId, storage, sendBehavior, clock }) {
   const sdk = {
-    sendEncryptedDeposit: async (opts) => sendBehavior(opts),
+    ...makeSealDispatch({ dispatchResult: (body) => sendBehavior({ deliverInboxId: body.mailboxId }) }),
     getIdentity: () => ({ localInboxId: "inbox:" + ownerAccountId }),
     subscriptions: {
       onEvent: () => () => {},
@@ -211,7 +212,7 @@ test("resend after queued+expired clears stale tracking and drives a fresh sent 
   let outboundStatusHandler = null;
   const alice = (() => {
     const sdk = {
-      sendEncryptedDeposit: async (opts) => sendBehavior(opts),
+      ...makeSealDispatch({ dispatchResult: (body) => sendBehavior({ deliverInboxId: body.mailboxId }) }),
       getIdentity: () => ({ localInboxId: "inbox:" + ALICE }),
       subscriptions: {
         onEvent: (eventType, handler) => {

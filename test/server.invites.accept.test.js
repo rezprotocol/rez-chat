@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import {
   encodeInviteCodeV3,
+  MeshCapability,
   PEERLINK_INVITE_RECORD_KIND,
 } from "@rezprotocol/sdk/client";
 
@@ -209,13 +210,18 @@ test("invite.create forwards title; invite.accept materializes the group with th
   };
 
   const durableRecords = makeDurableRecordStore();
+  const mailbox = { deposit: async () => ({ eventId: "evt-1" }) };
   const server = createServer({
     clock: () => { now += 1; return now; },
     sdk: {
       getIdentity: () => ({ localInboxId: "inbox:bob" }),
-      mailbox: { deposit: async () => ({ eventId: "evt-1" }) },
+      mailbox,
       peerLinks: { getPeerLink: async () => groupSnapshot },
       durableRecords,
+      // createInvite now publishes via the real mesh-dispatch verb. Wire a real
+      // MeshCapability over the stub store so dispatch routing + the coordinate
+      // guard are genuinely exercised — only the leaf store is a stand-in.
+      mesh: new MeshCapability({ pool: null, mailbox, durableRecords }),
     },
     peerLinks: fakePeerLinks,
   });

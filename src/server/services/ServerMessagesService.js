@@ -229,27 +229,16 @@ export class ServerMessagesService extends BaseServerService {
     let eventId = "";
     let messageQueued = false;
     let queuedInboxIds = [];
+    // Every chat thread id is minted with a `th_` prefix (ServerThreadsService /
+    // defaultRezConfig), so delivery always routes through #deliverToThread,
+    // which seals per-recipient before handing opaque bytes to the mesh. There
+    // is deliberately NO raw-mailbox path here: depositing plaintext straight to
+    // a mailbox would violate Shape A (the node must never see plaintext).
     if (threadId && threadId.indexOf("th_") === 0) {
       const routed = await this.#deliverToThread({ threadId, plaintextBodyBytes, sdk, eventTag: messageId, now });
       eventId = routed.eventId;
       messageQueued = routed.queued;
       queuedInboxIds = Array.isArray(routed.queuedInboxIds) ? routed.queuedInboxIds : [];
-    } else if (threadId) {
-      const result = sdk && sdk.mailbox && typeof sdk.mailbox.deposit === "function"
-        ? await sdk.mailbox.deposit({
-          mailboxId: threadId,
-          objectId: "",
-          data: wirePayload,
-          metadata: {
-            messageId,
-            targetCapabilityId: params.targetCapabilityId,
-          },
-        }).catch((err) => {
-          this.logger.error("[ServerMessagesService] local deposit failed", err && err.message ? err.message : err);
-          return null;
-        })
-        : null;
-      eventId = result && typeof result.eventId === "string" ? result.eventId.trim() : "";
     }
 
     if (threadId) {
@@ -542,7 +531,7 @@ export class ServerMessagesService extends BaseServerService {
     const peerAccountId = thread && typeof thread.peerAccountId === "string" ? thread.peerAccountId.trim() : "";
     const peerInboxId = thread && typeof thread.peerInboxId === "string" ? thread.peerInboxId.trim() : "";
     const resolvedSdk = sdk || (this.bus.runtime ? this.bus.runtime.sdk : null);
-    if (!resolvedSdk || typeof resolvedSdk.sendEncryptedDeposit !== "function") {
+    if (!resolvedSdk || typeof resolvedSdk.sealForPeer !== "function" || !resolvedSdk.mesh) {
       throw new Error("Cannot deliver to thread: sdk unavailable");
     }
     const localIdentity = typeof resolvedSdk.getIdentity === "function" ? resolvedSdk.getIdentity() : {};
@@ -570,12 +559,18 @@ export class ServerMessagesService extends BaseServerService {
       throw new Error("Cannot deliver to peer-link thread: peer account not resolved");
     }
     try {
-      const result = await resolvedSdk.sendEncryptedDeposit({
+      // Seal the message for the peer (crypto + inbox resolution), then hand
+      // the opaque object to the mesh. The creator names no transport.
+      const sealed = await resolvedSdk.sealForPeer({
         peerAccountId: peerAccountId,
         plaintextBodyBytes,
         deliverInboxId: peerInboxId,
         receiptInboxId: localInboxId || undefined,
       });
+      const result = await resolvedSdk.mesh.dispatch(
+        sealed.object,
+        sealed.address,
+      );
       // Node-side gateway couldn't route synchronously but persisted the
       // deposit into PersistentOutboundQueue; RetryScheduler will keep
       // attempting delivery until success or 72h TTL expiry.
@@ -646,7 +641,7 @@ export class ServerMessagesService extends BaseServerService {
   }
 
   async #sendGroupFanOut({ sdk, groupId, plaintextBodyBytes, localInboxId } = {}) {
-    if (!sdk || typeof sdk.sendEncryptedDeposit !== "function") {
+    if (!sdk || typeof sdk.sealForPeer !== "function" || !sdk.mesh) {
       throw new Error("sendGroupFanOut: sdk unavailable");
     }
     const members = await this.#groupStore.listMembers({
@@ -663,11 +658,14 @@ export class ServerMessagesService extends BaseServerService {
       return { sentCount: 0, failedCount: 0, skippedCount: 0, queuedCount: 0, queuedInboxIds: [] };
     }
     const results = await Promise.allSettled(
-      targets.map((member) => sdk.sendEncryptedDeposit({
+      targets.map((member) => sdk.sealForPeer({
         peerAccountId: member.accountId,
         plaintextBodyBytes,
         receiptInboxId: localInboxId || undefined,
-      })),
+      }).then((sealed) => sdk.mesh.dispatch(
+        sealed.object,
+        sealed.address,
+      ))),
     );
     let sentCount = 0;
     let failedCount = 0;

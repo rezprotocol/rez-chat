@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { MessageSendParams } from "../src/records/index.js";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupStore } from "../src/server/storage/ChatGroupStore.js";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 // Minimal in-memory key-value store for test isolation
 class TestKVStore {
@@ -44,13 +45,15 @@ const THREAD_ID = "th_group_test1";
 
 function makeNodeRuntime({ sendResult, sendError } = {}) {
   return {
-    sendEncryptedDeposit: async (opts) => {
-      if (sendError) {
-        const err = typeof sendError === "function" ? sendError(opts) : sendError;
-        if (err) throw err;
-      }
-      return sendResult || { ok: true };
-    },
+    ...makeSealDispatch({
+      onSend: sendError
+        ? (opts) => {
+          const err = typeof sendError === "function" ? sendError(opts) : sendError;
+          if (err) throw err;
+        }
+        : null,
+      dispatchResult: sendResult || null,
+    }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
 }
@@ -112,10 +115,6 @@ function sendThreadMessage(server, payload) {
     threadId: payload.mailboxId,
     payload: payload.data,
     messageId: payload.metadata && typeof payload.metadata.messageId === "string" ? payload.metadata.messageId : "",
-    targetCapabilityId:
-      payload.metadata && typeof payload.metadata.targetCapabilityId === "string"
-        ? payload.metadata.targetCapabilityId
-        : "",
   });
   return server.bus.call("message", "send", record);
 }
@@ -124,7 +123,7 @@ test("group fan-out sends to all active members with peer links", async () => {
   const storage = new TestStorageProvider();
   const sent = [];
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => { sent.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sent.push(opts) }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
   await seedGroupThread(storage, {
@@ -160,15 +159,16 @@ test("members without peer links are skipped (NO_DELIVERY_TARGET)", async () => 
   const storage = new TestStorageProvider();
   const sent = [];
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => {
-      if (opts.peerAccountId === MEMBER_B) {
-        const err = new Error("no peer link");
-        err.code = "NO_DELIVERY_TARGET";
-        throw err;
-      }
-      sent.push(opts);
-      return { ok: true };
-    },
+    ...makeSealDispatch({
+      onSend: (opts) => {
+        if (opts.peerAccountId === MEMBER_B) {
+          const err = new Error("no peer link");
+          err.code = "NO_DELIVERY_TARGET";
+          throw err;
+        }
+        sent.push(opts);
+      },
+    }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
   await seedGroupThread(storage, {
@@ -198,7 +198,7 @@ test("self is excluded from fan-out targets", async () => {
   const storage = new TestStorageProvider();
   const sent = [];
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => { sent.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sent.push(opts) }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
   await seedGroupThread(storage, {
@@ -229,7 +229,7 @@ test("empty group (no other active members) returns without sending", async () =
   const storage = new TestStorageProvider();
   const sent = [];
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => { sent.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sent.push(opts) }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
   await seedGroupThread(storage, {
@@ -255,7 +255,7 @@ test("DM path unchanged (regression)", async () => {
   const storage = new TestStorageProvider();
   const sent = [];
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => { sent.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sent.push(opts) }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
 
@@ -289,22 +289,20 @@ test("mixed results: some sent, some skipped, some queued", async () => {
   const storage = new TestStorageProvider();
   const memberC = "rez:acct:member-c";
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => {
-      if (opts.peerAccountId === MEMBER_A) {
-        return { ok: true };
-      }
-      if (opts.peerAccountId === MEMBER_B) {
-        const err = new Error("no peer link");
-        err.code = "NO_DELIVERY_TARGET";
-        throw err;
-      }
-      if (opts.peerAccountId === memberC) {
-        const err = new Error("queued");
-        err.queued = true;
-        throw err;
-      }
-      return { ok: true };
-    },
+    ...makeSealDispatch({
+      onSend: (opts) => {
+        if (opts.peerAccountId === MEMBER_B) {
+          const err = new Error("no peer link");
+          err.code = "NO_DELIVERY_TARGET";
+          throw err;
+        }
+        if (opts.peerAccountId === memberC) {
+          const err = new Error("queued");
+          err.queued = true;
+          throw err;
+        }
+      },
+    }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
   await seedGroupThread(storage, {
@@ -334,7 +332,7 @@ test("inactive members are excluded from fan-out", async () => {
   const storage = new TestStorageProvider();
   const sent = [];
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => { sent.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sent.push(opts) }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
   await seedGroupThread(storage, {
@@ -372,7 +370,7 @@ test("group.kick by non-admin throws ADMIN_REQUIRED and does not mutate or fan o
   const storage = new TestStorageProvider();
   const sent = [];
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => { sent.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sent.push(opts) }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
   await seedGroupThread(storage, {
@@ -401,7 +399,7 @@ test("group.setRole by non-admin throws ADMIN_REQUIRED", async () => {
   const storage = new TestStorageProvider();
   const sent = [];
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => { sent.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sent.push(opts) }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
   await seedGroupThread(storage, {
@@ -426,7 +424,7 @@ test("group.rename by non-admin throws ADMIN_REQUIRED and does not change title"
   const storage = new TestStorageProvider();
   const sent = [];
   const nodeRuntime = {
-    sendEncryptedDeposit: async (opts) => { sent.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sent.push(opts) }),
     getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
   };
   await seedGroupThread(storage, {

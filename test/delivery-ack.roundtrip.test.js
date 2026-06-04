@@ -19,6 +19,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -55,10 +56,7 @@ const GROUP_THREAD = "th_" + GROUP_ID;
 
 function makeServer({ ownerAccountId, storage, sendCapture, clock }) {
   const sdk = {
-    sendEncryptedDeposit: async (opts) => {
-      if (Array.isArray(sendCapture)) sendCapture.push(opts);
-      return { ok: true };
-    },
+    ...makeSealDispatch({ onSend: (opts) => { if (Array.isArray(sendCapture)) sendCapture.push(opts); } }),
     getIdentity: () => ({ localInboxId: "inbox:" + ownerAccountId }),
   };
   return new ChatServerApp({

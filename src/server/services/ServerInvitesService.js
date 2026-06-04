@@ -7,7 +7,8 @@ import {
 import { BaseServerService } from "../base/BaseServerService.js";
 import {
   base64ToBytes,
-  bytesToBase64,
+  buildInboxAddress,
+  buildRendezvousAddress,
   encodeInviteCodeV3,
   isInviteCodeV3,
   parseInviteCodeV3,
@@ -103,13 +104,24 @@ export class ServerInvitesService extends BaseServerService {
       publisherPublicKeyB64: result.publisherPublicKeyB64,
     });
 
-    // Publish the signed envelope as a durable record so acceptors can fetch
-    // it while the inviter is offline. The inviter is, by definition, online
-    // here at create time — putRecord pushes it to the k-closest backbone
+    // Publish the signed envelope at its rendezvous coordinate so acceptors can
+    // fetch it while the inviter is offline. The inviter is, by definition,
+    // online here at create time — dispatch pushes it to the k-closest backbone
     // nodes, which keep it alive thereafter. Local-only fallback (replicas=0)
     // still lets same-node accepts resolve via the stored invite record.
+    //
+    // ServerInvitesService names the rendezvous coordinate (the invite's
+    // identity); the mesh owns the mechanism. It does NOT call durableRecords
+    // directly — that selection is routing's, not the creator's.
     const sdk = this._sdk();
-    await sdk.durableRecords.put({ record: result.durableRecord });
+    await sdk.mesh.dispatch(
+      { record: result.durableRecord },
+      buildRendezvousAddress({
+        recordKind: PEERLINK_INVITE_RECORD_KIND,
+        recordId: result.inviteId,
+        publisherPublicKeyB64: result.publisherPublicKeyB64,
+      }),
+    );
 
     return new InviteCreateResult({
       peerLinkId: result.peerLinkId,
@@ -185,12 +197,10 @@ export class ServerInvitesService extends BaseServerService {
           throw err;
         }
         const objectId = "hs_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
-        await sdk.mailbox.deposit({
-          mailboxId: target,
-          objectId,
-          ciphertextB64: bytesToBase64(handshakePacket.toBytes()),
-          metadata: {},
-        });
+        await sdk.mesh.dispatch(
+          { payloadBytes: handshakePacket.toBytes(), objectId, metadata: {} },
+          buildInboxAddress({ inboxId: target }),
+        );
         return { packetId: objectId };
       },
     });
@@ -368,6 +378,12 @@ export class ServerInvitesService extends BaseServerService {
    * node has already verified the record's signature + slot-binding against
    * `publisherPublicKeyB64` before returning it. Returns `{ envelope,
    * signatureB64 }` or null if absent/malformed.
+   *
+   * NOTE (deferred, not drift): the publish side of this flow goes through the
+   * unified `mesh.dispatch(rendezvous-address)` verb, but this READ side still
+   * names `durableRecords` directly. There is intentionally no `mesh.resolve`
+   * fetch primitive yet — it lands in the Phase-4 "one overlay find" work, at
+   * which point this call migrates too. Until then the asymmetry is expected.
    */
   async _fetchDurableInviteEnvelope({ sdk, inviteId, publisherPublicKeyB64 }) {
     const record = await sdk.durableRecords.get({

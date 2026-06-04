@@ -1,4 +1,4 @@
-import { bytesToBase64, base64ToBytes } from "@rezprotocol/sdk/client";
+import { base64ToBytes, buildInboxAddress, bytesToBase64 } from "@rezprotocol/sdk/client";
 import { BaseServerService } from "../base/BaseServerService.js";
 
 /**
@@ -170,12 +170,14 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       this._emitPeerLinkUpdated(result.snapshot);
       if (result.handshakePacket && result.deliverInboxId) {
         try {
-          await this._sdk().mailbox.deposit({
-            mailboxId: result.deliverInboxId,
-            objectId: "rhresp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
-            ciphertextB64: bytesToBase64(result.handshakePacket),
-            metadata: {},
-          });
+          await this._sdk().mesh.dispatch(
+            {
+              payloadBytes: result.handshakePacket,
+              objectId: "rhresp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
+              metadata: {},
+            },
+            buildInboxAddress({ inboxId: result.deliverInboxId }),
+          );
         } catch (sendErr) {
           this.logger.error("[ServerPeerLinkProtocolService] rehandshake response send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
         }
@@ -286,7 +288,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
 
   async _sendHandshakeAck({ deliverInboxId, ownerDisplayName = "", ackNonce = null }) {
     const sdk = this._sdk();
-    if (!sdk || !sdk.mailbox) return;
+    if (!sdk || !sdk.mesh) return;
     if (typeof ackNonce !== "string" || ackNonce.length === 0) {
       this.logger.warn("[ServerPeerLinkProtocolService] handshake.ack send skipped — missing ackNonce");
       return;
@@ -311,12 +313,14 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       return;
     }
     try {
-      await sdk.mailbox.deposit({
-        mailboxId: deliverInboxId,
-        objectId: "hsack_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
-        ciphertextB64: bytesToBase64(ackBytes),
-        metadata: {},
-      });
+      await sdk.mesh.dispatch(
+        {
+          payloadBytes: ackBytes,
+          objectId: "hsack_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
+          metadata: {},
+        },
+        buildInboxAddress({ inboxId: deliverInboxId }),
+      );
     } catch (sendErr) {
       this.logger.error("[ServerPeerLinkProtocolService] handshake.ack send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
     }
@@ -324,7 +328,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
 
   async _sendHandshakeReject({ deliverInboxId, reason, ackNonce = null }) {
     const sdk = this._sdk();
-    if (!sdk || !sdk.mailbox) return;
+    if (!sdk || !sdk.mesh) return;
     if (typeof ackNonce !== "string" || ackNonce.length === 0) {
       this.logger.warn("[ServerPeerLinkProtocolService] handshake.reject send skipped — missing ackNonce");
       return;
@@ -347,12 +351,14 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       return;
     }
     try {
-      await sdk.mailbox.deposit({
-        mailboxId: deliverInboxId,
-        objectId: "hsrej_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
-        ciphertextB64: bytesToBase64(rejectBytes),
-        metadata: {},
-      });
+      await sdk.mesh.dispatch(
+        {
+          payloadBytes: rejectBytes,
+          objectId: "hsrej_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
+          metadata: {},
+        },
+        buildInboxAddress({ inboxId: deliverInboxId }),
+      );
     } catch (sendErr) {
       this.logger.error("[ServerPeerLinkProtocolService] handshake.reject send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
     }
@@ -367,17 +373,19 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       peerAccountId,
       sendRehandshake: async ({ deliverInboxId, packetBytes }) => {
         const sdk = this._sdk();
-        if (!sdk || !sdk.mailbox) {
-          const err = new Error("sdk.mailbox unavailable for rehandshake send");
+        if (!sdk || !sdk.mesh) {
+          const err = new Error("sdk.mesh unavailable for rehandshake send");
           err.code = "UNREACHABLE";
           throw err;
         }
-        await sdk.mailbox.deposit({
-          mailboxId: deliverInboxId,
-          objectId: "rhreq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
-          ciphertextB64: bytesToBase64(packetBytes),
-          metadata: {},
-        });
+        await sdk.mesh.dispatch(
+          {
+            payloadBytes: packetBytes,
+            objectId: "rhreq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
+            metadata: {},
+          },
+          buildInboxAddress({ inboxId: deliverInboxId }),
+        );
       },
     }).catch((rhErr) => {
       this.logger.error("[ServerPeerLinkProtocolService] requestRehandshake failed", rhErr && rhErr.message ? rhErr.message : rhErr);
