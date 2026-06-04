@@ -16,16 +16,35 @@ export class ServerEventService extends BaseServerService {
   }
 
   async start() {
-    // Both the live SDK push (via MailboxPushBridge) and the
-    // InboxCatchupService re-emit on this single bus event, so we no
-    // longer subscribe to sdk.subscriptions.onMailboxDeposited directly.
-    this._listen("runtime.event.mailbox.deposited", (event) => this.#handleMailboxDeposited(event));
-    // Shape A: ServerPeerLinkProtocolService decrypts E2EE deposits and feeds
-    // peer-link snapshots, user messages, and delivery acks back through the
-    // chat bus so this service can materialize them.
-    this.bus.on("peerlink.user.message", (event) => this.#handlePeerlinkUserMessage(event));
+    // Inbound deposit application is NOT event-driven. Processing a deposit is
+    // a directive that must complete-and-confirm before the next deposit is
+    // touched (catch-up ordering correctness — see InboundDepositPipeline and
+    // memory feedback_inbound_deposit_pipeline_must_be_awaited_calls). The
+    // pipeline calls processDeposit()/applyUserMessage() directly and awaits
+    // them, in order; we therefore do NOT subscribe to the deposit/user-message
+    // bus events here. Peer-link snapshots + delivery acks remain true
+    // notifications (react-if-you-care), so they stay as bus subscriptions.
     this.bus.on("peerlink.protocol.snapshot", (event) => this.#handlePeerLinkUpdated({ body: event }));
     this.bus.on("delivery.ack", (event) => this.#handleDeliveryAck({ body: event }));
+  }
+
+  /**
+   * Apply a raw inbound deposit (plaintext app deposits; E2EE bodies are
+   * decrypted upstream by ServerPeerLinkProtocolService and applied via
+   * {@link applyUserMessage}). Awaitable directive — the inbound pipeline
+   * awaits this to completion before processing the next deposit.
+   */
+  async processDeposit(event) {
+    return this.#handleMailboxDeposited(event);
+  }
+
+  /**
+   * Apply a decrypted E2EE user message (plaintext + authenticated sender)
+   * surfaced by ServerPeerLinkProtocolService.processDeposit. Awaitable
+   * directive — feeds the same apply core as a plaintext deposit.
+   */
+  async applyUserMessage(data) {
+    return this.#handlePeerlinkUserMessage(data);
   }
 
   async #handlePeerLinkUpdated(event) {

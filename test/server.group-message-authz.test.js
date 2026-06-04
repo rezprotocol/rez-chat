@@ -80,13 +80,15 @@ async function deliverGroupMessage(app, { authedSender, claimedSender, messageId
     text,
   };
   const plaintextB64 = Buffer.from(JSON.stringify(body)).toString("base64");
-  app.bus.emit("peerlink.user.message", {
+  // Drive the canonical apply directive directly — this is exactly what the
+  // serialized InboundDepositPipeline calls after ServerPeerLinkProtocolService
+  // decrypts an E2EE deposit (no longer a fire-and-forget bus event).
+  await app.bus.services.events.applyUserMessage({
     eventId: "evt_" + messageId,
     mailboxId: "inbox:alice",
     senderAccountId: authedSender,
     plaintextB64,
   });
-  await flush();
   return threadId;
 }
 

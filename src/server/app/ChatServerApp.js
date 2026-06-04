@@ -1,6 +1,7 @@
 import { ThreadStoreService, ThreadIndexService, ContactStore, GroupStore, ChannelStore, LinkPreviewStore } from "../storage/index.js";
 import { ChatServerBus } from "./ChatServerBus.js";
 import { ChatBridge } from "../transport/ChatBridge.js";
+import { InboundDepositPipeline } from "../runtime/InboundDepositPipeline.js";
 import {
   ServerRuntimeService,
   ServerSessionService,
@@ -281,6 +282,16 @@ export class ChatServerApp {
         logger,
       }),
     };
+    // The single serialized inbound path. Both the live SDK push
+    // (MailboxPushBridge) and the catch-up drain (InboxCatchupService) feed
+    // deposits through this one pipeline so each is fully applied before the
+    // next — no fire-and-forget emit, no ordering race. Not a lifecycle service
+    // (no start/stop); registered on the bus for the bridge + catch-up to reach.
+    const inboundPipeline = new InboundDepositPipeline({
+      peerLinkProtocol: services.peerLinkProtocol,
+      events: services.events,
+      logger,
+    });
     // Catchup is only meaningful when an inbox is claimed (production). In
     // unit-test paths that wire ChatServerApp without an inboxClaimant the
     // SDK push bridge is also not engaged, so nothing to drain. Added last
@@ -290,10 +301,11 @@ export class ChatServerApp {
         bus: this.bus,
         storageProvider: this.#storageProvider,
         inboxClaimant,
+        inboundPipeline,
         logger,
       });
     }
-    Object.assign(this.bus.services, services);
+    Object.assign(this.bus.services, services, { inboundPipeline });
     this.#services = Object.values(services);
   }
 }
