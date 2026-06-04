@@ -230,6 +230,12 @@ test("inviter side: inbound member.join materializes membership + persists syste
     "joiner is now an active group member");
   assert.equal(memberEvents.length, 1, "group.members.updated emitted");
 
+  // The joiner's display-name hint from the op is persisted on the membership
+  // row — the inviter has no CONTACT for the joiner, so this is the only name
+  // source for the joiner's row in the inviter's roster.
+  const joinerMembership = members.find((m) => m.accountId === joinerAccountId);
+  assert.equal(joinerMembership.displayName, "Bob", "joiner displayName persisted on membership");
+
   // System message persisted into the group thread.
   const threadId = server.bus.services.threads.groupThreadId(groupId);
   const page = await server.bus.stores.threadStore.listMessages({ threadId, limit: 10 });
@@ -554,6 +560,7 @@ test("inviter side: a kicked member is re-admitted ONLY by an invite issued AFTE
     ownerAccountId: inviterAccountId, groupId, accountId: joiner,
   });
   assert.equal(bob.state, "active", "a fresh post-kick invite re-admits Bob");
+  assert.equal(bob.displayName, "Bob", "re-admit refreshes the membership displayName from the op");
 });
 
 test("forwarded member.join CANNOT resurrect a removed member (only adds new ones)", async () => {

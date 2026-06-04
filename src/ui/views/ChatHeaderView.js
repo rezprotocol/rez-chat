@@ -323,8 +323,15 @@ export class ChatHeaderView extends BusComponent {
       h("div", { className: "text-body-sm text-on-surface font-body-sm whitespace-pre-wrap" }, members.map((member) => {
         const mid = String(member.accountId || "").trim();
         if (!mid) return "Account";
-        const name = queries && queries.contacts ? queries.contacts.displayName(mid) : null;
-        return name || shortId(mid, 12);
+        // Same resolution order as GroupMemberRowView: the contact/self check
+        // ("You" for the local owner, the saved contact name for the inviter)
+        // wins; the membership displayName (carried on the join op) covers a
+        // joiner the owner has no contact for; raw short-id is the last resort.
+        const contactName = queries && queries.contacts ? queries.contacts.displayName(mid) : null;
+        const memberName = typeof member.displayName === "string" && member.displayName.trim()
+          ? member.displayName.trim()
+          : "";
+        return contactName || memberName || shortId(mid, 12);
       }).join("\n")),
       // While catch-up is still draining, the roster above may be incomplete —
       // tell the user rather than letting a short list read as authoritative.
