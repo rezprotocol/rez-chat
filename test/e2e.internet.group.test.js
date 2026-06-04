@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import { readFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { startRezNode } from "@rezprotocol/node";
 import { bootstrapChatServer } from "../src/server/index.js";
+import { createDefaultRezConfig } from "../src/server/config/defaultRezConfig.js";
 
 /**
  * LIVE DO-relay GROUP e2e — fully un-mocked, real DigitalOcean relays.
@@ -26,11 +25,6 @@ import { bootstrapChatServer } from "../src/server/index.js";
  * e2e.internet.chat covers the all-online DM path. Mirrors its DO relay loading,
  * node bootstrap, and real chat-server wiring. Gated behind RUN_INTERNET_E2E=1.
  */
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const REPO_ROOT = path.resolve(__dirname, "..", "..");
-const RELAY_INFO_PATH = path.resolve(REPO_ROOT, "relays", "relay-info.json");
 
 const RUN_LIVE = String(process.env.RUN_INTERNET_E2E || "").trim() === "1";
 const ASSERT_ONION_PROOF = String(process.env.REZ_E2E_ASSERT_ONION_PROOF || "").trim() === "1";
@@ -226,35 +220,15 @@ async function stopChatNode(app, { keepTmp = false } = {}) {
   }
 }
 
+// The live DO relays are the production knownRelays baked into the default
+// rez config (r1/r2/r3.rezprotocol.io:8443, TLS) — the exact set the shipped
+// app dials. Use them directly so this test needs no relay-info.json overlay.
 function loadKnownRelays() {
-  const raw = readFileSync(RELAY_INFO_PATH, "utf8");
-  const parsed = JSON.parse(raw);
-  const relays = parsed && Array.isArray(parsed.relays) ? parsed.relays : [];
-  return relays.map((relay) => {
-    const relayKeyId = String(relay.relayKeyId || "").trim();
-    const endpoint = parseRelayEndpoint(relay.relayEndpoint);
-    if (!relayKeyId) throw new Error("relay is missing relayKeyId");
-    if (!endpoint) throw new Error("relay has invalid relayEndpoint");
-    return {
-      id: relayKeyId,
-      relayKeyId,
-      host: endpoint.host,
-      port: endpoint.port,
-      transport: "tcp",
-      tls: endpoint.protocol === "tls",
-    };
-  });
-}
-
-function parseRelayEndpoint(value) {
-  const text = typeof value === "string" ? value.trim() : "";
-  const match = text.match(/^(tcp|tls):\/\/([^:]+):(\d+)$/i);
-  if (!match) return null;
-  const protocol = String(match[1] || "").toLowerCase();
-  const host = String(match[2] || "").trim();
-  const port = Number(match[3]);
-  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
-  return { protocol, host, port };
+  const cfg = createDefaultRezConfig({ dataDir: path.join(os.tmpdir(), "rez-relay-cfg-ignored") });
+  const relays = cfg && cfg.node && cfg.node.network && Array.isArray(cfg.node.network.knownRelays)
+    ? cfg.node.network.knownRelays
+    : [];
+  return relays.map((relay) => ({ ...relay }));
 }
 
 async function waitForPeerLinkReady(chat, peerAccountId, timeoutMs, label) {
