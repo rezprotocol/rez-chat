@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupStore } from "../src/server/storage/ChatGroupStore.js";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -45,7 +46,7 @@ function createServer(storage) {
     ownerAccountId: OWNER,
     clock: () => 2000,
     sdk: {
-      sendEncryptedDeposit: async () => ({ ok: true }),
+      ...makeSealDispatch(),
       getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
     },
   });

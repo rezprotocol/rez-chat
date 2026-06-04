@@ -13,6 +13,7 @@ import {
   bytesToBase64,
   createDefaultStorageProvider,
   deriveAccountIdFromPublicKey,
+  MeshCapability,
 } from "@rezprotocol/sdk/client";
 import { PeerLinkService } from "@rezprotocol/sdk/peer-link";
 import { NodeCryptoProvider } from "@rezprotocol/node";
@@ -175,13 +176,18 @@ test("ServerPeerLinkProtocolService decrypts an inbound x3dh handshake and emits
   const ciphertextB64 = Buffer.from(capturedHandshakePacket.toBytes()).toString("base64");
 
   const deposits = [];
-  const fakeSdk = {
-    mailbox: {
-      deposit: async (opts) => {
-        deposits.push(opts);
-        return { eventId: "evt:deposit:" + deposits.length };
-      },
+  const mailbox = {
+    deposit: async (opts) => {
+      deposits.push(opts);
+      return { eventId: "evt:deposit:" + deposits.length };
     },
+  };
+  const fakeSdk = {
+    mailbox,
+    // The protocol service now sends the handshake.ack via mesh.dispatch; a real
+    // MeshCapability over the capturing mailbox keeps the deposit assertions
+    // meaningful while exercising real dispatch routing.
+    mesh: new MeshCapability({ pool: null, mailbox }),
     getIdentity: () => ({ localInboxId: aliceInboxId }),
   };
   const bus = makeFakeBus({ runtime: { peerLinks: alicePeerLinks, sdk: fakeSdk } });

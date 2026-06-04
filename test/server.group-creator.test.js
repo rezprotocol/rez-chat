@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupOpPayloadV1 } from "../src/records/payloads/GroupOpPayloadV1.js";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -46,7 +47,7 @@ function makeServer(ownerAccountId) {
     clock: () => Date.now(),
   });
   app.bus.runtime.sdk = {
-    sendEncryptedDeposit: async () => ({ ok: true }),
+    ...makeSealDispatch(),
     getIdentity: () => ({ localInboxId: "inbox:" + ownerAccountId }),
   };
   return app;

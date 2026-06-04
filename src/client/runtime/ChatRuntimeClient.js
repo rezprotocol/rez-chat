@@ -97,12 +97,11 @@ export class ChatRuntimeClient {
 
   // ---- Shape adapters (NOT bus directives) ----
 
-  async sendRezPayload({ threadId, payload, messageId = null, targetCapabilityId = "", channelId = "" } = {}) {
+  async sendRezPayload({ threadId, payload, messageId = null, channelId = "" } = {}) {
     return this.call("message.send", {
       threadId,
       payload: coerceRezPayload(payload),
       messageId: typeof messageId === "string" ? messageId : "",
-      targetCapabilityId: String(targetCapabilityId || ""),
       channelId: typeof channelId === "string" ? channelId.trim() : "",
     });
   }

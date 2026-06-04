@@ -339,16 +339,19 @@ export class ServerEventService extends BaseServerService {
         && thread.peerAccountId
         && thread.peerInboxId) {
       const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
-      if (sdk && typeof sdk.sendEncryptedDeposit === "function") {
+      if (sdk && typeof sdk.sealForPeer === "function" && sdk.mesh) {
         const ackRecord = new E2eeDeliveryAckV1({
           senderAccountId: this.ownerAccountId,
           messageIds: [messageId],
         });
-        sdk.sendEncryptedDeposit({
+        sdk.sealForPeer({
           peerAccountId: thread.peerAccountId,
           plaintextBodyBytes: ackRecord.toBytes(),
           deliverInboxId: thread.peerInboxId,
-        }).catch((ackErr) => {
+        }).then((sealed) => sdk.mesh.dispatch(
+          sealed.object,
+          sealed.address,
+        )).catch((ackErr) => {
           this.logger.error("[ServerEventService] delivery ack send failed", ackErr && ackErr.message ? ackErr.message : ackErr);
         });
       }

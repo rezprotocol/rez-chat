@@ -20,6 +20,7 @@ import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupOpPayloadV1 } from "../src/records/payloads/GroupOpPayloadV1.js";
 import { SYSTEM_EVENT_KIND } from "../src/records/payloads/ChatSystemEventPayloadV1.js";
 import { encodeInviteCodeV3 } from "@rezprotocol/sdk/client";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 // Realistic DER-SPKI Ed25519 key the v3 code commits to; the inner envelope
 // must be signed by the same identity (signerRef.signerPublicKeyB64).
@@ -84,7 +85,7 @@ test("acceptor side: invite.accept emits a member.join op to the inviter", async
   const sdk = {
     getIdentity: () => ({ localInboxId: "inbox:bob" }),
     mailbox: { deposit: async () => ({ eventId: "evt-1" }) },
-    sendEncryptedDeposit: async (opts) => { sends.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sends.push(opts) }),
     peerLinks: { getPeerLink: async () => groupSnapshot },
   };
   const groupSnapshot = {
@@ -126,8 +127,8 @@ test("acceptor side: invite.accept emits a member.join op to the inviter", async
   });
   assert.equal(accepted.groupId, groupId);
 
-  // sendEncryptedDeposit should have been called once with a member.join
-  // op addressed to the inviter.
+  // a member.join op should have been sealed + dispatched once, addressed to
+  // the inviter.
   assert.equal(sends.length, 1, "exactly one outbound member.join send");
   assert.equal(sends[0].peerAccountId, inviterAccountId);
   const op = decodeGroupOpFromDeposit(sends[0]);
@@ -146,7 +147,7 @@ async function setupInviterServerForJoin({ inviterAccountId, groupId, inviteId, 
   const sdk = {
     getIdentity: () => ({ localInboxId: "inbox:alice" }),
     mailbox: { deposit: async () => ({ eventId: "evt-x" }) },
-    sendEncryptedDeposit: async (opts) => { sends.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sends.push(opts) }),
     peerLinks: { getPeerLink: async () => null },
   };
   // Local invite record stored by the inviter — drives the join
@@ -355,7 +356,7 @@ test("forwarded member.join: honored when forwarder is an active group member", 
   const sdk = {
     getIdentity: () => ({ localInboxId: "inbox:carol" }),
     mailbox: { deposit: async () => ({ eventId: "evt-c" }) },
-    sendEncryptedDeposit: async () => ({ ok: true }),
+    ...makeSealDispatch(),
     peerLinks: { getPeerLink: async () => null },
   };
   // Carol has no invite record (not the inviter).
@@ -404,7 +405,7 @@ test("forwarded member.join: dropped when forwarder is not an active group membe
   const sdk = {
     getIdentity: () => ({ localInboxId: "inbox:carol" }),
     mailbox: { deposit: async () => ({ eventId: "evt-c" }) },
-    sendEncryptedDeposit: async () => ({ ok: true }),
+    ...makeSealDispatch(),
     peerLinks: { getPeerLink: async () => null },
   };
   const fakePeerLinks = { ownerAccountId: carolAccountId, getStoredInviteEnvelope: async () => null };
@@ -443,7 +444,7 @@ function makeInviterServerWithInvites({ inviterAccountId, groupId, invites, auth
   const sdk = {
     getIdentity: () => ({ localInboxId: "inbox:" + inviterAccountId }),
     mailbox: { deposit: async () => ({ eventId: "evt" }) },
-    sendEncryptedDeposit: async (opts) => { sends.push(opts); return { ok: true }; },
+    ...makeSealDispatch({ onSend: (opts) => sends.push(opts) }),
     peerLinks: { getPeerLink: async () => null },
   };
   const fakePeerLinks = {
@@ -565,7 +566,7 @@ test("forwarded member.join CANNOT resurrect a removed member (only adds new one
   const groupId = "grp_fwd_noresurrect";
   const sdk = {
     getIdentity: () => ({ localInboxId: "inbox:carol" }),
-    sendEncryptedDeposit: async () => ({ ok: true }),
+    ...makeSealDispatch(),
     peerLinks: { getPeerLink: async () => null },
   };
   const fakePeerLinks = { ownerAccountId: carol, getStoredInviteEnvelope: async () => null };

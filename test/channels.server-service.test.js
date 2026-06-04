@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupStore } from "../src/server/storage/ChatGroupStore.js";
 import { GROUP_OP_KIND, GroupOpPayloadV1 } from "../src/records/payloads/GroupOpPayloadV1.js";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -37,10 +38,7 @@ const GROUP_ID = "grp_channels_test";
 
 function makeServer({ ownerAccountId, storage, sendCapture, clock }) {
   const sdk = {
-    sendEncryptedDeposit: async (opts) => {
-      if (Array.isArray(sendCapture)) sendCapture.push(opts);
-      return { ok: true };
-    },
+    ...makeSealDispatch({ onSend: (opts) => { if (Array.isArray(sendCapture)) sendCapture.push(opts); } }),
     getIdentity: () => ({ localInboxId: "inbox:" + ownerAccountId }),
   };
   return new ChatServerApp({

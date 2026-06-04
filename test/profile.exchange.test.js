@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { ServerProfileService } from "../src/server/services/ServerProfileService.js";
 import { CHAT_BRIDGE_SPEC } from "../src/server/transport/ChatBridge.js";
 import { ProfileBroadcastParams, ProfileBroadcastResult } from "../src/records/index.js";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 function createBus() {
   const fns = {};
@@ -73,9 +74,7 @@ function createService({ threads = {}, ownerDisplayName = null, clock = () => 10
   const logger = { error() {}, warn() {} };
 
   bus.runtime.sdk = {
-    sendEncryptedDeposit: async (opts) => {
-      deposits.push(opts);
-    },
+    ...makeSealDispatch({ onSend: (opts) => { deposits.push(opts); } }),
     getIdentity: () => ({ localInboxId: "inbox_owner" }),
   };
 

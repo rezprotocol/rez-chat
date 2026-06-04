@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { MessageSendParams } from "../src/records/index.js";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 class TestKVStore {
   constructor() {
@@ -80,7 +81,7 @@ test("thread.get returns canonical summary fields rebuilt from persisted message
   const server = createServer({
     storage,
     sdk: {
-      sendEncryptedDeposit: async () => ({ ok: true }),
+      ...makeSealDispatch(),
       getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
     },
     clock: () => 5000,
@@ -130,7 +131,7 @@ test("message.send normalizes messageId into result, events, and persisted messa
   const server = createServer({
     storage,
     sdk: {
-      sendEncryptedDeposit: async () => ({ ok: true }),
+      ...makeSealDispatch(),
       getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
     },
     clock: () => 7000,
@@ -180,11 +181,7 @@ test("message.send marks direct messages queued when remote send is persisted fo
   const server = createServer({
     storage,
     sdk: {
-      sendEncryptedDeposit: async () => {
-        const err = new Error("queued");
-        err.queued = true;
-        throw err;
-      },
+      ...makeSealDispatch({ dispatchResult: { queued: true } }),
       getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
     },
     clock: () => 9000,
@@ -229,7 +226,7 @@ test("thread.read emits thread.index.updated with unread cleared", async () => {
   const server = createServer({
     storage,
     sdk: {
-      sendEncryptedDeposit: async () => ({ ok: true }),
+      ...makeSealDispatch(),
       getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
     },
     clock: () => 12000,

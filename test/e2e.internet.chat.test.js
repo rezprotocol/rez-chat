@@ -102,7 +102,9 @@ async function startChatNode(label, knownRelays, routePolicy) {
 
   const wsPort = await getFreePort();
   const wsPath = "/ws";
-  const directorySources = knownRelays.map((relay) => relay.directoryUrl).filter(Boolean);
+  // No directory: the HTTP directory was removed and replaced by relay-to-relay
+  // descriptor exchange. Nodes bootstrap purely from knownRelays — exactly as
+  // the production app does. Mesh seeds stay empty.
   const config = {
     node: {
       ws: { host: "127.0.0.1", port: wsPort, path: wsPath },
@@ -110,10 +112,10 @@ async function startChatNode(label, knownRelays, routePolicy) {
       network: { participateInRouting: true, knownRelays },
       mesh: {
         enabled: true,
-        mode: "seeded-gossip",
-        seeds: directorySources,
-        minPeers: 3,
-        maxPeers: 10,
+        mode: "seed-only",
+        seeds: [],
+        minPeers: 1,
+        maxPeers: 5,
         policy: routePolicy,
       },
       relay: {
@@ -162,10 +164,8 @@ function loadKnownRelays() {
   return relays.map((relay) => {
     const relayKeyId = String(relay.relayKeyId || "").trim();
     const endpoint = parseRelayEndpoint(relay.relayEndpoint);
-    const directoryUrl = String(relay.directoryUrl || "").trim();
     if (!relayKeyId) throw new Error("relay is missing relayKeyId");
     if (!endpoint) throw new Error("relay has invalid relayEndpoint");
-    if (!directoryUrl) throw new Error("relay is missing directoryUrl");
     return {
       id: relayKeyId,
       relayKeyId,
@@ -173,7 +173,6 @@ function loadKnownRelays() {
       port: endpoint.port,
       transport: "tcp",
       tls: endpoint.protocol === "tls",
-      directoryUrl,
     };
   });
 }

@@ -333,16 +333,19 @@ export class ServerChannelsService extends BaseServerService {
   async #fanOutGroupOp({ targets, payload } = {}) {
     if (!Array.isArray(targets) || targets.length === 0) return;
     const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
-    if (!sdk || typeof sdk.sendEncryptedDeposit !== "function") {
+    if (!sdk || typeof sdk.sealForPeer !== "function" || !sdk.mesh) {
       this.logger.warn("[ServerChannelsService] sdk unavailable, skipping channel-op fan-out");
       return;
     }
     const bodyBytes = groupOpPayloadToBytes(payload);
     await Promise.allSettled(targets.map((accountId) =>
-      sdk.sendEncryptedDeposit({
+      sdk.sealForPeer({
         peerAccountId: accountId,
         plaintextBodyBytes: bodyBytes,
-      }).catch((err) => {
+      }).then((sealed) => sdk.mesh.dispatch(
+        sealed.object,
+        sealed.address,
+      )).catch((err) => {
         this.logger.warn(
           "[ServerChannelsService] channel-op fan-out to " + accountId + " failed",
           err && err.message ? err.message : err,

@@ -4,6 +4,7 @@ import { FileSendParams, FileGetParams } from "../src/records/index.js";
 import { ServerFileTransferService } from "../src/server/services/ServerFileTransferService.js";
 import { ChatImagePayloadV1 } from "../src/records/payloads/ChatImagePayloadV1.js";
 import { FileManifestV1, FileChunkV1 } from "@rezprotocol/sdk/filetransfer";
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -53,7 +54,7 @@ function createBus() {
     },
     runtime: {
       sdk: {
-        sendEncryptedDeposit: async () => ({ ok: true }),
+        ...makeSealDispatch(),
         getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
       },
     },
@@ -124,10 +125,7 @@ test("ServerFileTransferService.sendFile validates params and sends", async () =
   const bus = createBus();
   const storage = new TestStorageProvider();
   const deposits = [];
-  bus.runtime.sdk.sendEncryptedDeposit = async (opts) => {
-    deposits.push(opts);
-    return { ok: true };
-  };
+  Object.assign(bus.runtime.sdk, makeSealDispatch({ onSend: (opts) => deposits.push(opts) }));
   const svc = new ServerFileTransferService({ bus, storageProvider: storage, ownerAccountId: OWNER, clock: () => 1000 });
   await svc.start();
 
@@ -190,10 +188,7 @@ test("ServerFileTransferService receive path persists ChatImagePayloadV1 and emi
   const senderBus = createBus();
   const senderStorage = new TestStorageProvider();
   const sentDeposits = [];
-  senderBus.runtime.sdk.sendEncryptedDeposit = async (opts) => {
-    sentDeposits.push(opts);
-    return { ok: true };
-  };
+  Object.assign(senderBus.runtime.sdk, makeSealDispatch({ onSend: (opts) => sentDeposits.push(opts) }));
   const sender = new ServerFileTransferService({
     bus: senderBus, storageProvider: senderStorage, ownerAccountId: OWNER, clock: () => 1000,
   });
@@ -274,7 +269,7 @@ test("ServerFileTransferService.sendFile transitions outbound row to sent and em
   bus.stores.threadStore.setMessageStatus = async (args) => {
     statusCalls.push(args);
   };
-  bus.runtime.sdk.sendEncryptedDeposit = async () => ({ ok: true });
+  Object.assign(bus.runtime.sdk, makeSealDispatch());
   const svc = new ServerFileTransferService({
     bus, storageProvider: storage, ownerAccountId: OWNER, clock: () => 1000,
   });
