@@ -45,6 +45,16 @@ const desktopCrypto = new NodeCryptoProvider();
 const TRAY_ICON_PATH = app.isPackaged
   ? path.join(app.getAppPath(), "node_modules", "@rezprotocol", "ui", "branding", "filled-silhouette", "rez-icon-mark-transparent-filled.png")
   : path.resolve(CHAT_ROOT, "..", "rez-ui", "branding", "filled-silhouette", "rez-icon-mark-transparent-filled.png");
+// Animated boot splash (binary-glitch Rez logo). Resolved the same way as
+// TRAY_ICON_PATH: dev pulls from the sibling rez-ui repo's branding dir; the
+// packaged app ships it under node_modules/@rezprotocol/ui/branding/ (the
+// electron-builder.yml filter includes branding/** for @rezprotocol/ui). The
+// 640x360 GIF (~1.1 MB) is inlined as a data: URI so the splash stays
+// self-contained (no preload, no network); the 1280x720 MP4 is too large to
+// inline on every launch.
+const SPLASH_ANIM_PATH = app.isPackaged
+  ? path.join(app.getAppPath(), "node_modules", "@rezprotocol", "ui", "branding", "rez-animated-splash-binary-glitch-pack", "rez-binary-glitch-splash-640x360.gif")
+  : path.resolve(CHAT_ROOT, "..", "rez-ui", "branding", "rez-animated-splash-binary-glitch-pack", "rez-binary-glitch-splash-640x360.gif");
 // Cap how far we look for unread when summing — must be >= ChatThreadIndex MAX_INDEX_SIZE.
 const UNREAD_SUM_LIMIT = 500;
 
@@ -345,21 +355,42 @@ function registerDesktopIpc() {
   });
 }
 
+// Load the animated binary-glitch splash as a base64 data: URI so the splash
+// page can stay self-contained (no file:// access, no preload). Returns null
+// if the asset can't be read, in which case the splash falls back to the
+// static wordmark + spinner — boot must never break on a missing branding file.
+function loadSplashAnimDataUri() {
+  try {
+    const bytes = fs.readFileSync(SPLASH_ANIM_PATH);
+    return "data:image/gif;base64," + bytes.toString("base64");
+  } catch (err) {
+    console.warn("[splash] animated splash unavailable, using fallback: " + (err && err.message ? String(err.message) : String(err)));
+    return null;
+  }
+}
+
 // A self-contained splash page (no network, no preload). The main process
 // pushes status text into it via webContents.executeJavaScript(window.__setStatus).
-const SPLASH_HTML = `<!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+// When the animated GIF is available it is inlined; otherwise the wordmark +
+// spinner fallback is shown.
+function buildSplashHtml(animDataUri) {
+  const stage = animDataUri
+    ? `<img class="anim" src="${animDataUri}" alt="Rez">`
+    : `<div class="mark">Rez</div><div class="spin"></div>`;
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
 <style>
-  html,body{margin:0;height:100%;background:#0b0d12;color:#e7e9ee;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
-  .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;-webkit-app-region:drag}
+  html,body{margin:0;height:100%;background:#0b0d12;color:#e7e9ee;font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
+  .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;-webkit-app-region:drag}
+  .anim{width:100%;max-width:440px;height:auto;border-radius:10px;display:block;user-select:none;-webkit-user-drag:none}
   .mark{font-size:30px;font-weight:700;letter-spacing:.5px}
   .spin{width:26px;height:26px;border:3px solid #2a2f3a;border-top-color:#5b8cff;border-radius:50%;animation:r .8s linear infinite}
-  #msg{min-height:20px;color:#aab2c5;text-align:center;max-width:320px;padding:0 16px}
+  #msg{min-height:18px;color:#aab2c5;text-align:center;max-width:360px;padding:0 16px;font-size:11px;letter-spacing:.18em;text-transform:uppercase}
   .wrap.error #msg{color:#ff6b6b;font-weight:600}
   .wrap.error .spin{display:none}
   @keyframes r{to{transform:rotate(360deg)}}
 </style></head><body>
-<div class="wrap" id="wrap"><div class="mark">Rez</div><div class="spin" id="spin"></div><div id="msg">Starting…</div></div>
+<div class="wrap" id="wrap">${stage}<div id="msg">Starting…</div></div>
 <script>
   window.__setStatus = function(s){
     try{
@@ -368,12 +399,16 @@ const SPLASH_HTML = `<!doctype html><html><head><meta charset="utf-8">
     }catch(e){}
   };
 </script></body></html>`;
+}
 
 function createSplashWindow() {
   if (splashWindow && !splashWindow.isDestroyed()) return;
+  const animDataUri = loadSplashAnimDataUri();
+  // Sized to frame the 16:9 animation (440px wide → ~248px tall) plus the
+  // status line; falls back gracefully to the same window for the spinner.
   splashWindow = new BrowserWindow({
-    width: 420,
-    height: 300,
+    width: 480,
+    height: 340,
     resizable: false,
     frame: false,
     show: true,
@@ -385,7 +420,7 @@ function createSplashWindow() {
     webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   splashWindow.on("closed", () => { splashWindow = null; });
-  splashWindow.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(SPLASH_HTML));
+  splashWindow.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(buildSplashHtml(animDataUri)));
 }
 
 function setSplashStatus(phase, message) {
