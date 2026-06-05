@@ -33,13 +33,24 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
   }
 
   async start() {
-    // Live SDK push (via MailboxPushBridge) and InboxCatchupService both
-    // emit on this one bus event; we no longer subscribe to the SDK
-    // directly. See MailboxPushBridge.js for the bridge contract.
-    this._listen("runtime.event.mailbox.deposited", (event) => this._handleMailboxDeposited(event));
+    // Inbound deposit decryption is a directive, not an event: the
+    // InboundDepositPipeline calls processDeposit() directly and awaits it,
+    // one deposit at a time in order, so a handshake/member.join is fully
+    // applied before any dependent message is evaluated. No bus subscription
+    // here. See memory feedback_inbound_deposit_pipeline_must_be_awaited_calls.
   }
 
-  async _handleMailboxDeposited(event) {
+  /**
+   * Decrypt + handle one inbound mailbox deposit. Protocol bodies (handshake,
+   * ack, reject, rehandshake, delivery-ack) are applied in place and resolve
+   * to `null`. A decrypted E2EE *user* message is RETURNED as
+   * `{ userMessage }` for the pipeline to apply via
+   * ServerEventService.applyUserMessage — never emitted, so the apply is
+   * awaited in deposit order. Awaitable directive.
+   *
+   * @returns {Promise<null | { userMessage: object }>}
+   */
+  async processDeposit(event) {
     const frame = event && typeof event === "object" ? event : {};
     const body = frame.body && typeof frame.body === "object" ? frame.body : frame;
     const ciphertextB64 = typeof body.ciphertextB64 === "string" ? body.ciphertextB64 : "";
@@ -276,14 +287,22 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       const snapshot = decResult.snapshot;
       const decryptedSender = snapshot && typeof snapshot.peerAccountId === "string"
         ? snapshot.peerAccountId.trim() : "";
-      this._emit("peerlink.user.message", {
-        mailboxId,
-        eventId,
-        plaintextB64: bytesToBase64(decResult.plaintextBytes),
-        senderAccountId: decryptedSender || null,
-        snapshot: snapshot || null,
-      });
+      // Return the decrypted user message for the pipeline to apply (awaited,
+      // in deposit order) — NOT an emit. A fire-and-forget emit here let a
+      // group message race ahead of the sender's member.join and get dropped
+      // by the membership gate. See memory
+      // feedback_inbound_deposit_pipeline_must_be_awaited_calls.
+      return {
+        userMessage: {
+          mailboxId,
+          eventId,
+          plaintextB64: bytesToBase64(decResult.plaintextBytes),
+          senderAccountId: decryptedSender || null,
+          snapshot: snapshot || null,
+        },
+      };
     }
+    return null;
   }
 
   async _sendHandshakeAck({ deliverInboxId, ownerDisplayName = "", ackNonce = null }) {

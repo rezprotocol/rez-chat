@@ -92,12 +92,12 @@ test("InboxCatchupService drains all pending items on first start", async () => 
   const inboxClaimant = { inboxId: INBOX };
 
   const emitted = [];
-  bus.on("runtime.event.mailbox.deposited", (frame) => emitted.push(frame));
+  const inboundPipeline = { submit(frame) { emitted.push(frame); return Promise.resolve(); } };
 
-  const service = new InboxCatchupService({ bus, storageProvider: storage, inboxClaimant });
+  const service = new InboxCatchupService({ bus, storageProvider: storage, inboxClaimant, inboundPipeline });
   await service.start();
 
-  assert.equal(emitted.length, 3, "all three pending items should reach the bus");
+  assert.equal(emitted.length, 3, "all three pending items should reach the pipeline");
   assert.deepEqual(emitted.map((f) => f.body.eventId), ["evt_a", "evt_b", "evt_c"]);
   assert.deepEqual(emitted.map((f) => f.body.ciphertextB64), ["AA==", "BB==", "CC=="]);
   assert.equal(emitted.every((f) => f.body.mailboxId === INBOX), true);
@@ -133,12 +133,13 @@ test("InboxCatchupService resumes from persisted cursor; never re-dispatches ear
   await new InboxCatchupCursor({ kvStore: storage.kv }).write(INBOX, "evt_2");
 
   const emitted = [];
-  bus.on("runtime.event.mailbox.deposited", (frame) => emitted.push(frame));
+  const inboundPipeline = { submit(frame) { emitted.push(frame); return Promise.resolve(); } };
 
   const service = new InboxCatchupService({
     bus,
     storageProvider: storage,
     inboxClaimant: { inboxId: INBOX },
+    inboundPipeline,
   });
   await service.start();
 
@@ -166,13 +167,14 @@ test("InboxCatchupService pages through multi-page nextCursor responses", async 
   const bus = new ChatServerBus();
   bus.runtime.sdk = sdk;
   const emitted = [];
-  bus.on("runtime.event.mailbox.deposited", (frame) => emitted.push(frame));
+  const inboundPipeline = { submit(frame) { emitted.push(frame); return Promise.resolve(); } };
 
   const service = new InboxCatchupService({
     bus,
     storageProvider: new MemStorage(),
     inboxClaimant: { inboxId: INBOX },
     pageLimit: 50,
+    inboundPipeline,
   });
   await service.start();
 
@@ -201,12 +203,13 @@ test("InboxCatchupService advances cursor even on a per-item basis (crash-safe h
   // (in production) drive downstream work — but cursor advance still happens
   // because it's per-item inside the drain loop.
   let count = 0;
-  bus.on("runtime.event.mailbox.deposited", () => { count++; });
+  const inboundPipeline = { submit() { count++; return Promise.resolve(); } };
 
   const service = new InboxCatchupService({
     bus,
     storageProvider: storage,
     inboxClaimant: { inboxId: INBOX },
+    inboundPipeline,
   });
   await service.start();
   assert.equal(count, 2);

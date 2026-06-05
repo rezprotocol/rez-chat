@@ -92,19 +92,24 @@ export class GroupStore {
     return sortByUpdatedThen(await this.groups.list(owner), "groupId");
   }
 
-  async ensureMembership({ ownerAccountId, groupId, accountId, role = "member" } = {}) {
+  async ensureMembership({ ownerAccountId, groupId, accountId, role = "member", displayName = null } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const gid = requireId(groupId, "groupId");
     const member = requireId(accountId, "accountId");
     const existing = await this.memberships.get(owner, gid, member);
     if (existing) return { membership: existing, created: false };
     const now = asInt(this.clock(), Date.now());
+    const name = typeof displayName === "string" && displayName.trim() ? displayName.trim() : null;
     const created = this.memberships.coerce({
       ownerAccountId: owner,
       groupId: gid,
       accountId: member,
       role,
       state: "active",
+      // Display-name hint carried on the join op (or supplied at create). The
+      // inviter has no CONTACT for a joiner, so this membership field is the
+      // only name source for the joiner's row in the inviter's roster.
+      displayName: name,
       joinedAtMs: now,
       updatedAtMs: now,
     });
@@ -122,7 +127,7 @@ export class GroupStore {
    * (e.g. against a fresh post-removal invite). No-op (revived:false) when the
    * row is absent or already active. Rejoin restores the supplied role.
    */
-  async reviveMembership({ ownerAccountId, groupId, accountId, role = "member" } = {}) {
+  async reviveMembership({ ownerAccountId, groupId, accountId, role = "member", displayName = null } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const gid = requireId(groupId, "groupId");
     const member = requireId(accountId, "accountId");
@@ -131,10 +136,14 @@ export class GroupStore {
       return { membership: existing || null, revived: false };
     }
     const now = asInt(this.clock(), Date.now());
+    const name = typeof displayName === "string" && displayName.trim() ? displayName.trim() : null;
     const revived = this.memberships.coerce({
       ...existing.toJSON(),
       role,
       state: "active",
+      // Refresh the name from the rejoin op when present; otherwise keep what
+      // the prior membership carried (spread above).
+      ...(name ? { displayName: name } : {}),
       updatedAtMs: now,
     });
     if (!revived) throw new Error("ChatGroupStore.reviveMembership produced invalid row");

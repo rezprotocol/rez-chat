@@ -23,8 +23,10 @@ export class InboxCatchupService extends BaseServerService {
   #draining;
   #pending;
   #offReconnect;
+  #pipeline;
+  #processedLog;
 
-  constructor({ bus, storageProvider, inboxClaimant, pageLimit = DEFAULT_PAGE_LIMIT, logger = console } = {}) {
+  constructor({ bus, storageProvider, inboxClaimant, inboundPipeline, processedLog = null, pageLimit = DEFAULT_PAGE_LIMIT, logger = console } = {}) {
     super({ bus, logger });
     if (!storageProvider || typeof storageProvider.getKeyValueStore !== "function") {
       throw new Error("InboxCatchupService requires storageProvider");
@@ -32,8 +34,16 @@ export class InboxCatchupService extends BaseServerService {
     if (!inboxClaimant) {
       throw new Error("InboxCatchupService requires inboxClaimant");
     }
+    if (!inboundPipeline || typeof inboundPipeline.submit !== "function") {
+      throw new Error("InboxCatchupService requires inboundPipeline.submit");
+    }
     this.#cursor = new InboxCatchupCursor({ kvStore: storageProvider.getKeyValueStore(null) });
     this.#inboxClaimant = inboxClaimant;
+    this.#pipeline = inboundPipeline;
+    // Optional dedup log shared with the pipeline. Once the cursor passes an
+    // eventId it is never re-fetched, so its processed-marker is redundant —
+    // forget it to keep the log bounded to "consumed-via-push since last drain".
+    this.#processedLog = processedLog && typeof processedLog.forget === "function" ? processedLog : null;
     this.#pageLimit = Number.isInteger(pageLimit) && pageLimit > 0 ? pageLimit : DEFAULT_PAGE_LIMIT;
     this.#draining = false;
     this.#pending = false;
@@ -85,6 +95,13 @@ export class InboxCatchupService extends BaseServerService {
     } finally {
       this.#draining = false;
     }
+    // Readiness signal (a true notification — emit is correct here): the inbox
+    // is now fully drained and every missed deposit has been APPLIED (the drain
+    // awaits each through the serialized pipeline). Emitted under the bare bridge
+    // spec key so the transport forwards it to the UI as
+    // `runtime.event.inbox.caughtup`; the UI gates "show real state" on it so
+    // login never asserts the stale pre-catch-up snapshot.
+    this._emit("inbox.caughtup", { mailboxId: this.#inboxClaimant.inboxId });
   }
 
   async #drainOnce() {
@@ -116,8 +133,20 @@ export class InboxCatchupService extends BaseServerService {
           t: "evt.mailbox.deposited",
           body: { mailboxId, eventId, ciphertextB64 },
         };
-        this._emit("runtime.event.mailbox.deposited", frame);
+        // Directive, not a notification: process this deposit to FULL COMPLETION
+        // (decrypt → apply membership/message, in order) before advancing the
+        // cursor or touching the next deposit. The serialized pipeline guarantees
+        // a member.join is applied before any message that depends on it.
+        await this.#pipeline.submit(frame);
         await this.#cursor.write(mailboxId, eventId);
+        // The event is now at/below the high-water mark and will never be
+        // re-fetched, so its dedup marker is redundant — drop it to keep the
+        // processed-log bounded.
+        if (this.#processedLog) {
+          await this.#processedLog.forget(mailboxId, eventId).catch((err) => {
+            this.logger.error("[InboxCatchupService] processed-log forget failed: " + (err && err.message ? err.message : err));
+          });
+        }
         cursor = eventId;
       }
       const nextCursor = page && typeof page.nextCursor === "string" ? page.nextCursor : null;

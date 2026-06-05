@@ -103,7 +103,7 @@ function nextEventId() {
 // dispatched via the `delivery.ack` bus event — that's what
 // ServerPeerLinkProtocolService does after decrypt. Everything else is
 // dispatched as `peerlink.user.message`.
-function deliverToReceiver({ senderServer, receiverServer, sentBuf, expectedPeerAccountId }) {
+async function deliverToReceiver({ senderServer, receiverServer, sentBuf, expectedPeerAccountId }) {
   const drained = sentBuf.splice(0, sentBuf.length);
   for (const opts of drained) {
     if (opts.peerAccountId !== expectedPeerAccountId) continue;
@@ -124,7 +124,7 @@ function deliverToReceiver({ senderServer, receiverServer, sentBuf, expectedPeer
       continue;
     }
     const b64 = Buffer.from(plaintextBytes).toString("base64");
-    receiverServer.bus.emit("peerlink.user.message", {
+    await receiverServer.bus.services.events.applyUserMessage({
       mailboxId: "inbox:" + expectedPeerAccountId,
       eventId: nextEventId(),
       plaintextB64: b64,
@@ -211,7 +211,7 @@ test("delivery ack: 1:1 chat message transitions alice's row from sent → deliv
   assert.equal(sentOk, true, "alice should observe status sent after local deposit");
 
   // Bridge Alice's outbound chat message → Bob's bus.
-  deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
+  await deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
 
   // Bob's chat layer should respond with a delivery ack. The ack's
   // messageIds must carry Alice's local messageId, not Bob's inbound
@@ -238,7 +238,7 @@ test("delivery ack: 1:1 chat message transitions alice's row from sent → deliv
   // Bridge Bob's ack → Alice. deliverToReceiver detects the ack kind and
   // routes it via the `delivery.ack` bus event (matching what
   // ServerPeerLinkProtocolService does in production).
-  deliverToReceiver({ senderServer: bob, receiverServer: alice, sentBuf: bobSent, expectedPeerAccountId: ALICE });
+  await deliverToReceiver({ senderServer: bob, receiverServer: alice, sentBuf: bobSent, expectedPeerAccountId: ALICE });
 
   const deliveredOk = await waitForCondition(() => aliceStatuses.some((e) => e.messageId === MID && e.status === "delivered"));
   assert.equal(deliveredOk, true, "alice's row should transition to delivered after ack");
@@ -291,7 +291,7 @@ test("delivery ack: group fan-out does NOT trigger acks from group members", asy
     payload: { kind: "rez.chat.message.v1", text: "hi team" },
   });
 
-  deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
+  await deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
 
   // Give the ingest a chance to run, then assert nothing on Bob's side
   // attempted to send an ack. Group fan-out is not acked (ambiguous

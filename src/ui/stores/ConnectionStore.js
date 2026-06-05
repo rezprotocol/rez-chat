@@ -6,6 +6,10 @@ function clone(connection) {
   return {
     status: nonEmptyString(row.status) || "disconnected",
     lastError: row.lastError == null ? null : String(row.lastError),
+    // True once the post-login inbox catch-up has fully drained + applied every
+    // missed deposit (server emits inbox.caughtup). Until then the UI shows a
+    // "syncing" state instead of asserting the stale pre-catch-up snapshot.
+    inboxSynced: row.inboxSynced === true,
     activeNode: nonEmptyString(row.activeNode),
     nodes: Array.isArray(row.nodes)
       ? row.nodes.map((item) => ({ ...(item && typeof item === "object" ? item : {}) }))
@@ -51,6 +55,13 @@ export class ConnectionStore extends StoreBase {
 
   isOnline() {
     return this.#connection.status === "connected";
+  }
+
+  // True once the post-login inbox catch-up has fully applied every missed
+  // deposit. Views gate their "empty"/roster assertions on this so a stale
+  // pre-catch-up snapshot is never shown as final.
+  isInboxSynced() {
+    return this.#connection.inboxSynced === true;
   }
 
   status() {

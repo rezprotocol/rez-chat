@@ -23,6 +23,22 @@ test("ConnectionStore.status / lastError typed accessors", () => {
   assert.equal(c.lastError(), "boom");
 });
 
+test("ConnectionStore.isInboxSynced reflects the inbox.caughtup readiness signal", () => {
+  const c = new ConnectionStore();
+  // Defaults to NOT synced — fresh login asserts "syncing", not real state.
+  assert.equal(c.isInboxSynced(), false);
+  // ConnectionService flips this true when the server emits inbox.caughtup.
+  c.setConnection({ inboxSynced: true });
+  assert.equal(c.isInboxSynced(), true);
+  // A fresh connect/disconnect resets it — catch-up will run again.
+  c.setConnection({ status: "connected", inboxSynced: false });
+  assert.equal(c.isInboxSynced(), false);
+  // Survives unrelated patches (clone preserves the flag).
+  c.setConnection({ inboxSynced: true });
+  c.setConnection({ lastError: "x" });
+  assert.equal(c.isInboxSynced(), true);
+});
+
 test("AuthStore typed status accessors reflect state", () => {
   const a = new AuthStore();
   assert.equal(a.hasKeystore(), false);

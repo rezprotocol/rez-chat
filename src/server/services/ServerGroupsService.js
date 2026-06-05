@@ -728,6 +728,7 @@ export class ServerGroupsService extends BaseServerService {
     // time we receive member.join we already have the group + thread locally.
     // Revival is an explicit, authorized transition (never a side effect of
     // ensureMembership); a brand-new joiner is added.
+    const joinerDisplayName = typeof op.displayName === "string" ? op.displayName : "";
     let changed = false;
     if (wasRemoved) {
       const { revived } = await this.#groupStore.reviveMembership({
@@ -735,6 +736,7 @@ export class ServerGroupsService extends BaseServerService {
         groupId: op.groupId,
         accountId: joiner,
         role: "member",
+        displayName: joinerDisplayName,
       }).catch(() => ({ revived: false }));
       changed = revived;
     } else {
@@ -743,6 +745,7 @@ export class ServerGroupsService extends BaseServerService {
         groupId: op.groupId,
         accountId: joiner,
         role: "member",
+        displayName: joinerDisplayName,
       }).catch(() => ({ created: false }));
       changed = created;
     }

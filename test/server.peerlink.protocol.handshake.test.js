@@ -197,7 +197,7 @@ test("ServerPeerLinkProtocolService decrypts an inbound x3dh handshake and emits
     logger: { log() {}, info() {}, warn() {}, error() {} },
   });
 
-  await protocolService._handleMailboxDeposited({
+  await protocolService.processDeposit({
     body: {
       eventId: "evt:1",
       mailboxId: aliceInboxId,

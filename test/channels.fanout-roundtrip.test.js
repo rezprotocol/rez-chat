@@ -101,17 +101,17 @@ function nextEventId() {
   return "evt_" + nextEventId._counter;
 }
 
-function deliverToReceiver({ senderServer, receiverServer, sentBuf, expectedPeerAccountId }) {
-  // Flush all captured fan-out from sender → emit each as a
-  // peerlink.user.message into the receiver's bus. Matches the shape
-  // ServerPeerLinkProtocolService produces after decrypt.
+async function deliverToReceiver({ senderServer, receiverServer, sentBuf, expectedPeerAccountId }) {
+  // Flush all captured fan-out from sender → apply each on the receiver via the
+  // canonical apply directive (what the serialized InboundDepositPipeline calls
+  // after ServerPeerLinkProtocolService decrypts an E2EE deposit). Awaited and
+  // in order, so a member/channel op is fully applied before the next.
   const drained = sentBuf.splice(0, sentBuf.length);
   for (const opts of drained) {
     if (opts.peerAccountId !== expectedPeerAccountId) continue;
     const plaintextBytes = opts.plaintextBodyBytes;
-    // base64-encode the plaintext bytes for the bus event shape.
     const b64 = Buffer.from(plaintextBytes).toString("base64");
-    receiverServer.bus.emit("peerlink.user.message", {
+    await receiverServer.bus.services.events.applyUserMessage({
       mailboxId: "inbox:" + expectedPeerAccountId,
       eventId: nextEventId(),
       plaintextB64: b64,
@@ -167,7 +167,7 @@ test("channels roundtrip: alice creates → bob materializes record + emits chan
   bob.bus.on("channel.upserted", (record) => bobUpserted.push(record));
 
   await alice.bus.services.channels.createChannel({ groupId: GROUP_ID, channelId: "dev" });
-  deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
+  await deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
 
   const ok = await waitForCondition(async () => bobUpserted.length >= 1);
   assert.equal(ok, true, "bob should observe channel.upserted via fan-out");
@@ -213,7 +213,7 @@ test("channels roundtrip: tagged message from alice causes bob to observe the ch
     payload: { kind: "rez.chat.message.v1", text: "hi planning" },
     channelId: "planning",
   });
-  deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
+  await deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
 
   const ok = await waitForCondition(async () => bobUpserted.length >= 1);
   assert.equal(ok, true, "bob should observe a channel.upserted from message-tag observation");
@@ -238,7 +238,7 @@ test("channels roundtrip: admin delete tombstones on bob; #general is undeletabl
 
   // create + propagate
   await alice.bus.services.channels.createChannel({ groupId: GROUP_ID, channelId: "dev" });
-  deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
+  await deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
   await waitForCondition(async () => {
     const list = await bob.bus.stores.channelStore.listChannels({ ownerAccountId: BOB, groupId: GROUP_ID });
     return list.length === 1;
@@ -246,7 +246,7 @@ test("channels roundtrip: admin delete tombstones on bob; #general is undeletabl
 
   // delete (Alice is admin in both directories)
   await alice.bus.services.channels.deleteChannel({ groupId: GROUP_ID, channelId: "dev" });
-  deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
+  await deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
   const removedOk = await waitForCondition(async () => bobRemoved.length >= 1);
   assert.equal(removedOk, true, "bob should observe channel.removed");
   const bobActive = await bob.bus.stores.channelStore.listChannels({ ownerAccountId: BOB, groupId: GROUP_ID });
