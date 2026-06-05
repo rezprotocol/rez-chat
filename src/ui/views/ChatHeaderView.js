@@ -74,9 +74,19 @@ export class ChatHeaderView extends BusComponent {
       });
     }
     if (stores.connection) {
-      // Re-render when inbox catch-up completes so the members panel stops
-      // showing "Syncing…" and reflects the now-authoritative roster.
-      this._subscribe(stores.connection, () => this.render());
+      // Re-render ONLY when the inbox-sync bit flips — that is the only
+      // connection-derived value the header reads (the members-panel "Syncing…"
+      // gate). The connection store also churns on every mesh/heartbeat/
+      // connection-state tick, and re-rendering the whole header on each of
+      // those pegs the renderer (it has no mesh/status to show). Mirror the
+      // filtered-subscribe pattern used by the contacts/groups stores above.
+      let lastInboxSynced = stores.connection.isInboxSynced();
+      this._subscribe(stores.connection, () => {
+        const synced = stores.connection.isInboxSynced();
+        if (synced === lastInboxSynced) return;
+        lastInboxSynced = synced;
+        this.render();
+      });
     }
     this.render();
   }
