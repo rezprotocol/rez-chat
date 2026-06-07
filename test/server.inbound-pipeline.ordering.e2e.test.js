@@ -201,21 +201,27 @@ test("serialized pipeline: concurrent submits (live-push burst) still apply in o
     "burst-submitted message survives — the queue serialized join-before-message");
 });
 
-test("ordering hazard: a group message applied BEFORE the sender's member.join is dropped (what the pipeline prevents)", async () => {
-  // This is the pre-fix behaviour the serialized pipeline eliminates: if the
-  // message is processed before the join commits membership, the fail-closed
-  // group-content gate drops it permanently.
+test("ordering: a group message applied BEFORE the sender's member.join is DEFERRED, then delivered once the join lands", async () => {
+  // The offline push-before-member.join race: a message can be delivered ahead
+  // of its sender's join op. The fail-closed group-content gate used to DROP it
+  // permanently. Now the gate DEFERS a message from an authenticated sender with
+  // no membership record yet, and ServerGroupsService re-applies it via
+  // flushDeferredGroupMessages when the join activates them. See memory
+  // project_offline_push_before_handshake_race.
   const app = await setupInviterServer();
   const threadId = app.bus.services.threads.groupThreadId(GROUP_ID);
 
-  // Apply the message FIRST (Bob not yet a member) ...
+  // Apply the message FIRST (Bob not yet a member) — held, not dropped ...
   await app.bus.services.events.applyUserMessage({
     eventId: "evt_msg_early",
     mailboxId: "inbox:alice",
     plaintextB64: Buffer.from(JSON.stringify(messageInner(threadId))).toString("base64"),
     senderAccountId: JOINER,
   });
-  // ... then the join.
+  assert.ok(!(await listGroupMessages(app, threadId)).some((m) => m.messageId === "msg_from_bob_1"),
+    "message is deferred (not delivered) before the join");
+
+  // ... then the join, which activates Bob and flushes his deferred message.
   await app.bus.services.events.applyUserMessage({
     eventId: "evt_join_late",
     mailboxId: "inbox:alice",
@@ -225,8 +231,8 @@ test("ordering hazard: a group message applied BEFORE the sender's member.join i
 
   const msgs = await listGroupMessages(app, threadId);
   const fromBob = msgs.find((m) => m.messageId === "msg_from_bob_1");
-  assert.ok(!fromBob, "out-of-order: the message was dropped by the membership gate (the bug)");
-  // The late join still establishes membership — but the message is already lost.
+  assert.ok(fromBob, "the earlier message is delivered once the join activates the sender");
+  assert.equal(fromBob.senderAccountId, JOINER, "delivered with the authenticated sender");
   const members = await app.bus.stores.groupStore.listMembers({ ownerAccountId: INVITER, groupId: GROUP_ID });
-  assert.ok(members.some((m) => m.accountId === JOINER), "join still applied; only the earlier message was lost");
+  assert.ok(members.some((m) => m.accountId === JOINER), "join applied and membership established");
 });

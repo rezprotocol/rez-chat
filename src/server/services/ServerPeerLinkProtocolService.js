@@ -277,14 +277,27 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         });
       } catch (decErr) {
         this.logger.error("[ServerPeerLinkProtocolService] E2EE decryption failed", decErr && decErr.message ? decErr.message : decErr);
-        if (decErr && decErr.code === "DECRYPT_FAILED" && decErr.rehandshakeNeeded) {
-          this._triggerRehandshake({ peerAccountId: decErr.peerAccountId });
+        const isThreadNotReady = Boolean(decErr && decErr.code === "THREAD_NOT_READY");
+        // decryptDirectMessageAnyPeer (the only decrypt on this path) reports a
+        // total miss as THREAD_NOT_READY with state-attributed recoveryCandidates;
+        // it never throws the single-peer DECRYPT_FAILED. Recipient-side recovery:
+        // a packet we could not decrypt against ANY usable session may mean a
+        // desynced/one-sided peer link. The opaque packet cannot identify its
+        // sender, so only act when EXACTLY ONE candidate link has crossed the
+        // rehandshake threshold — zero or ambiguous (>1) candidates are left to
+        // retry, never guessed. The in-flight rehandshake_requested state is a
+        // natural cooldown.
+        if (isThreadNotReady && Array.isArray(decErr.recoveryCandidates)) {
+          const eligible = decErr.recoveryCandidates.filter((c) => c && c.rehandshakeNeeded === true);
+          if (eligible.length === 1) {
+            this._triggerRehandshake({ peerAccountId: eligible[0].peerAccountId });
+          }
         }
         // NOT consumed — leave the deposit buffered. The decrypt did not advance
         // the ratchet, so a later drain (once the establishing handshake ahead of
         // it is applied, or a rehandshake lands) can decrypt it. Acking here would
         // destroy a message we simply can't read YET (the desktop data-loss bug).
-        return { consumed: false, decryptOk: false, reason: "decrypt-failed" };
+        return { consumed: false, decryptOk: false, reason: isThreadNotReady ? "thread-not-ready" : "decrypt-failed" };
       }
       if (!decResult || !(decResult.plaintextBytes instanceof Uint8Array)) {
         return { consumed: false, decryptOk: false, reason: "decrypt-empty" };
@@ -421,32 +434,76 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     }
   }
 
+  // Initiate a re-handshake with a desynced peer. The SDK builds + signs the
+  // request record AND advances the local peer-link to rehandshake_requested;
+  // THIS service owns transport, so it resolves the peer's inbox and dispatches
+  // the request. The request rides plaintext to the peer's inbox — the ratchet
+  // is desynced, so it cannot be E2EE-wrapped; authenticity is carried by the
+  // signed account binding inside the bundle, which the receiver verifies in
+  // handleIncomingRehandshake. Fire-and-forget: failures are logged, never
+  // thrown into the deposit pipeline. (Before v0.4.6 this called the SDK with a
+  // `sendRehandshake` callback + no senderInboxId — a contract mismatch that
+  // made requestRehandshake throw `senderInboxId is required` and silently
+  // no-op'd all recovery. See project_offline_push_before_handshake_race.)
   _triggerRehandshake({ peerAccountId }) {
-    if (!peerAccountId) return;
+    const remote = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
+    if (!remote) return;
     const peerLinks = this._peerLinkService();
     if (!peerLinks || typeof peerLinks.requestRehandshake !== "function") return;
-    peerLinks.requestRehandshake({
-      ownerAccountId: this.ownerAccountId,
-      peerAccountId,
-      sendRehandshake: async ({ deliverInboxId, packetBytes }) => {
-        const sdk = this._sdk();
-        if (!sdk || !sdk.mesh) {
-          const err = new Error("sdk.mesh unavailable for rehandshake send");
-          err.code = "UNREACHABLE";
-          throw err;
-        }
-        await sdk.mesh.dispatch(
-          {
-            payloadBytes: packetBytes,
-            objectId: "rhreq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
-            metadata: {},
-          },
-          buildInboxAddress({ inboxId: deliverInboxId }),
-        );
-      },
-    }).catch((rhErr) => {
-      this.logger.error("[ServerPeerLinkProtocolService] requestRehandshake failed", rhErr && rhErr.message ? rhErr.message : rhErr);
+    const sdk = this._sdk();
+    if (!sdk || !sdk.mesh) {
+      this.logger.warn("[ServerPeerLinkProtocolService] rehandshake skipped — sdk.mesh unavailable");
+      return;
+    }
+    const senderInboxId = this._ownInboxId(sdk);
+    if (!senderInboxId) {
+      this.logger.warn("[ServerPeerLinkProtocolService] rehandshake skipped — no local inbox id");
+      return;
+    }
+    this._sendRehandshakeRequest({ peerLinks, sdk, remote, senderInboxId }).catch((rhErr) => {
+      this.logger.error("[ServerPeerLinkProtocolService] rehandshake request failed", rhErr && rhErr.message ? rhErr.message : rhErr);
     });
+  }
+
+  // Resolve the peer's inbox, ask the SDK to build the signed re-handshake
+  // request (which also advances the local peer-link state), then dispatch the
+  // request bytes to the peer. Split out from _triggerRehandshake so the latter
+  // stays a synchronous fire-and-forget entry point.
+  async _sendRehandshakeRequest({ peerLinks, sdk, remote, senderInboxId }) {
+    const deliverInboxId = await this._resolvePeerInboxId(peerLinks, remote);
+    if (!deliverInboxId) {
+      this.logger.warn("[ServerPeerLinkProtocolService] rehandshake skipped — no inbox for peer " + remote);
+      return;
+    }
+    const result = await peerLinks.requestRehandshake({
+      ownerAccountId: this.ownerAccountId,
+      peerAccountId: remote,
+      senderInboxId,
+    });
+    const record = result ? result.rehandshakeRecord : null;
+    if (!record || typeof record.toBytes !== "function") {
+      this.logger.warn("[ServerPeerLinkProtocolService] rehandshake produced no request record for peer " + remote);
+      return;
+    }
+    if (result.snapshot) this._emitPeerLinkUpdated(result.snapshot);
+    await sdk.mesh.dispatch(
+      {
+        payloadBytes: record.toBytes(),
+        objectId: "rhreq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
+        metadata: {},
+      },
+      buildInboxAddress({ inboxId: deliverInboxId }),
+    );
+  }
+
+  // Look up the peer's current delivery inbox from the peer-link snapshot list
+  // (single source of truth for peer routing). Returns "" when unknown.
+  async _resolvePeerInboxId(peerLinks, peerAccountId) {
+    if (typeof peerLinks.listPeerLinks !== "function") return "";
+    const result = await peerLinks.listPeerLinks({ ownerAccountId: this.ownerAccountId });
+    const items = result && Array.isArray(result.items) ? result.items : [];
+    const match = items.find((it) => it && typeof it.peerAccountId === "string" && it.peerAccountId === peerAccountId);
+    return match && typeof match.peerInboxId === "string" ? match.peerInboxId.trim() : "";
   }
 
   _emitPeerLinkUpdated(snapshot, remoteDisplayName = "") {

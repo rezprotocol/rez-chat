@@ -9,10 +9,26 @@ import { BaseServerService } from "../base/BaseServerService.js";
 
 export class ServerEventService extends BaseServerService {
   #clock;
+  // Decrypted group messages whose authenticated sender is not YET an active
+  // member — held (keyed `groupId:accountId`) instead of dropped, then re-applied
+  // when that member's member.join lands (flushDeferredGroupMessages). Fixes the
+  // offline race where a message is push-delivered before its sender's join op,
+  // which the fail-closed authz gate would otherwise drop permanently. Bounded
+  // by key count + per-key depth. In-memory (the live offline path re-delivers
+  // both the message and the join into the same chat-server session). See memory
+  // project_offline_push_before_handshake_race.
+  #deferredGroupMessages;
+  #redeliveringDeferred;
+  #maxDeferredKeys;
+  #maxDeferredPerKey;
 
-  constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
+  constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console, maxDeferredKeys = 256, maxDeferredPerKey = 64 } = {}) {
     super({ bus, ownerAccountId, logger });
     this.#clock = clock;
+    this.#deferredGroupMessages = new Map();
+    this.#redeliveringDeferred = false;
+    this.#maxDeferredKeys = Number.isInteger(maxDeferredKeys) && maxDeferredKeys > 0 ? maxDeferredKeys : 256;
+    this.#maxDeferredPerKey = Number.isInteger(maxDeferredPerKey) && maxDeferredPerKey > 0 ? maxDeferredPerKey : 64;
   }
 
   async start() {
@@ -257,6 +273,24 @@ export class ServerEventService extends BaseServerService {
           }).catch(() => null)
         : null;
       if (!membership || String(membership.state || "").toLowerCase() !== "active") {
+        // The sender is cryptographically authenticated (envelopeSender from the
+        // decrypted peer-link snapshot) but we have not processed their
+        // member.join YET — the message was delivered ahead of the join. DEFER
+        // (not drop): hold the decrypted event and re-apply it when the join
+        // activates this sender. This does NOT weaken the gate — delivery still
+        // requires active membership; it is only deferred until the authorizing
+        // op arrives. A sender with no authenticated identity is still dropped,
+        // and a message re-applied from a flush that STILL fails the gate is
+        // dropped (never re-deferred — the #redeliveringDeferred guard).
+        // Defer ONLY a brand-new authenticated sender we have NO membership
+        // record for yet (their member.join simply hasn't been processed). A
+        // sender whose membership exists but is non-active (e.g. "removed"/
+        // kicked) is NOT a pending joiner — drop it, so a later re-admission can
+        // never resurrect a message they sent while removed.
+        if (!membership && authedSender && groupId && !this.#redeliveringDeferred) {
+          this.#deferGroupMessage(groupId, authedSender, event);
+          return;
+        }
         this.logger.warn("[ServerEventService] dropped group "
           + (inboundKind || "message") + " from non-member "
           + (authedSender || "<unauthenticated>") + " for group " + groupId);
@@ -451,6 +485,61 @@ export class ServerEventService extends BaseServerService {
     });
   }
 
+  // Hold a decrypted group message whose sender isn't an active member yet,
+  // keyed by `groupId:accountId`, bounded by key count and per-key depth (oldest
+  // evicted). Re-applied by flushDeferredGroupMessages when the join lands.
+  #deferGroupMessage(groupId, accountId, event) {
+    const key = groupId + ":" + accountId;
+    let bucket = this.#deferredGroupMessages.get(key);
+    if (!bucket) {
+      if (this.#deferredGroupMessages.size >= this.#maxDeferredKeys) {
+        const oldestKey = this.#deferredGroupMessages.keys().next().value;
+        if (oldestKey) this.#deferredGroupMessages.delete(oldestKey);
+      }
+      bucket = [];
+      this.#deferredGroupMessages.set(key, bucket);
+    }
+    if (bucket.length >= this.#maxDeferredPerKey) bucket.shift();
+    bucket.push(event);
+    if (process.env.REZ_PEERLINK_TRACE === "1") {
+      this.logger.log("[PLTRACE] gate DEFER group=" + groupId + " sender=" + accountId + " (held=" + bucket.length + ")");
+    }
+  }
+
+  /**
+   * Re-apply any group messages deferred for `accountId` in `groupId`, now that
+   * their member.join has activated them. Called by ServerGroupsService after an
+   * inbound member.join is applied. Re-application runs through the same deposit
+   * path (the message bytes are already-decrypted plaintext); the
+   * #redeliveringDeferred guard ensures a message that STILL fails the gate is
+   * dropped rather than re-deferred (no loop).
+   */
+  async flushDeferredGroupMessages(groupId, accountId) {
+    const gid = typeof groupId === "string" ? groupId.trim() : "";
+    const acct = typeof accountId === "string" ? accountId.trim() : "";
+    if (!gid || !acct) return;
+    const key = gid + ":" + acct;
+    const bucket = this.#deferredGroupMessages.get(key);
+    if (!bucket || bucket.length === 0) return;
+    this.#deferredGroupMessages.delete(key);
+    if (process.env.REZ_PEERLINK_TRACE === "1") {
+      this.logger.log("[PLTRACE] gate FLUSH group=" + gid + " sender=" + acct + " (n=" + bucket.length + ")");
+    }
+    this.#redeliveringDeferred = true;
+    try {
+      for (const event of bucket) {
+        try {
+          await this.#handleMailboxDeposited(event);
+        } catch (err) {
+          this.logger.error("[ServerEventService] deferred group message re-apply failed",
+            err && err.message ? err.message : err);
+        }
+      }
+    } finally {
+      this.#redeliveringDeferred = false;
+    }
+  }
+
   async #resolveDirectThreadForSender({ senderAccountId, createdAtMs } = {}) {
     const peerAccountId = typeof senderAccountId === "string" ? senderAccountId.trim() : "";
     if (!peerAccountId) return null;
@@ -464,8 +553,8 @@ export class ServerEventService extends BaseServerService {
         const candidate = await threadStore.getThread(threadId).catch(() => null);
         if (!candidate || typeof candidate !== "object") continue;
         const type = String(candidate.threadType || candidate.kind || "direct").trim().toLowerCase();
-        const peerAccountId = typeof candidate.peerAccountId === "string" ? candidate.peerAccountId.trim() : "";
-        if (type === "direct" && peerAccountId === peerAccountId) {
+        const candidatePeer = typeof candidate.peerAccountId === "string" ? candidate.peerAccountId.trim() : "";
+        if (type === "direct" && candidatePeer === peerAccountId) {
           if (typeof candidate.peerInboxId === "string" && candidate.peerInboxId.trim()) {
             return { threadId, thread: candidate };
           }

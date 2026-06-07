@@ -761,6 +761,19 @@ export class ServerGroupsService extends BaseServerService {
       });
     }
 
+    // The joiner is now an active member — re-apply any of their group messages
+    // that arrived before this join and were deferred by the authz gate (the
+    // offline push-before-member.join race). Safe regardless of `changed`: a
+    // duplicate join still means the member is active, and the flush is a no-op
+    // when nothing was deferred. See project_offline_push_before_handshake_race.
+    const events = this.bus && this.bus.services ? this.bus.services.events : null;
+    if (events && typeof events.flushDeferredGroupMessages === "function") {
+      await events.flushDeferredGroupMessages(op.groupId, joiner).catch((err) => {
+        this.logger.error("[ServerGroupsService] flush deferred group messages failed",
+          err && err.message ? err.message : err);
+      });
+    }
+
     if (shouldForward) {
       // Shape B fan-out: forward the joiner's announcement to every
       // other active member (excluding the joiner themselves and the

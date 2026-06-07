@@ -40,6 +40,21 @@ export class ThreadsService extends BaseBusService {
         this.bus.emit("app.error", { source: "ThreadsService", message: "peer-link list refresh failed", severity: "warn", err });
       });
     });
+    // Reconcile the thread list (and thus unread badges) against the server's
+    // authoritative snapshot on every renderer session connect (initial login +
+    // every lock/unlock). Inbound catch-up runs at connect and persists offline-
+    // delivered messages with their unread counts; the incremental
+    // thread.index.updated events for that burst can be missed by the renderer
+    // (emitted before it is ready / dropped on connection churn), leaving stale
+    // badges. A force refetch here closes that gap — the persisted snapshot is
+    // correct even when an incremental event was lost. Mirrors ChannelsService's
+    // session-connect sync.
+    this._listen("session.runtime.connected", () => {
+      this.ensureList({ force: true }).catch((err) => {
+        console.error("[ThreadsService] session-connect list refresh failed", err);
+        this.bus.emit("app.error", { source: "ThreadsService", message: "session-connect list refresh failed", severity: "warn", err });
+      });
+    });
   }
 
   _getClient() {
