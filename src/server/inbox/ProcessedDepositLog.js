@@ -1,25 +1,29 @@
 const KEY_PREFIX = "chat-server:inbox:processed:v1:";
+const ATTEMPT_PREFIX = "chat-server:inbox:attempts:v1:";
 
 /**
  * Per-(mailbox,event) "already decrypted + consumed" marker for the inbound
- * deposit pipeline.
+ * deposit pipeline, plus a per-(mailbox,event) failed-decrypt attempt counter.
  *
- * Why this exists: a deposit can be delivered TWICE to the chat-server — once
- * live via the SDK push (MailboxPushBridge) and again by the catch-up drain
- * (InboxCatchupService) on a later cold boot, because the push path does NOT
- * advance the catch-up cursor. Re-running the SECOND copy through the peer-link
- * decrypt is NOT a harmless "redundant decode" (as the cursor's crash-semantics
- * note once assumed): the double ratchet has already advanced past that
- * ciphertext, so the re-decrypt fails with an AES-GCM auth error. That dropped
- * the genuinely-new offline message that followed it. Marking each eventId as
- * processed AFTER a successful decrypt lets the pipeline skip the re-decrypt.
+ * Why the processed marker exists: a deposit can be delivered TWICE to the
+ * chat-server — once live via the SDK push (MailboxPushBridge) and again by the
+ * catch-up drain (InboxCatchupService). Re-running the SECOND copy through the
+ * peer-link decrypt is NOT a harmless "redundant decode": the double ratchet has
+ * already advanced past that ciphertext, so the re-decrypt fails with an AES-GCM
+ * auth error. That dropped the genuinely-new offline message that followed it.
+ * Marking each eventId processed AFTER a successful decrypt lets the pipeline
+ * skip the re-decrypt; the consume layers then ack/delete the buffer copy.
  *
- * Bounded by pruning: InboxCatchupService.forget()s each marker right after it
- * advances the persisted cursor past that eventId — once an event is at/below
- * the high-water mark it is never re-fetched, so the marker is redundant. The
- * live set is therefore only "events consumed via push since the last drain",
- * reclaimed on every drain. Backed by the chat-server's global KV
- * (`getKeyValueStore(null)`), same scope as the catch-up cursor.
+ * Why the attempt counter exists (D1): the consume layers now LEAVE an
+ * undecryptable deposit buffered to retry on the next drain (a failed decrypt
+ * does not commit the ratchet, so transient/ordering failures self-heal). A
+ * genuinely poison deposit would otherwise retry forever, so the drain
+ * quarantines (acks + drops) it once `attempts` crosses a bound. Counters are
+ * cleared when a deposit is finally acked.
+ *
+ * Bounded by pruning: the drain forget()s the processed marker and
+ * clearAttempts() the counter the moment it acks an eventId, so both sets stay
+ * small. Backed by the chat-server's global KV (`getKeyValueStore(null)`).
  */
 export class ProcessedDepositLog {
   #kvStore;
@@ -33,6 +37,10 @@ export class ProcessedDepositLog {
 
   #key(mailboxId, eventId) {
     return KEY_PREFIX + mailboxId + ":" + eventId;
+  }
+
+  #attemptKey(mailboxId, eventId) {
+    return ATTEMPT_PREFIX + mailboxId + ":" + eventId;
   }
 
   async has(mailboxId, eventId) {
@@ -57,6 +65,40 @@ export class ProcessedDepositLog {
     if (!ids) return;
     if (typeof this.#kvStore.delete !== "function") return;
     await this.#kvStore.delete(this.#key(ids.mailboxId, ids.eventId));
+  }
+
+  /**
+   * Increment and persist the failed-decrypt attempt counter for an event,
+   * returning the new count. Used by the drain to bound poison retries (D1).
+   */
+  async recordAttempt(mailboxId, eventId, { nowMs = Date.now() } = {}) {
+    const ids = this.#ids(mailboxId, eventId);
+    if (!ids) return 0;
+    const key = this.#attemptKey(ids.mailboxId, ids.eventId);
+    const stored = await this.#kvStore.get(key);
+    const prev = stored && Number.isInteger(stored.attempts) ? stored.attempts : 0;
+    const attempts = prev + 1;
+    await this.#kvStore.set(key, {
+      mailboxId: ids.mailboxId,
+      eventId: ids.eventId,
+      attempts,
+      lastAttemptAtMs: Number.isFinite(nowMs) ? Number(nowMs) : Date.now(),
+    });
+    return attempts;
+  }
+
+  async attempts(mailboxId, eventId) {
+    const ids = this.#ids(mailboxId, eventId);
+    if (!ids) return 0;
+    const stored = await this.#kvStore.get(this.#attemptKey(ids.mailboxId, ids.eventId));
+    return stored && Number.isInteger(stored.attempts) ? stored.attempts : 0;
+  }
+
+  async clearAttempts(mailboxId, eventId) {
+    const ids = this.#ids(mailboxId, eventId);
+    if (!ids) return;
+    if (typeof this.#kvStore.delete !== "function") return;
+    await this.#kvStore.delete(this.#attemptKey(ids.mailboxId, ids.eventId));
   }
 
   #ids(mailboxId, eventId) {

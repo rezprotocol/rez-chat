@@ -106,16 +106,32 @@ export function launchDesktopProfile(profileName, options = {}) {
       REZ_CHAT_WINDOW_WIDTH: String(profile.windowWidth),
       REZ_CHAT_WINDOW_HEIGHT: String(profile.windowHeight),
       CHAT_ID: "desktop-" + profile.name,
+      // Default the receive-path / peer-link trace ON for two-node dev runs so a
+      // captured run.log shows exactly where a deposit is classified, decrypted,
+      // or dropped. Overridable from the parent env.
+      REZ_PEERLINK_TRACE: process.env.REZ_PEERLINK_TRACE || "1",
+      REZ_INBOX_CATCHUP_DEBUG: process.env.REZ_INBOX_CATCHUP_DEBUG || "1",
+      REZ_ROUTE_DEBUG: process.env.REZ_ROUTE_DEBUG || "1",
     },
     stdio: options.prefix ? ["inherit", "pipe", "pipe"] : "inherit",
   });
 
+  // Tee everything the child emits (main process + embedded node + chat-server)
+  // to <userDataDir>/run.log so the full live log is readable from disk, not just
+  // the terminal. Truncated on each launch. Renderer/UI console stays in devtools.
+  let logStream = null;
   if (options.prefix) {
-    prefixStream(child.stdout, "[" + profile.name + "] ", process.stdout);
-    prefixStream(child.stderr, "[" + profile.name + "] ", process.stderr);
+    const logPath = path.join(profile.userDataDir, "run.log");
+    logStream = fs.createWriteStream(logPath, { flags: "w" });
+    logStream.write("=== run.log " + profile.name + " started " + new Date().toISOString() + " ===\n");
+    prefixStream(child.stdout, "[" + profile.name + "] ", process.stdout, logStream);
+    prefixStream(child.stderr, "[" + profile.name + "] ", process.stderr, logStream);
   }
 
   child.once("exit", (code, signal) => {
+    if (logStream) {
+      logStream.end("=== run.log " + profile.name + " exited code=" + String(code) + " signal=" + String(signal || "") + " ===\n");
+    }
     if (options.onExit) {
       options.onExit({ profile, code, signal });
     }
@@ -164,7 +180,7 @@ function parseWindowSize(value, fallback, label) {
   return result;
 }
 
-function prefixStream(stream, prefix, target) {
+function prefixStream(stream, prefix, target, fileStream) {
   if (!stream) return;
   stream.on("data", (chunk) => {
     const text = String(chunk || "");
@@ -173,6 +189,7 @@ function prefixStream(stream, prefix, target) {
       const line = lines[i];
       if (!line && i === lines.length - 1) continue;
       target.write(prefix + line + "\n");
+      if (fileStream) fileStream.write(new Date().toISOString() + " " + line + "\n");
     }
   });
 }
@@ -204,8 +221,12 @@ async function main() {
   }
 
   await prepareElectronNativeModules();
-  const { profile, child } = launchDesktopProfile(arg);
+  // prefix:true so a single-profile launch also tees its full log to
+  // <userDataDir>/run.log — needed to capture an offline-accept run where alice
+  // and bob are launched in separate terminals (so one can be quit independently).
+  const { profile, child } = launchDesktopProfile(arg, { prefix: true });
   console.log("[desktop:" + profile.name + "] userData " + profile.userDataDir);
+  console.log("[desktop:" + profile.name + "] run.log " + path.join(profile.userDataDir, "run.log"));
   console.log("[desktop:" + profile.name + "] shell http://127.0.0.1:" + profile.desktopPort + "/");
   console.log("[desktop:" + profile.name + "] node ws://127.0.0.1:" + profile.nodeWsPort + "/ws");
   console.log("[desktop:" + profile.name + "] window " + profile.windowWidth + "x" + profile.windowHeight + "+" + profile.windowX + "+" + profile.windowY);

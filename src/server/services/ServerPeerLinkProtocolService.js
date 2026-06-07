@@ -51,31 +51,60 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
    * @returns {Promise<null | { userMessage: object }>}
    */
   async processDeposit(event) {
+    const tr = process.env.REZ_PEERLINK_TRACE === "1";
     const frame = event && typeof event === "object" ? event : {};
     const body = frame.body && typeof frame.body === "object" ? frame.body : frame;
     const ciphertextB64 = typeof body.ciphertextB64 === "string" ? body.ciphertextB64 : "";
     const mailboxId = typeof body.mailboxId === "string" ? body.mailboxId : "";
     const eventId = typeof body.eventId === "string" ? body.eventId : "";
-    if (!ciphertextB64) return;
+    if (!ciphertextB64) {
+      if (tr) this.logger.log("[PLTRACE] processDeposit SKIP no-ciphertextB64 mbox=" + mailboxId + " evt=" + eventId);
+      return { consumed: false, decryptOk: false, reason: "no-ciphertext" };
+    }
 
     let payloadBytes;
     try {
       payloadBytes = base64ToBytes(ciphertextB64);
-    } catch {
-      return;
+    } catch (b64Err) {
+      if (tr) this.logger.log("[PLTRACE] processDeposit SKIP base64-fail evt=" + eventId + " err=" + (b64Err && b64Err.message ? b64Err.message : b64Err));
+      return { consumed: false, decryptOk: false, reason: "base64-fail" };
     }
 
     let bodyObj = null;
+    let parseErr = null;
     try {
       const text = new TextDecoder().decode(payloadBytes);
       const parsed = JSON.parse(text);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         bodyObj = parsed;
       }
-    } catch {
+    } catch (err) {
+      parseErr = err;
       bodyObj = null;
     }
-    if (!bodyObj) return;
+    if (!bodyObj) {
+      if (tr) {
+        const head = Buffer.from(payloadBytes.slice(0, 24)).toString("hex");
+        this.logger.log("[PLTRACE] processDeposit SKIP unparseable evt=" + eventId + " bytes=" + payloadBytes.length + " head=" + head + (parseErr ? " err=" + (parseErr.message || parseErr) : ""));
+      }
+      return { consumed: false, decryptOk: false, reason: "unparseable" };
+    }
+
+    // Receive-path trace (opt-in via REZ_PEERLINK_TRACE): classify every inbound
+    // deposit so a captured run.log shows exactly which establishment/decrypt path
+    // each packet took — the single highest-signal line for diagnosing one-sided
+    // peer links (handshake never processed) vs ratchet desync.
+    if (process.env.REZ_PEERLINK_TRACE === "1") {
+      this.logger.log(
+        "[PLTRACE] deposit owner=" + this.ownerAccountId + " mbox=" + mailboxId + " evt=" + eventId
+        + " type=" + (typeof bodyObj.type === "string" ? bodyObj.type : "-")
+        + " kind=" + (typeof bodyObj.kind === "string" ? bodyObj.kind : "-")
+        + " e2ee=" + (bodyObj.e2ee === 1 ? "1" : "0")
+        + " hs=" + (bodyObj.handshake ? "1" : "0")
+        + (bodyObj.handshake && bodyObj.handshake.rehandshakeRequestId ? " rehsResp=1" : "")
+        + " bytes=" + payloadBytes.length,
+      );
+    }
 
     // --- Plaintext peer-link protocol messages ---
 
@@ -106,9 +135,9 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         this.logger.error("[ServerPeerLinkProtocolService] rehandshake response failed", rhErr && rhErr.message ? rhErr.message : rhErr);
         return;
       }
-      if (!result) return;
+      if (!result) return { consumed: false, decryptOk: false, reason: "rehs-response-noop" };
       this._emitPeerLinkUpdated(result.snapshot);
-      return;
+      return { consumed: true, decryptOk: true };
     }
 
     // Regular peer-link handshake.
@@ -127,11 +156,12 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         this.logger.error("[ServerPeerLinkProtocolService] handshake processing failed", hsErr && hsErr.message ? hsErr.message : hsErr);
         return;
       }
-      if (!handled) return;
+      if (!handled) return { consumed: false, decryptOk: false, reason: "handshake-not-handled" };
       // Lazy maxUses enforcement declined this handshake (invite used up or
       // expired). No session was established and the inviter holds no
       // peer-link for it — deposit a signed reject so the acceptor can roll
-      // back its optimistic peer-link.
+      // back its optimistic peer-link. The handshake itself IS consumed (we
+      // decided on it), so it must be acked, not retried.
       if (handled.rejected) {
         const rejectInboxId = String(handled.acceptorInboxId || "").trim();
         if (rejectInboxId) {
@@ -141,7 +171,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
             ackNonce: handled.ackNonce || null,
           });
         }
-        return;
+        return { consumed: true, decryptOk: true };
       }
       this._emitPeerLinkUpdated(handled.snapshot, handled.remoteDisplayName);
       const acceptorInboxId = handled.snapshot
@@ -154,7 +184,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
           ackNonce: handled.ackNonce || null,
         });
       }
-      return;
+      return { consumed: true, decryptOk: true };
     }
 
     // Re-handshake request.
@@ -177,7 +207,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         this.logger.error("[ServerPeerLinkProtocolService] rehandshake processing failed", rhErr && rhErr.message ? rhErr.message : rhErr);
         return;
       }
-      if (!result) return;
+      if (!result) return { consumed: false, decryptOk: false, reason: "rehs-request-noop" };
       this._emitPeerLinkUpdated(result.snapshot);
       if (result.handshakePacket && result.deliverInboxId) {
         try {
@@ -193,7 +223,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
           this.logger.error("[ServerPeerLinkProtocolService] rehandshake response send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
         }
       }
-      return;
+      return { consumed: true, decryptOk: true };
     }
 
     // Handshake ack (signed envelope from inviter → acceptor). MED-1: the
@@ -211,9 +241,9 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         this.logger.error("[ServerPeerLinkProtocolService] handshake.ack processing failed", ackErr && ackErr.message ? ackErr.message : ackErr);
         return;
       }
-      if (!handled) return;
+      if (!handled) return { consumed: false, decryptOk: false, reason: "ack-not-handled" };
       this._emitPeerLinkUpdated(handled.snapshot, handled.remoteDisplayName);
-      return;
+      return { consumed: true, decryptOk: false };
     }
 
     // Handshake reject (signed envelope from inviter → acceptor). Authenticated
@@ -231,9 +261,9 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         this.logger.error("[ServerPeerLinkProtocolService] handshake.reject processing failed", rejErr && rejErr.message ? rejErr.message : rejErr);
         return;
       }
-      if (!handled) return;
+      if (!handled) return { consumed: false, decryptOk: false, reason: "reject-not-handled" };
       this._emitPeerLinkUpdated(handled.snapshot);
-      return;
+      return { consumed: true, decryptOk: false };
     }
 
     // E2EE direct message (user content or delivery ack inside ciphertext).
@@ -250,9 +280,15 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         if (decErr && decErr.code === "DECRYPT_FAILED" && decErr.rehandshakeNeeded) {
           this._triggerRehandshake({ peerAccountId: decErr.peerAccountId });
         }
-        return;
+        // NOT consumed — leave the deposit buffered. The decrypt did not advance
+        // the ratchet, so a later drain (once the establishing handshake ahead of
+        // it is applied, or a rehandshake lands) can decrypt it. Acking here would
+        // destroy a message we simply can't read YET (the desktop data-loss bug).
+        return { consumed: false, decryptOk: false, reason: "decrypt-failed" };
       }
-      if (!decResult || !(decResult.plaintextBytes instanceof Uint8Array)) return;
+      if (!decResult || !(decResult.plaintextBytes instanceof Uint8Array)) {
+        return { consumed: false, decryptOk: false, reason: "decrypt-empty" };
+      }
 
       // Emit the snapshot-updated event only when an actual peer-link state
       // transition occurred (decResult.event is non-null). Snapshot is now
@@ -273,7 +309,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
             senderAccountId: inner.senderAccountId,
             messageIds: inner.messageIds,
           });
-          return;
+          return { consumed: true, decryptOk: true };
         }
       } catch {
         // not JSON or not a protocol message — fall through as user message
@@ -293,6 +329,8 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       // by the membership gate. See memory
       // feedback_inbound_deposit_pipeline_must_be_awaited_calls.
       return {
+        consumed: true,
+        decryptOk: true,
         userMessage: {
           mailboxId,
           eventId,
@@ -302,7 +340,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         },
       };
     }
-    return null;
+    return { consumed: false, decryptOk: false, reason: "unknown-type" };
   }
 
   async _sendHandshakeAck({ deliverInboxId, ownerDisplayName = "", ackNonce = null }) {

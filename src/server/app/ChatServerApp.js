@@ -307,7 +307,6 @@ export class ChatServerApp {
     if (inboxClaimant) {
       services.inboxCatchup = new InboxCatchupService({
         bus: this.bus,
-        storageProvider: this.#storageProvider,
         inboxClaimant,
         inboundPipeline,
         processedLog,
