@@ -9,17 +9,15 @@ export class SessionService extends BaseBusService {
     bus,
     authBootstrapService,
     accountAuthService,
-    authStore,
     sessionStore,
     logger = console,
   } = {}) {
     super({ bus });
-    if (!authBootstrapService || !accountAuthService || !authStore || !sessionStore) {
-      throw new Error("SessionService requires authBootstrapService, accountAuthService, authStore, sessionStore");
+    if (!authBootstrapService || !accountAuthService || !sessionStore) {
+      throw new Error("SessionService requires authBootstrapService, accountAuthService, sessionStore");
     }
     this._authBootstrapService = authBootstrapService;
     this._accountAuthService = accountAuthService;
-    this._authStore = authStore;
     this._sessionStore = sessionStore;
     this._logger = logger;
     this._runtimeConnectSeq = 0;
@@ -65,7 +63,6 @@ export class SessionService extends BaseBusService {
       return this._sessionStore.snapshot();
     } catch (err) {
       const message = err && err.message ? err.message : "Restore failed.";
-      this._syncFromAuth();
       if (this._sessionStore.snapshot().status === SESSION_STATUS.UNLOCKING) {
         this._sessionStore.setLocked({ error: message });
       }
@@ -94,7 +91,6 @@ export class SessionService extends BaseBusService {
       }
     }
     const result = await this._accountAuthService.changePassword({ accountId, oldPassword, newPassword });
-    this._syncFromAuth();
     this.bus.emit("session.passwordChanged", { accountId });
     return result;
   }
@@ -111,7 +107,6 @@ export class SessionService extends BaseBusService {
       }
     }
     const result = await this._accountAuthService.resetPasswordWithMnemonic({ accountId, mnemonic, newPassword });
-    this._syncFromAuth();
     this.bus.emit("session.passwordReset", { accountId });
     return result;
   }
@@ -132,14 +127,12 @@ export class SessionService extends BaseBusService {
       }
     }
     const result = await this._accountAuthService.purgeAccount({ accountId: targetId, password });
-    this._syncFromAuth();
     this.bus.emit("session.purged", { accountId: targetId });
     return result;
   }
 
   async init() {
     await this._authBootstrapService.init();
-    this._syncFromAuth();
   }
 
   async inspectBootstrap() {
@@ -176,7 +169,6 @@ export class SessionService extends BaseBusService {
       return this._sessionStore.snapshot();
     } catch (err) {
       const message = err && err.message ? err.message : "Unlock failed.";
-      this._syncFromAuth();
       if (this._sessionStore.snapshot().status === SESSION_STATUS.UNLOCKING) {
         this._sessionStore.setLocked({ error: message });
       }
@@ -193,7 +185,6 @@ export class SessionService extends BaseBusService {
       return this._sessionStore.snapshot();
     } catch (err) {
       const message = err && err.message ? err.message : "Device unlock failed.";
-      this._syncFromAuth();
       if (this._sessionStore.snapshot().status === SESSION_STATUS.UNLOCKING) {
         this._sessionStore.setLocked({ error: "" });
       }
@@ -206,13 +197,11 @@ export class SessionService extends BaseBusService {
     const snap = this._sessionStore.snapshot();
     const resolved = accountId || (snap && snap.selectedAccountId) || (snap && snap.accountId) || null;
     const result = await this._accountAuthService.disableDeviceUnlock({ accountId: resolved });
-    this._syncFromAuth({ keepStatus: true });
     this.bus.emit("session.deviceUnlock.disabled", { accountId: resolved });
     return result;
   }
 
   _completeUnlock(unlocked) {
-    this._syncFromAuth({ keepStatus: true });
     this._sessionStore.setUnlocked({
       accountId: unlocked && unlocked.accountId ? unlocked.accountId : null,
       deviceId: unlocked && unlocked.deviceId ? unlocked.deviceId : null,
@@ -240,7 +229,6 @@ export class SessionService extends BaseBusService {
         profileName: resolvedName,
         password,
       });
-      this._syncFromAuth({ keepStatus: true });
       this._sessionStore.setUnlocked({
         accountId: unlocked && unlocked.accountId ? unlocked.accountId : null,
         deviceId: unlocked && unlocked.deviceId ? unlocked.deviceId : null,
@@ -248,6 +236,7 @@ export class SessionService extends BaseBusService {
         ownerAccountId: unlocked && unlocked.ownerAccountId ? unlocked.ownerAccountId : null,
       });
       this.bus.emit("session.unlocked", this._sessionStore.snapshot());
+      this.bus.emit("session.authenticated", this._sessionStore.snapshot());
       const connectSeq = ++this._runtimeConnectSeq;
       this._connectRuntimeAfterUnlock({ connectSeq }).catch((err) => {
         if (this._logger && typeof this._logger.warn === "function") {
@@ -257,7 +246,6 @@ export class SessionService extends BaseBusService {
       return this._sessionStore.snapshot();
     } catch (err) {
       const message = err && err.message ? err.message : "Account creation failed.";
-      this._syncFromAuth();
       this._sessionStore.setError(message);
       throw err;
     }
@@ -275,7 +263,6 @@ export class SessionService extends BaseBusService {
     }
 
     await this._authBootstrapService.setDisplayName(accountId, name);
-    this._syncFromAuth({ keepStatus: true });
     this.bus.emit("session.updated", this._sessionStore.snapshot());
 
     const client = this.bus.runtime && this.bus.runtime.client ? this.bus.runtime.client : null;
@@ -358,7 +345,6 @@ export class SessionService extends BaseBusService {
 
   selectAccount({ accountId } = {}) {
     this._authBootstrapService.selectAccount({ accountId });
-    this._syncFromAuth({ keepStatus: true });
   }
 
   async lock() {
@@ -371,7 +357,6 @@ export class SessionService extends BaseBusService {
       }
     }
     await this._accountAuthService.logout();
-    this._syncFromAuth();
     this.bus.emit("session.locked", this._sessionStore.snapshot());
   }
 
@@ -404,37 +389,5 @@ export class SessionService extends BaseBusService {
     if (snap && snap.selectedAccountId) return String(snap.selectedAccountId).trim();
     if (snap && snap.accountId) return String(snap.accountId).trim();
     return "";
-  }
-
-  _syncFromAuth({ keepStatus = false } = {}) {
-    const snap = this._authStore.snapshot();
-    const list = Array.isArray(snap.accountList) ? snap.accountList : [];
-    this._sessionStore.setAccountList(list);
-    this._sessionStore.setSelectedAccountId(snap.selectedAccountId);
-    this._sessionStore.setCanAddAccount(true);
-    if (keepStatus) {
-      if (snap.error) this._sessionStore.setError(snap.error);
-      return;
-    }
-    if (snap.status === "NO_KEYSTORE") {
-      this._sessionStore.setNoKeystore();
-      return;
-    }
-    if (snap.status === "LOCKED") {
-      this._sessionStore.setLocked({ error: snap.error });
-      return;
-    }
-    if (snap.status === "UNLOCKED") {
-      this._sessionStore.setUnlocked({
-        accountId: snap.accountId,
-        deviceId: snap.deviceId,
-      });
-      return;
-    }
-    if (snap.status === "LOCKING") {
-      this._sessionStore.setLocking();
-      return;
-    }
-    this._sessionStore.setUnlocking();
   }
 }

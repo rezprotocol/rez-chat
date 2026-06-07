@@ -2,19 +2,17 @@ import { resolveSessionIdentity } from "@rezprotocol/sdk/client";
 
 export class SdkSessionService {
   constructor({
-    authStore,
     accountAuthService,
     sdkClientFactory = null,
     sdkClient = null,
     logger = console,
   } = {}) {
-    if (!authStore || !accountAuthService) {
-      throw new Error("SdkSessionService requires authStore and accountAuthService");
+    if (!accountAuthService) {
+      throw new Error("SdkSessionService requires accountAuthService");
     }
     if (!sdkClient && typeof sdkClientFactory !== "function") {
       throw new Error("SdkSessionService requires sdkClientFactory or sdkClient");
     }
-    this._authStore = authStore;
     this._accountAuthService = accountAuthService;
     this._sdkClientFactory = sdkClientFactory;
     this._sdkClientStatic = sdkClient;
@@ -37,9 +35,6 @@ export class SdkSessionService {
     if (!account) throw new Error("No unlocked account");
     const connectResult = await this._connectClient(account);
     this._sessionHandles = connectResult.sessionHandles;
-    if (this._authStore && typeof this._authStore.updateSessionHandles === "function") {
-      this._authStore.updateSessionHandles(connectResult.sessionHandles);
-    }
     const envelope = this._accountAuthService.takePendingServerSyncEnvelope();
     if (envelope) {
       this._syncKeystoreToServer(envelope, connectResult.client).catch((err) => {
@@ -54,9 +49,6 @@ export class SdkSessionService {
   async disconnect() {
     await this._closeClient();
     this._sessionHandles = null;
-    if (this._authStore && typeof this._authStore.updateSessionHandles === "function") {
-      this._authStore.updateSessionHandles(null);
-    }
   }
 
   async _syncKeystoreToServer(envelope, client) {

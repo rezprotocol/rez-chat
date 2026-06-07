@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { KeystoreStore } from "@rezprotocol/sdk/client";
-import { AuthStore, AUTH_STATUS } from "../src/ui/stores/AuthStore.js";
+import { SessionStore, SESSION_STATUS } from "../src/ui/stores/SessionStore.js";
 import { createAuthHarness } from "./_helpers/createAuthHarness.js";
 
 function createMemoryStorage() {
@@ -77,7 +77,7 @@ test("unlock succeeds offline — authStore is UNLOCKED despite connect timeout"
   await seedKeystore(storage, password);
 
   const service = createAuthHarness({
-    authStore: new AuthStore(),
+    authStore: new SessionStore(),
     keystoreStore: new KeystoreStore({ storageProvider: storage }),
     sdkClientFactory: createOfflineSdkFactory(),
     cryptoProvider: globalThis.crypto,
@@ -85,12 +85,12 @@ test("unlock succeeds offline — authStore is UNLOCKED despite connect timeout"
   });
 
   await service.init();
-  assert.equal(service.authStore.snapshot().status, AUTH_STATUS.LOCKED);
+  assert.equal(service.authStore.snapshot().status, SESSION_STATUS.LOCKED);
 
   const result = await service.unlock({ password });
 
   const snap = service.authStore.snapshot();
-  assert.equal(snap.status, AUTH_STATUS.UNLOCKED, "authStore must be UNLOCKED after offline unlock");
+  assert.equal(snap.status, SESSION_STATUS.UNLOCKED, "authStore must be UNLOCKED after offline unlock");
   assert.equal(typeof snap.accountId, "string");
   assert.ok(snap.accountId.length > 0, "accountId must be non-empty");
   assert.equal(typeof snap.deviceId, "string");
@@ -106,7 +106,7 @@ test("unlock does not throw when network is unavailable", async () => {
   await seedKeystore(storage, password);
 
   const service = createAuthHarness({
-    authStore: new AuthStore(),
+    authStore: new SessionStore(),
     keystoreStore: new KeystoreStore({ storageProvider: storage }),
     sdkClientFactory: createOfflineSdkFactory(),
     cryptoProvider: globalThis.crypto,
@@ -127,7 +127,7 @@ test("connectClient throws when called offline after successful unlock", async (
   await seedKeystore(storage, password);
 
   const service = createAuthHarness({
-    authStore: new AuthStore(),
+    authStore: new SessionStore(),
     keystoreStore: new KeystoreStore({ storageProvider: storage }),
     sdkClientFactory: createOfflineSdkFactory(),
     cryptoProvider: globalThis.crypto,
@@ -137,7 +137,7 @@ test("connectClient throws when called offline after successful unlock", async (
   await service.init();
   await service.unlock({ password });
 
-  assert.equal(service.authStore.snapshot().status, AUTH_STATUS.UNLOCKED);
+  assert.equal(service.authStore.snapshot().status, SESSION_STATUS.UNLOCKED);
 
   await assert.rejects(
     () => service.connectClient(),
@@ -147,7 +147,7 @@ test("connectClient throws when called offline after successful unlock", async (
 
   assert.equal(
     service.authStore.snapshot().status,
-    AUTH_STATUS.UNLOCKED,
+    SESSION_STATUS.UNLOCKED,
     "authStore must remain UNLOCKED after connect failure",
   );
 });

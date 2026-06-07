@@ -4,7 +4,7 @@ import { nonEmptyString } from "../../records/domain/coerce.js";
 /**
  * DesktopAccountListEntry: one entry in the desktop vault's account-picker
  * list. Sourced from the Electron desktop bridge's `vault.listAccounts()`
- * response; surfaced to the AuthStore for the unlock screen.
+ * response; surfaced to the SessionStore for the unlock screen.
  */
 export class DesktopAccountListEntry extends RRecord {
   static type = "chat.desktopAccountListEntry";
