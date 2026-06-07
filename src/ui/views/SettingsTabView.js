@@ -17,6 +17,7 @@ export class SettingsTabView extends BusComponent {
     super({ bus });
     this._sidebarEl = null;
     this._mainEl = null;
+    this._appVersion = "";
   }
 
   mount(parentEl) {
@@ -33,6 +34,24 @@ export class SettingsTabView extends BusComponent {
     });
     this._renderSidebar();
     this._renderMain();
+    this._loadAppVersion();
+  }
+
+  // The desktop app exposes its version via the rezDesktop bridge
+  // (electron main: app.getVersion() over the desktop:getAppInfo IPC). It is
+  // async and absent in the web build, so fetch once and re-render on arrival.
+  _loadAppVersion() {
+    const desktop = typeof window !== "undefined" && window.rezDesktop ? window.rezDesktop : null;
+    if (!desktop || typeof desktop.getAppInfo !== "function") return;
+    Promise.resolve(desktop.getAppInfo()).then((info) => {
+      const version = info && typeof info.appVersion === "string" ? info.appVersion.trim() : "";
+      if (!version || version === this._appVersion) return;
+      this._appVersion = version;
+      this._renderSidebar();
+      this._renderMain();
+    }).catch((err) => {
+      console.error("[SettingsTabView] getAppInfo failed", err);
+    });
   }
 
   _renderSidebar() {
@@ -54,6 +73,7 @@ export class SettingsTabView extends BusComponent {
       h("h1", { className: "text-headline-md font-headline-md text-on-surface" }, "System"),
     ]));
     this._sidebarEl.appendChild(h("div", { className: "px-space-lg py-space-md flex flex-col gap-space-sm" }, [
+      h("p", { className: STAT_VALUE_CLASS, "data-testid": "system.app-version" }, "Version: " + (this._appVersion || "—")),
       h("p", { className: STAT_VALUE_CLASS }, "Account: " + ellipsisId(accountId, 20)),
       h("p", { className: STAT_VALUE_CLASS }, "Device: " + ellipsisId(deviceId, 20)),
       h("p", { className: STAT_VALUE_CLASS, "data-testid": "system.connected-node" }, "Node: " + nodeLabel),
@@ -75,6 +95,10 @@ export class SettingsTabView extends BusComponent {
     const backup = current && current.backup && typeof current.backup === "object" ? current.backup : {};
     const wrapper = h("div", { className: "p-space-xl flex flex-col gap-space-lg max-w-3xl overflow-y-auto custom-scrollbar h-full" }, [
       h("h3", { className: "text-headline-md font-headline-md text-on-surface" }, "System Settings"),
+      h("p", {
+        className: "text-label-technical font-label-technical text-on-surface-variant/70 -mt-space-sm",
+        "data-testid": "system.app-version.main",
+      }, "Version " + (this._appVersion || "—")),
       h("div", {
         className: CARD_CLASS,
         "data-testid": "system.connected-node-url",

@@ -1,6 +1,15 @@
 appId: com.rezprotocol.chat
 productName: Rez Chat
 
+# Artifact filenames MUST contain no spaces. productName ("Rez Chat") has a
+# space; electron-builder sanitizes that space to "-" when it writes the
+# latest*.yml `url` fields, but the GitHub Releases upload (softprops/action-gh-release)
+# sanitizes the same space to ".". The two names then disagree, so electron-updater
+# 404s the download and silently refuses to update (broke every release v0.4.2→v0.4.7).
+# Using ${name} (the package name "rez-chat", no spaces) makes both sanitizers no-ops
+# so the yml url and the uploaded asset name always match.
+artifactName: ${name}-${version}-${arch}.${ext}
+
 directories:
   # rez-chat repo IS the app root. The four sibling Rez packages live at
   # ../rez-core, ../rez-sdk, ../rez-node, ../rez-ui (see the polyrepo
