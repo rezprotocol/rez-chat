@@ -37,6 +37,7 @@ export class ServerChannelsService extends BaseServerService {
   #channelStore;
   #groupStore;
   #clock;
+  #inFlightSyncAll = null;
 
   constructor({
     bus,
@@ -71,6 +72,21 @@ export class ServerChannelsService extends BaseServerService {
   }
 
   async requestSyncForAllMyGroups() {
+    // Two connect events fire back-to-back per login (the server's own
+    // `runtime.connected` and the UI's `session.runtime.connected` ->
+    // channels.syncAll). Collapse concurrent invocations so we walk groups and
+    // fan out sync_requests once per connect instead of doubling peer traffic.
+    if (this.#inFlightSyncAll) return this.#inFlightSyncAll;
+    const run = this.#doRequestSyncForAllMyGroups();
+    this.#inFlightSyncAll = run;
+    try {
+      return await run;
+    } finally {
+      this.#inFlightSyncAll = null;
+    }
+  }
+
+  async #doRequestSyncForAllMyGroups() {
     const groups = await this.#groupStore.listGroups({
       ownerAccountId: this.ownerAccountId,
     }).catch(() => []);

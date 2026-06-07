@@ -2,33 +2,44 @@ import {
   MessageDepositedEvent,
   PeerLinkUpdatedEvent,
 } from "../../records/index.js";
-import { getPayloadEntry, GROUP_OP_KIND } from "../../records/payloads/index.js";
+import { getPayloadEntry } from "../../records/payloads/index.js";
 import { MESSAGE_KIND as CHAT_MESSAGE_KIND } from "../../records/payloads/ChatMessagePayloadV1.js";
 import { E2eeDeliveryAckV1 } from "@rezprotocol/sdk/client";
 import { BaseServerService } from "../base/BaseServerService.js";
+import { ServerDeferredMessageBuffer } from "./ServerDeferredMessageBuffer.js";
+import { ServerGroupAuthzGate } from "./ServerGroupAuthzGate.js";
 
 export class ServerEventService extends BaseServerService {
   #clock;
   // Decrypted group messages whose authenticated sender is not YET an active
-  // member — held (keyed `groupId:accountId`) instead of dropped, then re-applied
-  // when that member's member.join lands (flushDeferredGroupMessages). Fixes the
-  // offline race where a message is push-delivered before its sender's join op,
-  // which the fail-closed authz gate would otherwise drop permanently. Bounded
-  // by key count + per-key depth. In-memory (the live offline path re-delivers
-  // both the message and the join into the same chat-server session). See memory
+  // member are held (not dropped) and re-applied when that member's member.join
+  // lands. The buffering + bounds + redelivery guard live in
+  // ServerDeferredMessageBuffer; the authz gate below consults it. See memory
   // project_offline_push_before_handshake_race.
-  #deferredGroupMessages;
-  #redeliveringDeferred;
-  #maxDeferredKeys;
-  #maxDeferredPerKey;
+  #deferred;
+  // Fail-closed group-content authz decision (audit pass 5, H1). Resolved lazily
+  // because bus.stores.groupStore is wired after services are constructed.
+  #authzGate;
 
   constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console, maxDeferredKeys = 256, maxDeferredPerKey = 64 } = {}) {
     super({ bus, ownerAccountId, logger });
     this.#clock = clock;
-    this.#deferredGroupMessages = new Map();
-    this.#redeliveringDeferred = false;
-    this.#maxDeferredKeys = Number.isInteger(maxDeferredKeys) && maxDeferredKeys > 0 ? maxDeferredKeys : 256;
-    this.#maxDeferredPerKey = Number.isInteger(maxDeferredPerKey) && maxDeferredPerKey > 0 ? maxDeferredPerKey : 64;
+    this.#deferred = new ServerDeferredMessageBuffer({
+      maxKeys: maxDeferredKeys,
+      maxPerKey: maxDeferredPerKey,
+      logger,
+    });
+    this.#authzGate = null;
+  }
+
+  #groupAuthzGate() {
+    if (!this.#authzGate) {
+      this.#authzGate = new ServerGroupAuthzGate({
+        groupStore: this.bus.stores.groupStore,
+        ownerAccountId: this.ownerAccountId,
+      });
+    }
+    return this.#authzGate;
   }
 
   async start() {
@@ -252,50 +263,28 @@ export class ServerEventService extends BaseServerService {
     const peerAcct = thread && typeof thread.peerAccountId === "string" ? thread.peerAccountId.trim() : "";
 
     // SECURITY — authoritative group-content authorization (audit pass 5, H1).
-    // Before ANY group content is dispatched (reactions/edits/tombstones/media),
-    // persisted (messages), or rendered, the sender MUST be an active member of
-    // the target group. The only trustworthy sender identity is `envelopeSender`
-    // — the account from the decrypted peer-link snapshot (cryptographically
-    // authenticated). The payload's self-declared `senderAccountId` is NOT
-    // trusted for group threads (it is attacker-controllable). Group-management
-    // ops (GroupOpPayloadV1) self-authorize inside handleIncomingGroupOp
-    // (member.join is the bootstrap exception), so they are exempt here. Fail
-    // closed: an unauthenticated or non-active sender is dropped.
+    // The decision lives in ServerGroupAuthzGate; we own the side effects. The
+    // only trustworthy sender identity is `envelopeSender` (the cryptographically
+    // authenticated account from the decrypted peer-link snapshot). A "defer"
+    // verdict holds a brand-new sender's message until their member.join lands
+    // (does NOT weaken the gate); a "drop" fails closed.
     const inboundKind = decodedPayload && typeof decodedPayload.kind === "string" ? decodedPayload.kind : "";
-    if (thread && thread.threadType === "group" && inboundKind !== GROUP_OP_KIND) {
-      const groupId = typeof thread.groupId === "string" ? thread.groupId.trim() : "";
-      const authedSender = envelopeSender;
-      const membership = groupId && authedSender
-        ? await this.bus.stores.groupStore.getMembership({
-            ownerAccountId: this.ownerAccountId,
-            groupId,
-            accountId: authedSender,
-          }).catch(() => null)
-        : null;
-      if (!membership || String(membership.state || "").toLowerCase() !== "active") {
-        // The sender is cryptographically authenticated (envelopeSender from the
-        // decrypted peer-link snapshot) but we have not processed their
-        // member.join YET — the message was delivered ahead of the join. DEFER
-        // (not drop): hold the decrypted event and re-apply it when the join
-        // activates this sender. This does NOT weaken the gate — delivery still
-        // requires active membership; it is only deferred until the authorizing
-        // op arrives. A sender with no authenticated identity is still dropped,
-        // and a message re-applied from a flush that STILL fails the gate is
-        // dropped (never re-deferred — the #redeliveringDeferred guard).
-        // Defer ONLY a brand-new authenticated sender we have NO membership
-        // record for yet (their member.join simply hasn't been processed). A
-        // sender whose membership exists but is non-active (e.g. "removed"/
-        // kicked) is NOT a pending joiner — drop it, so a later re-admission can
-        // never resurrect a message they sent while removed.
-        if (!membership && authedSender && groupId && !this.#redeliveringDeferred) {
-          this.#deferGroupMessage(groupId, authedSender, event);
-          return;
-        }
-        this.logger.warn("[ServerEventService] dropped group "
-          + (inboundKind || "message") + " from non-member "
-          + (authedSender || "<unauthenticated>") + " for group " + groupId);
-        return;
-      }
+    const authedSender = envelopeSender;
+    const verdict = await this.#groupAuthzGate().evaluate({
+      thread,
+      inboundKind,
+      authedSender,
+      redelivering: this.#deferred.redelivering,
+    });
+    if (verdict.action === "defer") {
+      this.#deferred.defer(verdict.groupId, authedSender, event);
+      return;
+    }
+    if (verdict.action === "drop") {
+      this.logger.warn("[ServerEventService] dropped group "
+        + (inboundKind || "message") + " from non-member "
+        + (authedSender || "<unauthenticated>") + " for group " + verdict.groupId);
+      return;
     }
 
     // Registry-driven dispatch: look up the kind in PAYLOAD_KIND_REGISTRY
@@ -485,59 +474,16 @@ export class ServerEventService extends BaseServerService {
     });
   }
 
-  // Hold a decrypted group message whose sender isn't an active member yet,
-  // keyed by `groupId:accountId`, bounded by key count and per-key depth (oldest
-  // evicted). Re-applied by flushDeferredGroupMessages when the join lands.
-  #deferGroupMessage(groupId, accountId, event) {
-    const key = groupId + ":" + accountId;
-    let bucket = this.#deferredGroupMessages.get(key);
-    if (!bucket) {
-      if (this.#deferredGroupMessages.size >= this.#maxDeferredKeys) {
-        const oldestKey = this.#deferredGroupMessages.keys().next().value;
-        if (oldestKey) this.#deferredGroupMessages.delete(oldestKey);
-      }
-      bucket = [];
-      this.#deferredGroupMessages.set(key, bucket);
-    }
-    if (bucket.length >= this.#maxDeferredPerKey) bucket.shift();
-    bucket.push(event);
-    if (process.env.REZ_PEERLINK_TRACE === "1") {
-      this.logger.log("[PLTRACE] gate DEFER group=" + groupId + " sender=" + accountId + " (held=" + bucket.length + ")");
-    }
-  }
-
   /**
    * Re-apply any group messages deferred for `accountId` in `groupId`, now that
    * their member.join has activated them. Called by ServerGroupsService after an
-   * inbound member.join is applied. Re-application runs through the same deposit
-   * path (the message bytes are already-decrypted plaintext); the
-   * #redeliveringDeferred guard ensures a message that STILL fails the gate is
-   * dropped rather than re-deferred (no loop).
+   * inbound member.join is applied. Delegates to ServerDeferredMessageBuffer,
+   * which re-runs each held event through the same deposit path
+   * (#handleMailboxDeposited) under its redelivery guard so a message that STILL
+   * fails the gate is dropped rather than re-deferred (no loop).
    */
   async flushDeferredGroupMessages(groupId, accountId) {
-    const gid = typeof groupId === "string" ? groupId.trim() : "";
-    const acct = typeof accountId === "string" ? accountId.trim() : "";
-    if (!gid || !acct) return;
-    const key = gid + ":" + acct;
-    const bucket = this.#deferredGroupMessages.get(key);
-    if (!bucket || bucket.length === 0) return;
-    this.#deferredGroupMessages.delete(key);
-    if (process.env.REZ_PEERLINK_TRACE === "1") {
-      this.logger.log("[PLTRACE] gate FLUSH group=" + gid + " sender=" + acct + " (n=" + bucket.length + ")");
-    }
-    this.#redeliveringDeferred = true;
-    try {
-      for (const event of bucket) {
-        try {
-          await this.#handleMailboxDeposited(event);
-        } catch (err) {
-          this.logger.error("[ServerEventService] deferred group message re-apply failed",
-            err && err.message ? err.message : err);
-        }
-      }
-    } finally {
-      this.#redeliveringDeferred = false;
-    }
+    await this.#deferred.flush(groupId, accountId, (event) => this.#handleMailboxDeposited(event));
   }
 
   async #resolveDirectThreadForSender({ senderAccountId, createdAtMs } = {}) {
