@@ -2,7 +2,6 @@ import { Host } from "@rezprotocol/ui/framework";
 import { IndexedDbStorageProvider } from "@rezprotocol/sdk/client";
 import { ChatBus } from "./ChatBus.js";
 import { SessionStore, SESSION_STATUS } from "../stores/SessionStore.js";
-import { AuthStore } from "../stores/AuthStore.js";
 import { UiStateStore } from "../stores/UiStateStore.js";
 import { ThreadStore } from "../stores/ThreadStore.js";
 import { MessageStore } from "../stores/MessageStore.js";
@@ -75,7 +74,6 @@ export class ChatApp {
 
   _createStores() {
     this.bus.stores.session = new SessionStore({ bus: this.bus });
-    this.bus.stores.auth = new AuthStore({ bus: this.bus });
     this.bus.stores.uiState = new UiStateStore({ bus: this.bus });
     // Stores receive `bus` only for error surfacing — they do NOT read
     // peer stores. Cross-store derivation lives in src/ui/queries/.
@@ -106,28 +104,27 @@ export class ChatApp {
     const accountRegistry = useDesktopRuntime ? null : hasStorage ? new AccountRegistry({ storageProvider }) : null;
     const authBootstrapService = useDesktopRuntime
       ? new DesktopAuthBootstrapService({
-        authStore: this.bus.stores.auth,
+        sessionStore: this.bus.stores.session,
         logger: this._logger,
       })
       : new AuthBootstrapService({
-        authStore: this.bus.stores.auth,
+        sessionStore: this.bus.stores.session,
         storageProvider: hasStorage ? storageProvider : null,
         accountRegistry,
         logger: this._logger,
       });
     const accountAuthService = useDesktopRuntime
       ? new DesktopAccountAuthService({
-        authStore: this.bus.stores.auth,
+        sessionStore: this.bus.stores.session,
         authBootstrapService,
       })
       : new AccountAuthService({
-        authStore: this.bus.stores.auth,
+        sessionStore: this.bus.stores.session,
         authBootstrapService,
         cryptoProvider: createAuthCryptoProvider(),
         logger: this._logger,
       });
     const sdkSessionService = new SdkSessionService({
-      authStore: this.bus.stores.auth,
       accountAuthService,
       sdkClientFactory: sdkFactory,
       logger: this._logger,
@@ -141,7 +138,6 @@ export class ChatApp {
         bus: this.bus,
         authBootstrapService,
         accountAuthService,
-        authStore: this.bus.stores.auth,
         sessionStore: this.bus.stores.session,
         logger: this._logger,
       }),

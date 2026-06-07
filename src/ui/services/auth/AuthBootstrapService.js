@@ -1,5 +1,5 @@
 import { KeystoreStore } from "@rezprotocol/sdk/client";
-import { AUTH_STATUS } from "../../stores/AuthStore.js";
+import { SESSION_STATUS } from "../../stores/SessionStore.js";
 import { AccountRegistryData } from "../../records/AccountRegistryData.js";
 import { AuthBootstrapDiagnosticResult } from "../../records/AuthBootstrapDiagnosticResult.js";
 
@@ -12,34 +12,26 @@ function countObjectKeys(value) {
   return Object.keys(value).length;
 }
 
-function keystoreMeta(envelope) {
-  if (!envelope) return null;
-  return {
-    version: Number(envelope.version || 0),
-    updatedAtMs: Number(envelope.updatedAtMs || 0) || null,
-  };
-}
-
 function createKeystoreStoreForAccount(storageProvider, accountId) {
   return new KeystoreStore({ storageProvider, key: String(accountId || DEFAULT_ACCOUNT_KEY) });
 }
 
 export class AuthBootstrapService {
   constructor({
-    authStore,
+    sessionStore,
     storageProvider = null,
     accountRegistry = null,
     keystoreStore = null,
     logger = console,
   } = {}) {
-    if (!authStore) throw new Error("AuthBootstrapService requires authStore");
+    if (!sessionStore) throw new Error("AuthBootstrapService requires sessionStore");
     const hasStorage = storageProvider && typeof storageProvider.get === "function" && typeof storageProvider.put === "function";
     const hasRegistry = accountRegistry && typeof accountRegistry.listAccounts === "function";
     const hasLegacyStore = keystoreStore instanceof KeystoreStore;
     if (!hasStorage && !hasRegistry && !hasLegacyStore) {
       throw new Error("AuthBootstrapService requires storageProvider+accountRegistry or a KeystoreStore instance");
     }
-    this._authStore = authStore;
+    this._sessionStore = sessionStore;
     this._storageProvider = storageProvider;
     this._accountRegistry = accountRegistry;
     this._keystoreStoreLegacy = hasLegacyStore ? keystoreStore : null;
@@ -78,11 +70,11 @@ export class AuthBootstrapService {
   selectAccount({ accountId } = {}) {
     const id = accountId != null ? String(accountId).trim() : "";
     if (!id) return false;
-    const snap = this._authStore.snapshot();
+    const snap = this._sessionStore.snapshot();
     const list = Array.isArray(snap.accountList) ? snap.accountList : [];
     const found = list.some((account) => account.id === id);
     if (!found) return false;
-    this._authStore.setSelectedAccountId(id);
+    this._sessionStore.setSelectedAccountId(id);
     return true;
   }
 
@@ -90,14 +82,13 @@ export class AuthBootstrapService {
     if (this._keystoreStoreLegacy) {
       const has = await this._keystoreStoreLegacy.hasKeystore();
       if (!has) {
-        this._authStore.setNoKeystore();
-        return this._authStore.snapshot();
+        this._sessionStore.setNoKeystore();
+        return this._sessionStore.snapshot();
       }
-      const envelope = await this._keystoreStoreLegacy.getKeystoreEnvelope();
-      this._authStore.setAccountList([{ id: DEFAULT_ACCOUNT_KEY, label: "Account", accountIdHint: null }]);
-      this._authStore.setSelectedAccountId(DEFAULT_ACCOUNT_KEY);
-      this._authStore.setLocked({ keystoreMeta: keystoreMeta(envelope) });
-      return this._authStore.snapshot();
+      this._sessionStore.setAccountList([{ id: DEFAULT_ACCOUNT_KEY, label: "Account", accountIdHint: null }]);
+      this._sessionStore.setSelectedAccountId(DEFAULT_ACCOUNT_KEY);
+      this._sessionStore.setLocked({});
+      return this._sessionStore.snapshot();
     }
 
     let list = await this.listAccounts();
@@ -113,26 +104,22 @@ export class AuthBootstrapService {
       if (hasDefault && this._accountRegistry) {
         await this._accountRegistry.addAccount(DEFAULT_ACCOUNT_KEY, "Account");
         const after = await this.listAccounts();
-        this._authStore.setAccountList(after);
-        const envelope = await defaultStore.getKeystoreEnvelope();
-        this._authStore.setLocked({ keystoreMeta: keystoreMeta(envelope) });
-        return this._authStore.snapshot();
+        this._sessionStore.setAccountList(after);
+        this._sessionStore.setLocked({});
+        return this._sessionStore.snapshot();
       }
-      this._authStore.setNoKeystore();
+      this._sessionStore.setNoKeystore();
       await this._logBootstrapDiagnosticIfNeeded();
-      return this._authStore.snapshot();
+      return this._sessionStore.snapshot();
     }
 
-    this._authStore.setAccountList(list);
+    this._sessionStore.setAccountList(list);
     if (list.length === 1) {
-      this._authStore.setSelectedAccountId(list[0].id);
+      this._sessionStore.setSelectedAccountId(list[0].id);
     }
-    const firstId = list[0] && list[0].id ? list[0].id : DEFAULT_ACCOUNT_KEY;
-    const store = this.getKeystoreStore(firstId);
-    const envelope = await store.getKeystoreEnvelope().catch(() => null);
-    this._authStore.setLocked({ keystoreMeta: envelope ? keystoreMeta(envelope) : null });
+    this._sessionStore.setLocked({});
     await this._logBootstrapDiagnosticIfNeeded();
-    return this._authStore.snapshot();
+    return this._sessionStore.snapshot();
   }
 
   async inspectBootstrap() {
@@ -161,7 +148,7 @@ export class AuthBootstrapService {
     if (!id) return;
     await this._accountRegistry.setAccountLabel(id, displayName != null ? displayName : "");
     const list = await this.listAccounts();
-    this._authStore.setAccountList(list);
+    this._sessionStore.setAccountList(list);
   }
 
   async setAvatarFileHash(accountId, hash) {
@@ -244,9 +231,9 @@ export class AuthBootstrapService {
   async _logBootstrapDiagnosticIfNeeded() {
     const result = await this._buildBootstrapDiagnosticResult();
     const diagnostic = result.diagnostic;
-    const status = this._authStore.snapshot().status;
+    const status = this._sessionStore.snapshot().status;
     const shouldLog =
-      status === AUTH_STATUS.NO_KEYSTORE ||
+      status === SESSION_STATUS.NO_KEYSTORE ||
       (diagnostic && Array.isArray(diagnostic.orphanEnvelopeKeys) && diagnostic.orphanEnvelopeKeys.length > 0);
     if (!shouldLog) return;
     if (this._logger && typeof this._logger.warn === "function") {
@@ -270,13 +257,13 @@ export class AuthBootstrapService {
     const storageProvider = this._storageProvider;
     const dbName = storageProvider && typeof storageProvider.getDbName === "function" ? storageProvider.getDbName() : "";
     const storeName = storageProvider && typeof storageProvider.getStoreName === "function" ? storageProvider.getStoreName() : "";
-    const snap = this._authStore.snapshot();
+    const snap = this._sessionStore.snapshot();
     let reason = "";
     if (registryAccountIds.length === 0 && orphanEnvelopeKeys.length > 0) {
       reason = "Valid local keystore envelopes exist, but the account registry is empty.";
     } else if (registryAccountIds.length > 0 && discoveredEnvelopeKeys.length === 0) {
       reason = "Account registry exists, but no valid local keystore envelopes were found for those keys.";
-    } else if (snap.status === AUTH_STATUS.NO_KEYSTORE) {
+    } else if (snap.status === SESSION_STATUS.NO_KEYSTORE) {
       reason = "No local keystore envelope was discovered for the selected browser storage.";
     }
     return new AuthBootstrapDiagnosticResult({

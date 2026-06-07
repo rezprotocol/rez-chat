@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 
 import { SessionService } from "../src/ui/services/bus/SessionService.js";
 import { SessionStore, SESSION_STATUS } from "../src/ui/stores/SessionStore.js";
-import { AuthStore } from "../src/ui/stores/AuthStore.js";
 import { ChatBus } from "../src/ui/root/ChatBus.js";
 
 const ACCOUNT_ID = "acct_owner";
@@ -35,7 +34,6 @@ function makeSessionService({ bootstrap, client }) {
     bus,
     authBootstrapService: bootstrap,
     accountAuthService: { unlock() {}, unlockWithDevice() {}, disableDeviceUnlock() {}, createAccount() {}, logout() {} },
-    authStore: new AuthStore(),
     sessionStore,
     logger: { warn() {}, error() {}, info() {} },
   });

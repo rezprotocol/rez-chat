@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AuthStore } from "../src/ui/stores/AuthStore.js";
+import { SessionStore } from "../src/ui/stores/SessionStore.js";
 import { AuthBootstrapService } from "../src/ui/services/auth/AuthBootstrapService.js";
 
 const storageProvider = { get() {}, put() {} };
 const accountRegistry = { listAccounts: async () => [] };
-const authStore = new AuthStore();
+const authStore = new SessionStore();
 const authService = new AuthBootstrapService({
-  authStore,
+  sessionStore: authStore,
   storageProvider,
   accountRegistry,
 });

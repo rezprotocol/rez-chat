@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { KeystoreStore } from "@rezprotocol/sdk/client";
-import { AuthStore, AUTH_STATUS } from "../src/ui/stores/AuthStore.js";
+import { SessionStore, SESSION_STATUS } from "../src/ui/stores/SessionStore.js";
 import { AccountRegistry } from "../src/ui/services/AccountRegistry.js";
 import { createAuthHarness } from "./_helpers/createAuthHarness.js";
 
@@ -57,7 +57,7 @@ test("auth init with empty storage starts in NO_KEYSTORE", async () => {
 
   await service.init();
   const snap = service.authStore.snapshot();
-  assert.equal(snap.status, AUTH_STATUS.NO_KEYSTORE);
+  assert.equal(snap.status, SESSION_STATUS.NO_KEYSTORE);
   assert.equal(metrics.connects, 0);
 });
 
@@ -74,7 +74,7 @@ test("createAccount persists keystore and transitions to UNLOCKED", async () => 
   await service.init();
   await service.createAccount({ profileName: "Alice", password: "password123" });
   const snap = service.authStore.snapshot();
-  assert.equal(snap.status, AUTH_STATUS.UNLOCKED);
+  assert.equal(snap.status, SESSION_STATUS.UNLOCKED);
   assert.equal(typeof snap.accountId, "string");
   assert.equal(typeof snap.deviceId, "string");
   assert.equal(metrics.connects, 0, "unlock no longer calls connect");
@@ -109,17 +109,17 @@ test("reload with existing keystore starts LOCKED; wrong password fails closed",
   });
 
   await service.init();
-  assert.equal(service.authStore.snapshot().status, AUTH_STATUS.LOCKED);
+  assert.equal(service.authStore.snapshot().status, SESSION_STATUS.LOCKED);
   assert.equal(metrics.connects, 0);
 
   await assert.rejects(service.unlock({ password: "wrong-password" }));
   const failed = service.authStore.snapshot();
-  assert.equal(failed.status, AUTH_STATUS.LOCKED);
+  assert.equal(failed.status, SESSION_STATUS.LOCKED);
   assert.equal(metrics.connects, 0);
 
   await service.unlock({ password: "password123" });
   const unlocked = service.authStore.snapshot();
-  assert.equal(unlocked.status, AUTH_STATUS.UNLOCKED);
+  assert.equal(unlocked.status, SESSION_STATUS.UNLOCKED);
   assert.equal(metrics.connects, 0, "unlock no longer calls connect");
 
   await service.connectClient();
@@ -138,14 +138,14 @@ test("logout transitions to LOCKED and closes active sdk client", async () => {
 
   await service.init();
   await service.createAccount({ profileName: "Cara", password: "password123" });
-  assert.equal(service.authStore.snapshot().status, AUTH_STATUS.UNLOCKED);
+  assert.equal(service.authStore.snapshot().status, SESSION_STATUS.UNLOCKED);
 
   await service.connectClient();
   assert.equal(metrics.connects, 1);
 
   await service.logout();
   const locked = service.authStore.snapshot();
-  assert.equal(locked.status, AUTH_STATUS.LOCKED);
+  assert.equal(locked.status, SESSION_STATUS.LOCKED);
   assert.equal(metrics.closes > 0, true);
 });
 
@@ -165,7 +165,7 @@ test("listAccounts with registry returns empty when no accounts", async () => {
   const list = await service.listAccounts();
   assert.equal(Array.isArray(list), true);
   assert.equal(list.length, 0);
-  assert.equal(service.authStore.snapshot().status, AUTH_STATUS.NO_KEYSTORE);
+  assert.equal(service.authStore.snapshot().status, SESSION_STATUS.NO_KEYSTORE);
 });
 
 test("createAccount with registry sets label to profileName and listAccounts returns it", async () => {
@@ -186,7 +186,7 @@ test("createAccount with registry sets label to profileName and listAccounts ret
   assert.equal(list.length, 1);
   assert.equal(list[0].id, "default");
   assert.equal(list[0].label, "Work");
-  assert.equal(service.authStore.snapshot().status, AUTH_STATUS.UNLOCKED);
+  assert.equal(service.authStore.snapshot().status, SESSION_STATUS.UNLOCKED);
 });
 
 test("init rebuilds registry from discovered local keystore keys", async () => {
@@ -207,7 +207,7 @@ test("init rebuilds registry from discovered local keystore keys", async () => {
   await storage.put("rez:account-hints", { accountIds: [], hints: {} });
 
   const reloaded = createAuthHarness({
-    authStore: new AuthStore(),
+    authStore: new SessionStore(),
     storageProvider: storage,
     accountRegistry: new AccountRegistry({ storageProvider: storage }),
     sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
@@ -217,7 +217,7 @@ test("init rebuilds registry from discovered local keystore keys", async () => {
 
   await reloaded.init();
   const snap = reloaded.authStore.snapshot();
-  assert.equal(snap.status, AUTH_STATUS.LOCKED);
+  assert.equal(snap.status, SESSION_STATUS.LOCKED);
   assert.equal(Array.isArray(snap.accountList), true);
   assert.equal(snap.accountList.length, 1);
   assert.equal(snap.accountList[0].id, "default");
@@ -272,10 +272,10 @@ test("unlock with accountId and registry unlocks correct account", async () => {
   await service.logout();
 
   await service.init();
-  assert.equal(service.authStore.snapshot().status, AUTH_STATUS.LOCKED);
+  assert.equal(service.authStore.snapshot().status, SESSION_STATUS.LOCKED);
   await service.unlock({ accountId: "default", password: "password123" });
   const snap = service.authStore.snapshot();
-  assert.equal(snap.status, AUTH_STATUS.UNLOCKED);
+  assert.equal(snap.status, SESSION_STATUS.UNLOCKED);
   assert.equal(metrics.connects, 0, "unlock no longer calls connect");
 
   await service.connectClient();

@@ -1,26 +1,18 @@
 import { createKeystoreAccount, unlockKeystoreAccount } from "@rezprotocol/sdk/client";
-import { AUTH_STATUS } from "../../stores/AuthStore.js";
+import { SESSION_STATUS } from "../../stores/SessionStore.js";
 import { nonEmptyString } from "../../../records/index.js";
-
-function keystoreMeta(envelope) {
-  if (!envelope) return null;
-  return {
-    version: Number(envelope.version || 0),
-    updatedAtMs: Number(envelope.updatedAtMs || 0) || null,
-  };
-}
 
 export class AccountAuthService {
   constructor({
-    authStore,
+    sessionStore,
     authBootstrapService,
     cryptoProvider = null,
     logger = console,
   } = {}) {
-    if (!authStore || !authBootstrapService) {
-      throw new Error("AccountAuthService requires authStore and authBootstrapService");
+    if (!sessionStore || !authBootstrapService) {
+      throw new Error("AccountAuthService requires sessionStore and authBootstrapService");
     }
-    this._authStore = authStore;
+    this._sessionStore = sessionStore;
     this._authBootstrapService = authBootstrapService;
     this._cryptoProvider = cryptoProvider;
     this._logger = logger;
@@ -77,7 +69,7 @@ export class AccountAuthService {
     }
 
     const result = await this.unlock({ accountId, password: pwd });
-    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
     return result;
   }
 
@@ -85,7 +77,7 @@ export class AccountAuthService {
     const pwd = String(password || "").trim();
     if (!pwd) throw new Error("Enter your password to unlock.");
 
-    const snap = this._authStore.snapshot();
+    const snap = this._sessionStore.snapshot();
     const accountList = Array.isArray(snap.accountList) ? snap.accountList : [];
     const resolvedId =
       accountId != null && String(accountId).trim() !== ""
@@ -98,11 +90,11 @@ export class AccountAuthService {
     const store = this._authBootstrapService.getKeystoreStore(resolvedId);
     const envelope = await store.getKeystoreEnvelope();
     if (!envelope) {
-      this._authStore.setNoKeystore();
+      this._sessionStore.setNoKeystore();
       throw new Error("No keystore found for this account. Create an account first.");
     }
 
-    this._authStore.beginUnlock();
+    this._sessionStore.setUnlocking();
 
     try {
       const account = await unlockKeystoreAccount({
@@ -119,12 +111,11 @@ export class AccountAuthService {
         throw new Error("Decrypted account missing identity (accountId/deviceId)");
       }
 
-      this._authStore.completeUnlock({
+      this._sessionStore.setUnlocked({
         accountId: unlockedAccountId,
         deviceId,
-        keystoreMeta: keystoreMeta(envelope),
       });
-      this._authStore.setSelectedAccountId(resolvedId);
+      this._sessionStore.setSelectedAccountId(resolvedId);
 
       if (this._authBootstrapService.hasAccountRegistry() && unlockedAccountId) {
         await this._authBootstrapService.setAccountIdHint(resolvedId, unlockedAccountId);
@@ -147,19 +138,19 @@ export class AccountAuthService {
       return { accountId: unlockedAccountId, deviceId };
     } catch (err) {
       const message = this._normalizeError(err, "Unlock failed.");
-      this._authStore.failUnlock(message);
+      this._sessionStore.setLocked({ error: message });
       throw new Error(message);
     }
   }
 
   async logout() {
-    const snap = this._authStore.snapshot();
-    if (snap.status === AUTH_STATUS.NO_KEYSTORE) {
-      this._authStore.setNoKeystore();
+    const snap = this._sessionStore.snapshot();
+    if (snap.status === SESSION_STATUS.NO_KEYSTORE) {
+      this._sessionStore.setNoKeystore();
       return;
     }
 
-    this._authStore.beginLocking();
+    this._sessionStore.setLocking();
     this._account = null;
     this._pendingServerSyncEnvelope = null;
 
@@ -172,12 +163,12 @@ export class AccountAuthService {
     const envelope = await store.getKeystoreEnvelope().catch(() => null);
     if (this._authBootstrapService.hasAccountRegistry()) {
       const list = await this._authBootstrapService.listAccounts();
-      this._authStore.setAccountList(list);
+      this._sessionStore.setAccountList(list);
     }
     if (envelope) {
-      this._authStore.setLocked({ keystoreMeta: keystoreMeta(envelope) });
+      this._sessionStore.setLocked({});
     } else {
-      this._authStore.setNoKeystore();
+      this._sessionStore.setNoKeystore();
     }
   }
 

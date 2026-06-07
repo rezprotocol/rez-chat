@@ -1,4 +1,4 @@
-import { AuthStore } from "../../src/ui/stores/AuthStore.js";
+import { SessionStore } from "../../src/ui/stores/SessionStore.js";
 import { AccountRegistry } from "../../src/ui/services/AccountRegistry.js";
 import { AuthBootstrapService } from "../../src/ui/services/auth/AuthBootstrapService.js";
 import { AccountAuthService } from "../../src/ui/services/auth/AccountAuthService.js";
@@ -7,6 +7,7 @@ import { SdkSessionService } from "../../src/ui/services/auth/SdkSessionService.
 export function createAuthHarness({
   storageProvider = null,
   authStore = null,
+  sessionStore = null,
   accountRegistry = undefined,
   keystoreStore = null,
   sdkClientFactory = null,
@@ -14,34 +15,37 @@ export function createAuthHarness({
   cryptoProvider = null,
   logger = console,
 } = {}) {
-  const resolvedAuthStore = authStore || new AuthStore();
+  // The auth lifecycle now writes the single SessionStore directly (AuthStore
+  // was removed). `authStore` is accepted + returned as an alias of the
+  // SessionStore so existing callers/assertions keep working.
+  const resolvedStore = sessionStore || authStore || new SessionStore();
   let resolvedAccountRegistry = accountRegistry;
   if (resolvedAccountRegistry === undefined) {
     const hasStorage = storageProvider && typeof storageProvider.get === "function" && typeof storageProvider.put === "function";
     resolvedAccountRegistry = hasStorage && !keystoreStore ? new AccountRegistry({ storageProvider }) : null;
   }
   const authBootstrapService = new AuthBootstrapService({
-    authStore: resolvedAuthStore,
+    sessionStore: resolvedStore,
     storageProvider,
     accountRegistry: resolvedAccountRegistry,
     keystoreStore,
     logger,
   });
   const accountAuthService = new AccountAuthService({
-    authStore: resolvedAuthStore,
+    sessionStore: resolvedStore,
     authBootstrapService,
     cryptoProvider,
     logger,
   });
   const sdkSessionService = new SdkSessionService({
-    authStore: resolvedAuthStore,
     accountAuthService,
     sdkClientFactory,
     sdkClient,
     logger,
   });
   return {
-    authStore: resolvedAuthStore,
+    authStore: resolvedStore,
+    sessionStore: resolvedStore,
     accountRegistry: resolvedAccountRegistry,
     authBootstrapService,
     accountAuthService,

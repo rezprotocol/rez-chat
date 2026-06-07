@@ -1,4 +1,4 @@
-import { AUTH_STATUS } from "../../stores/AuthStore.js";
+import { SESSION_STATUS } from "../../stores/SessionStore.js";
 import { coerceRow } from "../../../records/domain/coerce.js";
 import { DesktopAccountListEntry } from "../../records/DesktopAccountListEntry.js";
 import { DesktopVaultStatus } from "../../records/DesktopVaultStatus.js";
@@ -46,9 +46,9 @@ export function hasDesktopRuntimeBridge() {
 }
 
 export class DesktopAuthBootstrapService {
-  constructor({ authStore, desktop = null, logger = console } = {}) {
-    if (!authStore) throw new Error("DesktopAuthBootstrapService requires authStore");
-    this._authStore = authStore;
+  constructor({ sessionStore, desktop = null, logger = console } = {}) {
+    if (!sessionStore) throw new Error("DesktopAuthBootstrapService requires sessionStore");
+    this._sessionStore = sessionStore;
     this._desktop = desktop || getDesktopBridge();
     this._logger = logger;
   }
@@ -68,14 +68,14 @@ export class DesktopAuthBootstrapService {
   async init() {
     const status = new DesktopVaultStatus(await this._desktop.vault.status());
     const listed = await this.listAccounts();
-    this._authStore.setAccountList(listed);
-    if (listed.length > 0) this._authStore.setSelectedAccountId(listed[0].id);
+    this._sessionStore.setAccountList(listed);
+    if (listed.length > 0) this._sessionStore.setSelectedAccountId(listed[0].id);
     if (!status.hasAccounts) {
-      this._authStore.setNoKeystore();
-      return this._authStore.snapshot();
+      this._sessionStore.setNoKeystore();
+      return this._sessionStore.snapshot();
     }
-    this._authStore.setLocked({ keystoreMeta: null });
-    return this._authStore.snapshot();
+    this._sessionStore.setLocked({});
+    return this._sessionStore.snapshot();
   }
 
   async inspectBootstrap() {
@@ -91,8 +91,8 @@ export class DesktopAuthBootstrapService {
         defaultEnvelopePresent: false,
         discoveredEnvelopeKeys: [],
         orphanEnvelopeKeys: [],
-        selectedAccountId: this._authStore.snapshot().selectedAccountId || "",
-        resolvedStatus: this._authStore.snapshot().status || "",
+        selectedAccountId: this._sessionStore.snapshot().selectedAccountId || "",
+        resolvedStatus: this._sessionStore.snapshot().status || "",
         reason: "",
       },
       toJSON() {
@@ -117,7 +117,7 @@ export class DesktopAuthBootstrapService {
   selectAccount({ accountId } = {}) {
     const id = String(accountId == null ? "" : accountId).trim();
     if (!id) return false;
-    this._authStore.setSelectedAccountId(id);
+    this._sessionStore.setSelectedAccountId(id);
     return true;
   }
 
@@ -135,7 +135,7 @@ export class DesktopAuthBootstrapService {
     const name = String(displayName == null ? "" : displayName).trim();
     if (!name) return;
     await this._desktop.vault.setProfileName({ accountId: id, profileName: name });
-    this._authStore.setAccountList(await this.listAccounts());
+    this._sessionStore.setAccountList(await this.listAccounts());
   }
 
   async setAvatarFileHash(accountId, hash) {
@@ -178,11 +178,11 @@ export class DesktopAuthBootstrapService {
 }
 
 export class DesktopAccountAuthService {
-  constructor({ authStore, authBootstrapService, desktop = null } = {}) {
-    if (!authStore || !authBootstrapService) {
-      throw new Error("DesktopAccountAuthService requires authStore and authBootstrapService");
+  constructor({ sessionStore, authBootstrapService, desktop = null } = {}) {
+    if (!sessionStore || !authBootstrapService) {
+      throw new Error("DesktopAccountAuthService requires sessionStore and authBootstrapService");
     }
-    this._authStore = authStore;
+    this._sessionStore = sessionStore;
     this._authBootstrapService = authBootstrapService;
     this._desktop = desktop || getDesktopBridge();
     this._account = null;
@@ -199,14 +199,14 @@ export class DesktopAccountAuthService {
   async createAccount({ profileName = "", password = "" } = {}) {
     const result = await this._desktop.vault.createAccount({ profileName, password });
     await this.#completeAuth(result);
-    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
     return result;
   }
 
   async unlock({ accountId = null, password = "", enableDeviceUnlock = false } = {}) {
     const result = await this._desktop.vault.unlock({ accountId, password, enableDeviceUnlock: enableDeviceUnlock === true });
     await this.#completeAuth(result);
-    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
     return result;
   }
 
@@ -216,7 +216,7 @@ export class DesktopAccountAuthService {
     }
     const result = await this._desktop.vault.unlockWithDevice({ accountId });
     await this.#completeAuth(result);
-    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
     return result;
   }
 
@@ -225,7 +225,7 @@ export class DesktopAccountAuthService {
       throw new Error("Device unlock unavailable: bridge does not expose vault.disableDeviceUnlock");
     }
     const result = await this._desktop.vault.disableDeviceUnlock({ accountId });
-    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
     return result;
   }
 
@@ -243,7 +243,7 @@ export class DesktopAccountAuthService {
     const result = await this._desktop.vault.resetPasswordWithMnemonic({ accountId, mnemonic, newPassword });
     // Vault auto-locks after reset; refresh account list so the UI can show
     // the cleared device-unlock state.
-    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
     return result;
   }
 
@@ -262,7 +262,7 @@ export class DesktopAccountAuthService {
     // createAccount/unlock do so the session lands UNLOCKED.
     const result = await this._desktop.vault.importBackup({ encryptedBackup, mnemonic, newPassword });
     await this.#completeAuth(result);
-    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
     return result;
   }
 
@@ -272,8 +272,8 @@ export class DesktopAccountAuthService {
     }
     const result = await this._desktop.vault.changePassword({ accountId, oldPassword, newPassword });
     this._account = null;
-    this._authStore.setAccountList(await this._authBootstrapService.listAccounts());
-    this._authStore.setLocked({ keystoreMeta: null });
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
+    this._sessionStore.setLocked({});
     return result;
   }
 
@@ -284,11 +284,11 @@ export class DesktopAccountAuthService {
     const result = await this._desktop.vault.purgeAccount({ accountId, password });
     this._account = null;
     const list = await this._authBootstrapService.listAccounts();
-    this._authStore.setAccountList(list);
+    this._sessionStore.setAccountList(list);
     if (list.length === 0) {
-      this._authStore.setNoKeystore();
+      this._sessionStore.setNoKeystore();
     } else {
-      this._authStore.setLocked({ keystoreMeta: null });
+      this._sessionStore.setLocked({});
     }
     return result;
   }
@@ -297,12 +297,12 @@ export class DesktopAccountAuthService {
     this._account = null;
     await this._desktop.vault.lock();
     const list = await this._authBootstrapService.listAccounts();
-    this._authStore.setAccountList(list);
+    this._sessionStore.setAccountList(list);
     if (list.length === 0) {
-      this._authStore.setNoKeystore();
+      this._sessionStore.setNoKeystore();
       return;
     }
-    this._authStore.setLocked({ keystoreMeta: null });
+    this._sessionStore.setLocked({});
   }
 
   async #completeAuth(result) {
@@ -314,13 +314,12 @@ export class DesktopAccountAuthService {
       deviceId,
       identityPublicKey: result && result.identityPublicKey ? result.identityPublicKey : null,
     };
-    this._authStore.completeUnlock({
+    this._sessionStore.setUnlocked({
       accountId,
       deviceId,
-      keystoreMeta: null,
     });
-    this._authStore.setSelectedAccountId(accountId);
-    if (this._authStore.snapshot().status !== AUTH_STATUS.UNLOCKED) {
+    this._sessionStore.setSelectedAccountId(accountId);
+    if (this._sessionStore.snapshot().status !== SESSION_STATUS.UNLOCKED) {
       throw new Error("Desktop auth failed to unlock");
     }
   }

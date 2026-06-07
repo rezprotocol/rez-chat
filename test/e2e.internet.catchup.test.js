@@ -38,6 +38,7 @@ import test from "node:test";
 
 import { startRezNode } from "@rezprotocol/node";
 import { bootstrapChatServer } from "../src/server/index.js";
+import { createDefaultRezConfig } from "../src/server/config/defaultRezConfig.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -264,26 +265,13 @@ async function stopChatNode(app, { preserveTmpDir = false } = {}) {
 }
 
 function loadKnownRelays() {
-  const raw = readFileSync(RELAY_INFO_PATH, "utf8");
-  const parsed = JSON.parse(raw);
-  const relays = parsed && Array.isArray(parsed.relays) ? parsed.relays : [];
-  return relays.map((relay) => {
-    const relayKeyId = String(relay.relayKeyId || "").trim();
-    const endpoint = parseRelayEndpoint(relay.relayEndpoint);
-    const directoryUrl = String(relay.directoryUrl || "").trim();
-    if (!relayKeyId) throw new Error("relay is missing relayKeyId");
-    if (!endpoint) throw new Error("relay has invalid relayEndpoint");
-    if (!directoryUrl) throw new Error("relay is missing directoryUrl");
-    return {
-      id: relayKeyId,
-      relayKeyId,
-      host: endpoint.host,
-      port: endpoint.port,
-      transport: "tcp",
-      tls: endpoint.protocol === "tls",
-      directoryUrl,
-    };
-  });
+  // SSOT: the live relay set lives in defaultRezConfig.knownRelays (the same
+  // loader the passing group e2e tests use). The old relays/relay-info.json
+  // file is deprecated and no longer shipped.
+  const cfg = createDefaultRezConfig({ dataDir: path.join(os.tmpdir(), "rez-relay-cfg-ignored") });
+  const relays = cfg && cfg.node && cfg.node.network && Array.isArray(cfg.node.network.knownRelays)
+    ? cfg.node.network.knownRelays : [];
+  return relays.map((relay) => ({ ...relay }));
 }
 
 function parseRelayEndpoint(value) {
