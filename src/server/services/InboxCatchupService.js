@@ -4,6 +4,15 @@ const DEFAULT_PAGE_LIMIT = 50;
 // D1: after this many failed decrypts across drains, a deposit is treated as
 // poison and quarantined (acked + dropped) so it can't be retried forever.
 const DEFAULT_MAX_DECRYPT_ATTEMPTS = 8;
+// D1 (age bound): a deposit still undecryptable this long after we FIRST failed
+// on it is quarantined regardless of attempt count. The attempt bound alone is
+// reconnect-gated (one attempt per drain), so a permanently-undecryptable deposit
+// on a long-lived connection could be re-listed and re-drained for a very long
+// time. The age bound caps zombie lifetime by wall-clock. 30 min is far longer
+// than any legitimate transient (ordering races / rehandshake recovery resolve in
+// seconds-to-minutes) yet bounded — measured from first-failure so genuine
+// recovery of an old offline message still gets the full window.
+const DEFAULT_MAX_QUARANTINE_AGE_MS = 30 * 60 * 1000;
 
 /**
  * On chat-server start (and on every SDK transport reconnect), drain any mailbox
@@ -18,8 +27,12 @@ const DEFAULT_MAX_DECRYPT_ATTEMPTS = 8;
  *     good and the buffer drains to empty.
  *   - On a failed decrypt LEAVE it buffered. The decrypt did not commit the
  *     ratchet, so a later pass (e.g. once an out-of-order handshake ahead of it
- *     has been applied) can decrypt it cleanly. A bounded attempt counter
- *     quarantines a genuinely-poison deposit (D1) so it can never wedge the drain.
+ *     has been applied) can decrypt it cleanly. A genuinely-poison deposit is
+ *     quarantined (D1) by whichever bound hits first: a failed-attempt counter
+ *     (fast for a flood) or an age bound measured from first failure (caps a
+ *     zombie's lifetime by wall-clock — the attempt bound only advances once per
+ *     drain, so on a long-lived connection that rarely reconnects it alone could
+ *     let an undecryptable deposit be re-listed for a very long time).
  *
  * This replaces the old monotonic cursor, which advanced past a deposit even when
  * the pipeline swallowed its decrypt failure — permanently stranding it in the
@@ -35,8 +48,10 @@ export class InboxCatchupService extends BaseServerService {
   #offReconnect;
   #pipeline;
   #processedLog;
+  #maxQuarantineAgeMs;
+  #clock;
 
-  constructor({ bus, inboxClaimant, inboundPipeline, processedLog = null, pageLimit = DEFAULT_PAGE_LIMIT, maxDecryptAttempts = DEFAULT_MAX_DECRYPT_ATTEMPTS, logger = console } = {}) {
+  constructor({ bus, inboxClaimant, inboundPipeline, processedLog = null, pageLimit = DEFAULT_PAGE_LIMIT, maxDecryptAttempts = DEFAULT_MAX_DECRYPT_ATTEMPTS, maxQuarantineAgeMs = DEFAULT_MAX_QUARANTINE_AGE_MS, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, logger });
     if (!inboxClaimant) {
       throw new Error("InboxCatchupService requires inboxClaimant");
@@ -53,6 +68,10 @@ export class InboxCatchupService extends BaseServerService {
     this.#maxDecryptAttempts = Number.isInteger(maxDecryptAttempts) && maxDecryptAttempts > 0
       ? maxDecryptAttempts
       : DEFAULT_MAX_DECRYPT_ATTEMPTS;
+    this.#maxQuarantineAgeMs = Number.isFinite(maxQuarantineAgeMs) && maxQuarantineAgeMs > 0
+      ? Number(maxQuarantineAgeMs)
+      : DEFAULT_MAX_QUARANTINE_AGE_MS;
+    this.#clock = typeof clock === "function" ? clock : () => Date.now();
     this.#draining = false;
     this.#pending = false;
     this.#offReconnect = null;
@@ -200,23 +219,47 @@ export class InboxCatchupService extends BaseServerService {
   }
 
   // A deposit that could not be decrypted this pass: count the attempt and, once
-  // it crosses the bound (D1), quarantine it (ack + drop) so a single poison
-  // deposit can never wedge catch-up. Otherwise leave it for the next drain.
+  // it crosses a bound (D1), quarantine it (ack + drop) so a single poison deposit
+  // can never wedge catch-up or be re-listed forever. Two bounds, whichever hits
+  // first: attempt count (fast for a flood) and age since first failure (caps
+  // lifetime by wall-clock — the attempt bound only advances once per drain, so on
+  // a long-lived connection that drains rarely it could otherwise persist for a
+  // very long time). Otherwise leave it for the next drain — a failed decrypt does
+  // not commit the ratchet, so an ordering race or rehandshake recovery can still
+  // resolve it within the window.
   async #handleDecryptFailure(sdk, mailboxId, eventId) {
     if (!this.#processedLog || typeof this.#processedLog.recordAttempt !== "function") {
       // No attempt store wired: leave it buffered (best effort, no quarantine).
       this.logger.warn("[InboxCatchupService] deposit " + eventId + " left buffered (no attempt store to bound retries)");
       return;
     }
+    const nowMs = this.#clock();
     let attempts = 0;
     try {
-      attempts = await this.#processedLog.recordAttempt(mailboxId, eventId);
+      attempts = await this.#processedLog.recordAttempt(mailboxId, eventId, { nowMs });
     } catch (err) {
       this.logger.error("[InboxCatchupService] attempt-counter record failed for " + eventId + ": " + (err && err.message ? err.message : err));
       return;
     }
-    if (attempts >= this.#maxDecryptAttempts) {
-      this.logger.error("[InboxCatchupService] quarantining undecryptable deposit mailboxId=" + mailboxId + " eventId=" + eventId + " after " + attempts + " attempts");
+    let firstSeenAtMs = 0;
+    if (typeof this.#processedLog.firstSeenAtMs === "function") {
+      try {
+        firstSeenAtMs = await this.#processedLog.firstSeenAtMs(mailboxId, eventId);
+      } catch (err) {
+        // Age bound unavailable for this deposit — fall back to the attempt bound.
+        this.logger.error("[InboxCatchupService] firstSeen lookup failed for " + eventId + ": " + (err && err.message ? err.message : err));
+        firstSeenAtMs = 0;
+      }
+    }
+    const ageMs = firstSeenAtMs > 0 ? (nowMs - firstSeenAtMs) : 0;
+    const tooManyAttempts = attempts >= this.#maxDecryptAttempts;
+    const tooOld = firstSeenAtMs > 0 && ageMs >= this.#maxQuarantineAgeMs;
+    if (tooManyAttempts || tooOld) {
+      this.logger.error(
+        "[InboxCatchupService] quarantining undecryptable deposit mailboxId=" + mailboxId
+        + " eventId=" + eventId + " after " + attempts + " attempts, ageMs=" + ageMs
+        + " (" + (tooManyAttempts ? "attempt" : "age") + " bound)",
+      );
       await this.#ackAndForget(sdk, mailboxId, eventId);
     }
   }

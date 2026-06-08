@@ -78,11 +78,19 @@ export class ProcessedDepositLog {
     const stored = await this.#kvStore.get(key);
     const prev = stored && Number.isInteger(stored.attempts) ? stored.attempts : 0;
     const attempts = prev + 1;
+    const now = Number.isFinite(nowMs) ? Number(nowMs) : Date.now();
+    // firstSeenAtMs is set on the FIRST failed attempt and preserved thereafter —
+    // it anchors the age-based quarantine bound (D1) so a permanently-undecryptable
+    // deposit is dropped after a wall-clock window, not only after N reconnect
+    // drains. Measured from first-failure (not deposit time) so legitimate
+    // recovery (rehandshake) and ordering races get the full window.
+    const firstSeenAtMs = stored && Number.isFinite(stored.firstSeenAtMs) ? Number(stored.firstSeenAtMs) : now;
     await this.#kvStore.set(key, {
       mailboxId: ids.mailboxId,
       eventId: ids.eventId,
       attempts,
-      lastAttemptAtMs: Number.isFinite(nowMs) ? Number(nowMs) : Date.now(),
+      firstSeenAtMs,
+      lastAttemptAtMs: now,
     });
     return attempts;
   }
@@ -92,6 +100,17 @@ export class ProcessedDepositLog {
     if (!ids) return 0;
     const stored = await this.#kvStore.get(this.#attemptKey(ids.mailboxId, ids.eventId));
     return stored && Number.isInteger(stored.attempts) ? stored.attempts : 0;
+  }
+
+  /**
+   * The timestamp of the FIRST recorded failed-decrypt attempt for an event
+   * (0 if none). Used by the drain to age-bound poison retention (D1).
+   */
+  async firstSeenAtMs(mailboxId, eventId) {
+    const ids = this.#ids(mailboxId, eventId);
+    if (!ids) return 0;
+    const stored = await this.#kvStore.get(this.#attemptKey(ids.mailboxId, ids.eventId));
+    return stored && Number.isFinite(stored.firstSeenAtMs) ? Number(stored.firstSeenAtMs) : 0;
   }
 
   async clearAttempts(mailboxId, eventId) {

@@ -174,6 +174,40 @@ test("InboxCatchupService quarantines a poison deposit after maxDecryptAttempts 
   assert.equal(items[INBOX].length, 0, "poison deposit removed so it can't wedge the drain");
 });
 
+test("InboxCatchupService quarantines a long-undecryptable deposit by AGE before the attempt bound (D1 age)", async () => {
+  const INBOX = "inbox:aged";
+  const ackSpy = [];
+  const items = { [INBOX]: [{ eventId: "evt_old", objectId: "o", createdAt: 1 }] };
+  const sdk = makeSdkWithMailbox({
+    items,
+    fetchByEventId: { [INBOX + "|evt_old"]: { ciphertextB64: "UA==" } },
+    ackSpy,
+  });
+  const bus = new ChatServerBus();
+  bus.runtime.sdk = sdk;
+
+  let now = 1_000_000;
+  const service = new InboxCatchupService({
+    bus,
+    inboxClaimant: { inboxId: INBOX },
+    inboundPipeline: makePipeline(() => ({ decryptOk: false })),
+    processedLog: new ProcessedDepositLog({ kvStore: new MemKv() }),
+    maxDecryptAttempts: 100,    // attempt bound deliberately unreachable here
+    maxQuarantineAgeMs: 60_000, // 1 min age bound
+    clock: () => now,
+  });
+
+  await service.start();          // first failure → firstSeenAtMs anchored, age 0
+  assert.equal(items[INBOX].length, 1, "left buffered on first sight (age 0)");
+  now += 30_000;                  // 30s later — still under the age bound
+  await service.requestDrain();
+  assert.equal(items[INBOX].length, 1, "still buffered under the age bound");
+  now += 31_000;                  // 61s since first seen — past the age bound
+  await service.requestDrain();
+  assert.deepEqual(ackSpy.map((a) => a.eventId), ["evt_old"], "deposit quarantined by age, not attempt count");
+  assert.equal(items[INBOX].length, 0, "aged-out poison deposit removed");
+});
+
 test("InboxCatchupService acks a dedup hit (already consumed via live push) without requiring a fresh decrypt", async () => {
   const INBOX = "inbox:dedup";
   const ackSpy = [];
