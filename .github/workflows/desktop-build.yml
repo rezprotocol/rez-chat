@@ -32,40 +32,40 @@ jobs:
 
     steps:
       - name: Checkout rez-chat
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: rez-chat
 
       - name: Checkout rez-core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-core
           path: rez-core
           ref: main
 
       - name: Checkout rez-sdk
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-sdk
           path: rez-sdk
           ref: main
 
       - name: Checkout rez-node
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-node
           path: rez-node
           ref: main
 
       - name: Checkout rez-ui
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-ui
           path: rez-ui
           ref: main
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "22.x"
 
@@ -125,7 +125,7 @@ jobs:
           npx electron-builder --config electron-builder.yml --${{ matrix.platform }} --publish never
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: desktop-${{ matrix.platform }}
           path: |
@@ -145,12 +145,12 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
 
       - name: Create draft GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           generate_release_notes: true
