@@ -32,15 +32,16 @@ export class ServerInvitesService extends BaseServerService {
   async createInvite(payload = {}) {
     const params = this._coerceParams(payload, InviteCreateParams);
     const peerLinks = this._peerLinks();
-    // chat-server uses its persistent claimed inbox (registered via inbox.claim
-    // during runtime.connect) — NOT the SDK session's ephemeral inbox. This is
-    // the inboxId every cap chain anchors against.
+    // The invite's reply binding (our persistent claimed inbox) is configured
+    // intrinsically on PeerLinkService at construction (see bootstrapChatServer),
+    // so createInvite anchors it automatically — this path no longer hand-passes
+    // peerInboxId. We still require a claimed inbox to exist: without it the
+    // chat-server isn't routable and shouldn't be minting invites.
     const inboxClaimant = this.bus.runtime && this.bus.runtime.inboxClaimant
       ? this.bus.runtime.inboxClaimant : null;
     if (!inboxClaimant) {
       throw new Error("createInvite: chat-server requires bus.runtime.inboxClaimant");
     }
-    const ownInboxId = inboxClaimant.inboxId;
 
     const kind = params.kind === "group" ? "group" : "direct";
     const groupId = kind === "group" && typeof params.groupId === "string" && params.groupId.trim() ? params.groupId.trim() : null;
@@ -96,7 +97,6 @@ export class ServerInvitesService extends BaseServerService {
       title,
       maxUses,
       expiresAtMs: Date.now() + expiresInDays * 24 * 60 * 60 * 1000,
-      peerInboxId: ownInboxId,
     });
 
     const inviteCode = encodeInviteCodeV3({

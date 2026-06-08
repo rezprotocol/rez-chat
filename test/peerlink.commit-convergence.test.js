@@ -101,10 +101,10 @@ function makeAuthorityProvider(accounts) {
   };
 }
 
-function makePeerLinkService({ accountId, inboxId, getInviteAuthority }) {
+function makePeerLinkService({ accountId, inboxId, getInviteAuthority, clock = () => Date.now() }) {
   return new PeerLinkService({
     storageProvider: createDefaultStorageProvider(),
-    clock: () => Date.now(),
+    clock,
     ownerAccountId: accountId,
     getInviteAuthority,
     inviteBinding: { mailboxId: inboxId, capabilityId: inboxId },
@@ -189,7 +189,7 @@ test("every establishment path converges on session_established via #commitSessi
   assert.deepEqual(new TextDecoder().decode(dec.plaintextBytes), "hello alice");
 });
 
-test("rehandshake re-establishes through #commitSession with a fresh active session", async () => {
+test("recovery re-establishes through #commitSession with a fresh active session (re-invite + forceReestablish)", async () => {
   const alice = createSessionIdentity();
   const bob = createSessionIdentity();
   const getInviteAuthority = makeAuthorityProvider([alice.accountId, bob.accountId]);
@@ -202,35 +202,57 @@ test("rehandshake re-establishes through #commitSession with a fresh active sess
     inviterInbox: "inbox:alice2", inviteeInbox: "inbox:bob2",
   });
 
-  // Alice requests a rehandshake; Bob handles it (initiator) and replies with a
-  // handshake packet; Alice processes the response (responder) — both writes go
-  // through #commitSession and land in session_established with an active session.
-  const req = await alicePeerLinks.requestRehandshake({ ownerAccountId: alice.accountId, peerAccountId: bob.accountId, senderInboxId: "inbox:alice2" });
-  assert.equal(req.snapshot.state, "rehandshake_requested");
+  const linkId = async (svc, owner, peer) => {
+    const items = (await svc.listPeerLinks({ ownerAccountId: owner })).items;
+    const m = items.find((it) => it.peerAccountId === peer);
+    return m ? m.peerLinkId : null;
+  };
+  const aliceLinkBefore = await linkId(alicePeerLinks, alice.accountId, bob.accountId);
+  const bobLinkBefore = await linkId(bobPeerLinks, bob.accountId, alice.accountId);
 
-  const handled = await bobPeerLinks.handleIncomingRehandshake({
-    ownerAccountId: bob.accountId,
-    requestId: req.rehandshakeRecord.requestId,
-    senderAccountId: alice.accountId,
-    senderInboxId: "inbox:alice2",
-    bundleJson: req.rehandshakeRecord.bundleJson,
+  // RECOVERY = re-invite, reusing the invite/accept path. Alice mints a fresh
+  // invite to the SAME contact; Bob accepts with forceReestablish (re-keying the
+  // live-but-"broken" link), sends the handshake back; Alice completes as
+  // responder. Both writes route through #commitSession and land in
+  // session_established with a fresh active session — no bespoke rehandshake path.
+  const recovery = await alicePeerLinks.createInvite({ ownerAccountId: alice.accountId, maxUses: 1, expiresAtMs: Date.now() + 60_000 });
+  const recEnv = await alicePeerLinks.getStoredInviteEnvelope(alice.accountId, recovery.inviteId);
+  let recHandshake = null;
+  await bobPeerLinks.acceptInvite({
+    envelope: recEnv.envelope,
+    signatureB64: recEnv.signatureB64,
+    acceptorAccountId: bob.accountId,
+    senderInboxId: "inbox:bob2",
+    forceReestablish: true,
+    sendHandshake: async ({ handshakePacket: hp }) => { recHandshake = hp; return { packetId: "rec:hs:1" }; },
   });
-  assert.equal(handled.snapshot.state, "session_established");
-  assert.equal(handled.snapshot.sessionState, "active");
-  assert.equal(handled.event.type, "rehandshake_completed");
+  assert.ok(recHandshake, "forceReestablish accept produced a handshake (not the idempotent no-op)");
 
-  const resp = await alicePeerLinks.handleRehandshakeResponse({
+  const received = await alicePeerLinks.handleIncomingHandshakePacket({
     ownerAccountId: alice.accountId,
-    packetBytes: handled.handshakePacket.toBytes(),
+    packetBytes: recHandshake.toBytes(),
   });
-  assert.equal(resp.snapshot.state, "session_established");
-  assert.equal(resp.snapshot.sessionState, "active");
-  assert.equal(resp.event.type, "rehandshake_response_completed");
+  assert.equal(received.snapshot.state, "session_established");
+  assert.equal(received.snapshot.sessionState, "active");
 
-  // The re-established session must carry traffic.
-  const enc = await bobPeerLinks.encryptDirectMessage({ ownerAccountId: bob.accountId, peerAccountId: alice.accountId, plaintextBytes: new TextEncoder().encode("after rehs") });
+  // Confirm the acceptor too (ack round-trip), mirroring a full accept.
+  const { ackBytes } = await alicePeerLinks.createSignedHandshakeAck({
+    ownerAccountId: alice.accountId, ownerInboxId: "inbox:alice2", ackNonce: received.ackNonce,
+  });
+  await bobPeerLinks.handleIncomingHandshakeAck({ ownerAccountId: bob.accountId, ackPacketBytes: ackBytes });
+
+  // Recovery REUSES the same peer-link record on both sides (never forks it), so
+  // the fresh session overwrites the row in place — no orphaned session.
+  assert.equal(await linkId(alicePeerLinks, alice.accountId, bob.accountId), aliceLinkBefore, "alice reuses the same peerLinkId");
+  assert.equal(await linkId(bobPeerLinks, bob.accountId, alice.accountId), bobLinkBefore, "bob reuses the same peerLinkId");
+
+  // The re-established session must carry traffic both directions.
+  const enc = await bobPeerLinks.encryptDirectMessage({ ownerAccountId: bob.accountId, peerAccountId: alice.accountId, plaintextBytes: new TextEncoder().encode("after recovery") });
   const dec = await alicePeerLinks.decryptDirectMessageAnyPeer({ ownerAccountId: alice.accountId, packetBytes: enc.encryptedPacket.toBytes() });
-  assert.deepEqual(new TextDecoder().decode(dec.plaintextBytes), "after rehs");
+  assert.deepEqual(new TextDecoder().decode(dec.plaintextBytes), "after recovery");
+  const enc2 = await alicePeerLinks.encryptDirectMessage({ ownerAccountId: alice.accountId, peerAccountId: bob.accountId, plaintextBytes: new TextEncoder().encode("reply") });
+  const dec2 = await bobPeerLinks.decryptDirectMessageAnyPeer({ ownerAccountId: bob.accountId, packetBytes: enc2.encryptedPacket.toBytes() });
+  assert.deepEqual(new TextDecoder().decode(dec2.plaintextBytes), "reply");
 });
 
 test("THREAD_NOT_READY attaches recoveryCandidates, increments per-link, flips at threshold, clears on success", async () => {
@@ -238,9 +260,15 @@ test("THREAD_NOT_READY attaches recoveryCandidates, increments per-link, flips a
   const bob = createSessionIdentity();
   const carol = createSessionIdentity();
   const getInviteAuthority = makeAuthorityProvider([alice.accountId, bob.accountId, carol.accountId]);
-  const alicePeerLinks = makePeerLinkService({ accountId: alice.accountId, inboxId: "inbox:alice3", getInviteAuthority });
-  const bobPeerLinks = makePeerLinkService({ accountId: bob.accountId, inboxId: "inbox:bob3", getInviteAuthority });
-  const carolPeerLinks = makePeerLinkService({ accountId: carol.accountId, inboxId: "inbox:carol3", getInviteAuthority });
+  // Controllable clock so we can step past the establish-healthy guard: a fresh
+  // establish marks the link healthy (HEALTHY_SESSION_DECRYPT_GUARD_MS), which
+  // suppresses recovery arming on undecryptable noise. To observe the miss
+  // counter flip rehandshakeNeeded we advance past that window first.
+  let nowMs = Date.now();
+  const clock = () => nowMs;
+  const alicePeerLinks = makePeerLinkService({ accountId: alice.accountId, inboxId: "inbox:alice3", getInviteAuthority, clock });
+  const bobPeerLinks = makePeerLinkService({ accountId: bob.accountId, inboxId: "inbox:bob3", getInviteAuthority, clock });
+  const carolPeerLinks = makePeerLinkService({ accountId: carol.accountId, inboxId: "inbox:carol3", getInviteAuthority, clock });
   await provisionPeerLinkBinding({ peerLinks: alicePeerLinks, identity: alice });
   await provisionPeerLinkBinding({ peerLinks: bobPeerLinks, identity: bob });
   await provisionPeerLinkBinding({ peerLinks: carolPeerLinks, identity: carol });
@@ -250,6 +278,8 @@ test("THREAD_NOT_READY attaches recoveryCandidates, increments per-link, flips a
     inviter: alicePeerLinks, inviterId: alice.accountId, invitee: bobPeerLinks, inviteeId: bob.accountId,
     inviterInbox: "inbox:alice3", inviteeInbox: "inbox:bob3",
   });
+  // Step past the establish-healthy guard so undecryptable misses can arm recovery.
+  nowMs += 31_000;
 
   // Carol accepts a SEPARATE Alice invite (deriving a one-sided session to
   // Alice) but Alice never processes Carol's handshake — so Alice has no Carol

@@ -1,31 +1,54 @@
 import { base64ToBytes, buildInboxAddress, bytesToBase64 } from "@rezprotocol/sdk/client";
 import { BaseServerService } from "../base/BaseServerService.js";
 
+// Minimum gap between recovery-invite triggers for the SAME peer. The inbound
+// pipeline can surface a backlog of undecryptable deposits in a tight burst, so
+// without a synchronous gate each one would mint a fresh recovery invite — a
+// storm. One attempt per window is enough: it either heals the link or the
+// window expires and recovery retries. This timestamp also doubles as the
+// "outstanding recovery invite" marker for the glare tiebreak (an invite sent
+// within RECOVERY_INVITE_TTL_MS is considered still in flight). 30s so it
+// comfortably exceeds a live re-invite round-trip (invite → accept → handshake →
+// ack over multi-hop relays); a shorter window let a second invite fire mid-flight
+// and re-key the peer, churning the session. The healthy-on-establish guard in
+// #commitSession is the primary convergence lever; this is the backstop.
+const RECOVERY_INVITE_TRIGGER_COOLDOWN_MS = 30_000;
+// How long a recovery invite stays valid. Deliberately SHORT: a desynced link
+// heals in seconds, and a short TTL means a stale/superseded/replayed invite
+// auto-rejects (INVITE_EXPIRED) instead of re-establishing a now-wrong session —
+// the property that lets crossing invites converge without bespoke glare state.
+const RECOVERY_INVITE_TTL_MS = 5 * 60 * 1000;
+// Inbox message kind carrying a directed recovery invite ({envelope,
+// signatureB64}). A plain JSON body like rez.peerlink.handshake.ack.v2 — NOT a
+// new e2ee packet type. Recovery reuses the proven invite/accept path verbatim.
+const RECOVERY_INVITE_KIND = "rez.peerlink.recovery-invite.v1";
+
 /**
  * ServerPeerLinkProtocolService — chat-server-side handler for peer-link
  * protocol messages flowing over mailbox deposits (Shape A).
  *
- * Subscribes to `sdk.subscriptions.onMailboxDeposited`. Each deposit body is
- * parsed and routed by kind:
+ * Each deposit body is parsed and routed by kind:
  *
- *   - Plaintext JSON:
- *     - `rez.peerlink.handshake.ack` — handleIncomingHandshakeAck.
- *
- *   - E2EE packets:
- *     - `x3dh.handshake.v2` with `rehandshakeRequestId` — handleRehandshakeResponse.
- *     - `x3dh.handshake.v2` (regular) — handleIncomingHandshakePacket; on
- *       success, send a handshake.ack to the acceptor's inbox. The SDK
- *       handler verifies the envelope signature and derives senderAccountId
- *       from the signed pubkey — this service never trusts plaintext
- *       senderAccountId on the wire.
- *     - `x3dh.rehandshake.v1` — handleIncomingRehandshake; send the response
- *       handshake bytes back to the requester's inbox.
- *     - regular E2EE deposit — decrypt via PeerLinkService; if inner is a
- *       `rez.delivery.ack` emit `delivery.ack` on the chat bus; otherwise
- *       emit `peerlink.user.message` carrying plaintext for ServerEventService.
+ *   - `x3dh.handshake.v2` (regular) — handleIncomingHandshakePacket; on success,
+ *     send a handshake.ack to the acceptor's inbox. The SDK handler verifies the
+ *     envelope signature and derives senderAccountId from the signed pubkey —
+ *     this service never trusts plaintext senderAccountId on the wire. This is
+ *     also the RESPONSE leg of recovery (the inviter completes the re-invite).
+ *   - `rez.peerlink.recovery-invite.v1` — a directed re-invite for link RECOVERY
+ *     (desynced DM link) or co-member BOOTSTRAP (group member with no link yet).
+ *     Glare tiebreak + authz gate, then acceptInvite({forceReestablish}) reuses
+ *     the normal accept path; the response rides back as a regular handshake.
+ *   - `rez.peerlink.handshake.ack.v2` / `.reject.v1` — ack/reject handlers.
+ *   - regular E2EE deposit — decrypt via PeerLinkService; a delivery-ack emits
+ *     `delivery.ack`; otherwise the decrypted user message is returned for
+ *     ServerEventService. A total decrypt miss (THREAD_NOT_READY) triggers a
+ *     recovery invite for the single eligible candidate.
  */
 export class ServerPeerLinkProtocolService extends BaseServerService {
   #clock;
+  // peerAccountId -> last recovery-invite trigger time (ms). Synchronous burst
+  // gate AND the glare "outstanding invite" marker; see the consts above.
+  #recoveryInviteAtMsByPeer = new Map();
 
   constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
@@ -101,7 +124,6 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         + " kind=" + (typeof bodyObj.kind === "string" ? bodyObj.kind : "-")
         + " e2ee=" + (bodyObj.e2ee === 1 ? "1" : "0")
         + " hs=" + (bodyObj.handshake ? "1" : "0")
-        + (bodyObj.handshake && bodyObj.handshake.rehandshakeRequestId ? " rehsResp=1" : "")
         + " bytes=" + payloadBytes.length,
       );
     }
@@ -111,62 +133,8 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     const peerLinks = this._peerLinkService();
     if (!peerLinks) return;
 
-    // Introduction response — MUST be checked BEFORE both the rehandshake
-    // response and the regular handshake, since all three match
-    // e2ee:1 + type=x3dh.handshake.v2. Routed on the presence of
-    // `introductionId`; the SDK verifies the envelope + binding (no plaintext
-    // trust). This is the response to a co-member introduction WE initiated.
-    if (bodyObj.e2ee === 1
-        && bodyObj.type === "x3dh.handshake.v2"
-        && bodyObj.handshake
-        && typeof bodyObj.handshake === "object"
-        && bodyObj.handshake.introductionId) {
-      if (typeof peerLinks.handleIntroductionResponse !== "function") return;
-      let result;
-      try {
-        result = await peerLinks.handleIntroductionResponse({
-          ownerAccountId: this.ownerAccountId,
-          packetBytes: payloadBytes,
-        });
-      } catch (introErr) {
-        this.logger.error("[ServerPeerLinkProtocolService] introduction response failed", introErr && introErr.message ? introErr.message : introErr);
-        return;
-      }
-      if (!result) return { consumed: false, decryptOk: false, reason: "introduction-response-noop" };
-      this._emitPeerLinkUpdated(result.snapshot);
-      return { consumed: true, decryptOk: true };
-    }
-
-    // Re-handshake response — MUST be checked BEFORE the regular handshake
-    // since both match e2ee:1 + type=x3dh.handshake.v2.
-    //
-    // We route on the presence of `rehandshakeRequestId` in the unverified
-    // payload, but only the SDK is allowed to trust handshake contents — it
-    // verifies the envelope signature and derives accountId from the verified
-    // pubkey + accountBinding chain. Plaintext senderAccountId is no longer
-    // accepted here.
-    if (bodyObj.e2ee === 1
-        && bodyObj.type === "x3dh.handshake.v2"
-        && bodyObj.handshake
-        && typeof bodyObj.handshake === "object"
-        && bodyObj.handshake.rehandshakeRequestId) {
-      if (typeof peerLinks.handleRehandshakeResponse !== "function") return;
-      let result;
-      try {
-        result = await peerLinks.handleRehandshakeResponse({
-          ownerAccountId: this.ownerAccountId,
-          packetBytes: payloadBytes,
-        });
-      } catch (rhErr) {
-        this.logger.error("[ServerPeerLinkProtocolService] rehandshake response failed", rhErr && rhErr.message ? rhErr.message : rhErr);
-        return;
-      }
-      if (!result) return { consumed: false, decryptOk: false, reason: "rehs-response-noop" };
-      this._emitPeerLinkUpdated(result.snapshot);
-      return { consumed: true, decryptOk: true };
-    }
-
-    // Regular peer-link handshake.
+    // Regular peer-link handshake — ALSO the response leg of a recovery invite
+    // (the inviter completes the re-invite here, identical to a first accept).
     if (bodyObj.e2ee === 1
         && bodyObj.type === "x3dh.handshake.v2"
         && bodyObj.handshake
@@ -213,101 +181,14 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       return { consumed: true, decryptOk: true };
     }
 
-    // Re-handshake request.
-    if (bodyObj.e2ee === 1
-        && bodyObj.type === "x3dh.rehandshake.v1"
-        && bodyObj.rehandshake
-        && typeof bodyObj.rehandshake === "object") {
-      if (typeof peerLinks.handleIncomingRehandshake !== "function") return;
-      const rh = bodyObj.rehandshake;
-      let result;
-      try {
-        result = await peerLinks.handleIncomingRehandshake({
-          ownerAccountId: this.ownerAccountId,
-          requestId: rh.requestId,
-          senderAccountId: rh.senderAccountId,
-          senderInboxId: rh.senderInboxId,
-          bundleJson: rh.bundleJson,
-        });
-      } catch (rhErr) {
-        this.logger.error("[ServerPeerLinkProtocolService] rehandshake processing failed", rhErr && rhErr.message ? rhErr.message : rhErr);
-        return;
-      }
-      if (!result) return { consumed: false, decryptOk: false, reason: "rehs-request-noop" };
-      this._emitPeerLinkUpdated(result.snapshot);
-      if (result.handshakePacket && result.deliverInboxId) {
-        try {
-          await this._sdk().mesh.dispatch(
-            {
-              payloadBytes: result.handshakePacket.toBytes(),
-              objectId: "rhresp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
-              metadata: {},
-            },
-            buildInboxAddress({ inboxId: result.deliverInboxId }),
-          );
-        } catch (sendErr) {
-          this.logger.error("[ServerPeerLinkProtocolService] rehandshake response send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
-        }
-      }
-      return { consumed: true, decryptOk: true };
-    }
-
-    // Introduction request (co-member mesh bootstrap). Structurally a
-    // rehandshake request, but authorized by CO-MEMBERSHIP rather than an
-    // existing link: the sender must be an active member of a group we are also
-    // in. Like rehandshake it rides UNSEALED to our inbox (no shared ratchet
-    // yet); authenticity is the signed account binding the SDK verifies.
-    if (bodyObj.e2ee === 1
-        && bodyObj.type === "x3dh.introduce.v1"
-        && bodyObj.introduction
-        && typeof bodyObj.introduction === "object") {
-      if (typeof peerLinks.handleIncomingIntroduction !== "function") return;
-      const intro = bodyObj.introduction;
-      const introSender = typeof intro.senderAccountId === "string" ? intro.senderAccountId.trim() : "";
-      // Co-membership gate. If we don't yet know the sender as a co-member, the
-      // member.contact op announcing them may simply not have arrived yet
-      // (same ordering race as push-before-member.join). Leave the deposit
-      // BUFFERED (not consumed) so a later drain — after member.contact applies
-      // — retries it, rather than dropping a legitimate introduction.
-      const coMember = await this._isCoMember(introSender);
-      if (!coMember) {
-        return { consumed: false, decryptOk: false, reason: "introduction-not-co-member" };
-      }
-      const sdk = this._sdk();
-      const ownerInboxId = sdk ? this._ownInboxId(sdk) : "";
-      let result;
-      try {
-        result = await peerLinks.handleIncomingIntroduction({
-          ownerAccountId: this.ownerAccountId,
-          ownerInboxId: ownerInboxId || null,
-          introductionId: intro.introductionId,
-          senderAccountId: intro.senderAccountId,
-          senderInboxId: intro.senderInboxId,
-          bundleJson: intro.bundleJson,
-        });
-      } catch (introErr) {
-        this.logger.error("[ServerPeerLinkProtocolService] introduction processing failed", introErr && introErr.message ? introErr.message : introErr);
-        return;
-      }
-      // null = idempotent no-op (already established). The introduction itself is
-      // handled either way, so it is consumed.
-      if (!result) return { consumed: true, decryptOk: true };
-      this._emitPeerLinkUpdated(result.snapshot);
-      if (result.handshakePacket && result.deliverInboxId && sdk && sdk.mesh) {
-        try {
-          await sdk.mesh.dispatch(
-            {
-              payloadBytes: result.handshakePacket.toBytes(),
-              objectId: "introresp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
-              metadata: {},
-            },
-            buildInboxAddress({ inboxId: result.deliverInboxId }),
-          );
-        } catch (sendErr) {
-          this.logger.error("[ServerPeerLinkProtocolService] introduction response send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
-        }
-      }
-      return { consumed: true, decryptOk: true };
+    // Recovery invite (directed re-invite). Replaces the bespoke rehandshake +
+    // introduction request paths: a peer whose link to us desynced — or a group
+    // co-member we have no link to yet — sends us a fresh, short-lived invite
+    // ({envelope, signatureB64}). We accept it through the normal invite path
+    // (forceReestablish so a live-but-broken link is re-keyed), which sends the
+    // handshake back as a regular x3dh.handshake.v2 the inviter completes above.
+    if (bodyObj.kind === RECOVERY_INVITE_KIND) {
+      return await this._handleIncomingRecoveryInvite(bodyObj);
     }
 
     // Handshake ack (signed envelope from inviter → acceptor). MED-1: the
@@ -368,13 +249,12 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         // a packet we could not decrypt against ANY usable session may mean a
         // desynced/one-sided peer link. The opaque packet cannot identify its
         // sender, so only act when EXACTLY ONE candidate link has crossed the
-        // rehandshake threshold — zero or ambiguous (>1) candidates are left to
-        // retry, never guessed. The in-flight rehandshake_requested state is a
-        // natural cooldown.
+        // recovery threshold — zero or ambiguous (>1) candidates are left to
+        // retry, never guessed. The per-peer trigger cooldown is the burst gate.
         if (isThreadNotReady && Array.isArray(decErr.recoveryCandidates)) {
           const eligible = decErr.recoveryCandidates.filter((c) => c && c.rehandshakeNeeded === true);
           if (eligible.length === 1) {
-            this._triggerRehandshake({ peerAccountId: eligible[0].peerAccountId });
+            this._triggerRecoveryInvite({ peerAccountId: eligible[0].peerAccountId });
           }
         }
         // NOT consumed — leave the deposit buffered. The decrypt did not advance
@@ -518,66 +398,209 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     }
   }
 
-  // Initiate a re-handshake with a desynced peer. The SDK builds + signs the
-  // request record AND advances the local peer-link to rehandshake_requested;
-  // THIS service owns transport, so it resolves the peer's inbox and dispatches
-  // the request. The request rides plaintext to the peer's inbox — the ratchet
-  // is desynced, so it cannot be E2EE-wrapped; authenticity is carried by the
-  // signed account binding inside the bundle, which the receiver verifies in
-  // handleIncomingRehandshake. Fire-and-forget: failures are logged, never
-  // thrown into the deposit pipeline. (Before v0.4.6 this called the SDK with a
-  // `sendRehandshake` callback + no senderInboxId — a contract mismatch that
-  // made requestRehandshake throw `senderInboxId is required` and silently
-  // no-op'd all recovery. See project_offline_push_before_handshake_race.)
-  _triggerRehandshake({ peerAccountId }) {
+  // Initiate link RECOVERY by re-inviting a peer — the single recovery path for
+  // BOTH a desynced DM link and a group co-member we have no link to yet. Mints a
+  // fresh, short-lived direct invite and dispatches it to the peer's inbox; the
+  // peer accepts (forceReestablish) and completes the handshake back to us, so
+  // recovery reuses the proven invite/accept machinery verbatim. Fire-and-forget:
+  // failures are logged, never thrown into the deposit pipeline.
+  //
+  // Glare-free by construction: only the asymmetric invite/accept roles run, and
+  // if both sides re-invite at once the accept-side tiebreak
+  // (_handleIncomingRecoveryInvite) keeps a single matched pair; the short invite
+  // TTL retires superseded invites. `peerInboxId` is supplied for the group
+  // bootstrap case (from member.contact); for DM recovery it is resolved from the
+  // existing peer-link snapshot.
+  _triggerRecoveryInvite({ peerAccountId, peerInboxId = "" } = {}) {
     const remote = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
-    if (!remote) return;
+    if (!remote || remote === this.ownerAccountId) return;
+    // Synchronous per-peer cooldown (also the glare "outstanding invite" marker).
+    // Read here; commit the timestamp only once we're actually about to dispatch,
+    // so an early-return (no sdk) does not start a cooldown that delays a retry.
+    const nowMs = this.#clock();
+    const lastAtMs = this.#recoveryInviteAtMsByPeer.get(remote);
+    if (typeof lastAtMs === "number" && nowMs - lastAtMs < RECOVERY_INVITE_TRIGGER_COOLDOWN_MS) return;
     const peerLinks = this._peerLinkService();
-    if (!peerLinks || typeof peerLinks.requestRehandshake !== "function") return;
+    if (!peerLinks || typeof peerLinks.createInvite !== "function") return;
     const sdk = this._sdk();
     if (!sdk || !sdk.mesh) {
-      this.logger.warn("[ServerPeerLinkProtocolService] rehandshake skipped — sdk.mesh unavailable");
+      this.logger.warn("[ServerPeerLinkProtocolService] recovery invite skipped — sdk.mesh unavailable");
       return;
     }
-    const senderInboxId = this._ownInboxId(sdk);
-    if (!senderInboxId) {
-      this.logger.warn("[ServerPeerLinkProtocolService] rehandshake skipped — no local inbox id");
-      return;
-    }
-    this._sendRehandshakeRequest({ peerLinks, sdk, remote, senderInboxId }).catch((rhErr) => {
-      this.logger.error("[ServerPeerLinkProtocolService] rehandshake request failed", rhErr && rhErr.message ? rhErr.message : rhErr);
+    this.#recoveryInviteAtMsByPeer.set(remote, nowMs);
+    const remoteInbox = typeof peerInboxId === "string" ? peerInboxId.trim() : "";
+    this._sendRecoveryInvite({ peerLinks, sdk, remote, peerInboxId: remoteInbox }).catch((err) => {
+      this.logger.error("[ServerPeerLinkProtocolService] recovery invite send failed", err && err.message ? err.message : err);
     });
   }
 
-  // Resolve the peer's inbox, ask the SDK to build the signed re-handshake
-  // request (which also advances the local peer-link state), then dispatch the
-  // request bytes to the peer. Split out from _triggerRehandshake so the latter
-  // stays a synchronous fire-and-forget entry point.
-  async _sendRehandshakeRequest({ peerLinks, sdk, remote, senderInboxId }) {
-    const deliverInboxId = await this._resolvePeerInboxId(peerLinks, remote);
+  // Mint a fresh, short-lived direct invite and dispatch it to the peer's inbox
+  // as a recovery-invite body. Split out so _triggerRecoveryInvite stays a
+  // synchronous fire-and-forget entry point. The invite envelope binds OUR inbox
+  // as the reply target (createInvite's inviteBinding capabilityId), so the
+  // peer's accept handshake routes back to us.
+  async _sendRecoveryInvite({ peerLinks, sdk, remote, peerInboxId }) {
+    const deliverInboxId = peerInboxId || await this._resolvePeerInboxId(peerLinks, remote);
     if (!deliverInboxId) {
-      this.logger.warn("[ServerPeerLinkProtocolService] rehandshake skipped — no inbox for peer " + remote);
+      this.logger.warn("[ServerPeerLinkProtocolService] recovery invite skipped — no inbox for peer " + remote);
       return;
     }
-    const result = await peerLinks.requestRehandshake({
+    // The invite's reply binding (our persistent claimed inbox) is configured
+    // intrinsically on PeerLinkService at construction (see bootstrapChatServer),
+    // so createInvite anchors it automatically — recovery does NOT hand-pass it.
+    // createInvite fails loud if no binding is configured, so a bindingless invite
+    // can no longer be silently produced.
+    const created = await peerLinks.createInvite({
       ownerAccountId: this.ownerAccountId,
-      peerAccountId: remote,
-      senderInboxId,
+      kind: "direct",
+      maxUses: 1,
+      expiresAtMs: this.#clock() + RECOVERY_INVITE_TTL_MS,
     });
-    const record = result ? result.rehandshakeRecord : null;
-    if (!record || typeof record.toBytes !== "function") {
-      this.logger.warn("[ServerPeerLinkProtocolService] rehandshake produced no request record for peer " + remote);
+    const inviteId = created && typeof created.inviteId === "string" ? created.inviteId : "";
+    if (!inviteId) {
+      this.logger.warn("[ServerPeerLinkProtocolService] recovery invite produced no inviteId for peer " + remote);
       return;
     }
-    if (result.snapshot) this._emitPeerLinkUpdated(result.snapshot);
+    const envelopeData = await peerLinks.getStoredInviteEnvelope(this.ownerAccountId, inviteId);
+    if (!envelopeData || !envelopeData.envelope || typeof envelopeData.signatureB64 !== "string") {
+      this.logger.warn("[ServerPeerLinkProtocolService] recovery invite envelope missing for peer " + remote);
+      return;
+    }
+    const payloadBytes = new TextEncoder().encode(JSON.stringify({
+      kind: RECOVERY_INVITE_KIND,
+      envelope: envelopeData.envelope,
+      signatureB64: envelopeData.signatureB64,
+    }));
     await sdk.mesh.dispatch(
       {
-        payloadBytes: record.toBytes(),
-        objectId: "rhreq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
+        payloadBytes,
+        objectId: "recinv_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
         metadata: {},
       },
       buildInboxAddress({ inboxId: deliverInboxId }),
     );
+  }
+
+  // Accept an inbound recovery invite: glare tiebreak + authz gate, then reuse
+  // the normal acceptInvite path (forceReestablish so a live-but-broken link is
+  // re-keyed). The handshake response rides back as a regular x3dh.handshake.v2
+  // the inviter completes via handleIncomingHandshakePacket. Returns a pipeline
+  // consume status (see processDeposit).
+  async _handleIncomingRecoveryInvite(bodyObj) {
+    const peerLinks = this._peerLinkService();
+    const sdk = this._sdk();
+    if (!peerLinks || typeof peerLinks.acceptInvite !== "function" || !sdk || !sdk.mesh) {
+      return { consumed: false, decryptOk: false, reason: "recovery-invite-unready" };
+    }
+    const envelope = bodyObj && typeof bodyObj.envelope === "object" ? bodyObj.envelope : null;
+    const signatureB64 = typeof bodyObj.signatureB64 === "string" ? bodyObj.signatureB64 : "";
+    if (!envelope || !signatureB64) {
+      return { consumed: true, decryptOk: false, reason: "recovery-invite-malformed" };
+    }
+    const sender = typeof envelope.creatorAccountId === "string" ? envelope.creatorAccountId.trim() : "";
+    if (!sender || sender === this.ownerAccountId) {
+      return { consumed: true, decryptOk: false, reason: "recovery-invite-bad-sender" };
+    }
+
+    // GLARE TIEBREAK. If we ALSO have a recovery invite outstanding to this sender
+    // and WE are the canonical inviter (smaller accountId wins), ignore theirs —
+    // ours stands and they will accept it. Otherwise proceed; one matched pair
+    // results regardless of who detected the break first.
+    const lastAtMs = this.#recoveryInviteAtMsByPeer.get(sender);
+    const haveOutstanding = typeof lastAtMs === "number" && (this.#clock() - lastAtMs) < RECOVERY_INVITE_TTL_MS;
+    if (haveOutstanding && this.ownerAccountId < sender) {
+      return { consumed: true, decryptOk: true, reason: "recovery-invite-glare-deferred" };
+    }
+
+    // AUTHZ. Accept only from a peer we already know: an existing peer-link (DM
+    // recovery) or a co-member (group bootstrap). For an unknown sender the
+    // member.contact announcing them may not have arrived yet — leave the deposit
+    // BUFFERED (not consumed) so a later drain retries rather than dropping a
+    // legitimate co-member bootstrap.
+    const authorized = await this._hasExistingLink(peerLinks, sender) || await this._isCoMember(sender);
+    if (!authorized) {
+      return { consumed: false, decryptOk: false, reason: "recovery-invite-unauthorized" };
+    }
+
+    const senderInboxId = this._ownInboxId(sdk);
+    let result;
+    try {
+      result = await peerLinks.acceptInvite({
+        envelope,
+        signatureB64,
+        acceptorAccountId: this.ownerAccountId,
+        senderInboxId: senderInboxId || null,
+        forceReestablish: true,
+        sendHandshake: async ({ deliverInboxId, handshakePacket }) => {
+          const target = String(deliverInboxId || "").trim();
+          if (!target) {
+            const err = new Error("recovery invite sendHandshake: no target inbox");
+            err.code = "UNREACHABLE";
+            throw err;
+          }
+          const objectId = "hs_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
+          await sdk.mesh.dispatch(
+            { payloadBytes: handshakePacket.toBytes(), objectId, metadata: {} },
+            buildInboxAddress({ inboxId: target }),
+          );
+          return { packetId: objectId };
+        },
+      });
+    } catch (err) {
+      // A stale/superseded invite auto-rejecting (the glare TTL doing its job) is
+      // benign — consume it (nothing to retry). Other errors leave it buffered.
+      const code = err && err.code ? err.code : "";
+      if (code === "INVITE_EXPIRED" || code === "INVITE_SIGNATURE_INVALID") {
+        return { consumed: true, decryptOk: false, reason: "recovery-invite-" + code };
+      }
+      this.logger.error("[ServerPeerLinkProtocolService] recovery invite accept failed", err && err.message ? err.message : err);
+      return { consumed: false, decryptOk: false, reason: "recovery-invite-accept-error" };
+    }
+    if (result && result.snapshot) this._emitPeerLinkUpdated(result.snapshot);
+    return { consumed: true, decryptOk: true };
+  }
+
+  // True when we already hold ANY peer-link record to the peer (any state).
+  // Recovery authorization: an existing link means we know this contact, so an
+  // inbound recovery invite from them is legitimate.
+  async _hasExistingLink(peerLinks, peerAccountId) {
+    if (typeof peerLinks.listPeerLinks !== "function") return false;
+    const result = await peerLinks.listPeerLinks({ ownerAccountId: this.ownerAccountId });
+    const items = result && Array.isArray(result.items) ? result.items : [];
+    return items.some((it) => it && it.peerAccountId === peerAccountId);
+  }
+
+  // Group co-member BOOTSTRAP: establish a link with a co-member we have no
+  // usable/in-flight link to yet, by re-inviting them (same recovery path as a
+  // desynced DM, just triggered by member.contact instead of a decrypt miss).
+  // Unlike DM recovery — which re-keys a broken-but-established link — this SKIPS
+  // when a live or establishing link already exists, so it never needlessly
+  // re-keys a healthy link. Both co-members may fire this; the accept-side glare
+  // tiebreak keeps a single matched pair. Fire-and-forget (never throws).
+  async bootstrapCoMemberLink({ peerAccountId, peerInboxId } = {}) {
+    const remote = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
+    if (!remote || remote === this.ownerAccountId) return;
+    try {
+      const peerLinks = this._peerLinkService();
+      if (!peerLinks) return;
+      if (await this._hasLiveOrPendingLink(peerLinks, remote)) return;
+      this._triggerRecoveryInvite({ peerAccountId: remote, peerInboxId });
+    } catch (err) {
+      this.logger.error("[ServerPeerLinkProtocolService] co-member bootstrap failed", err && err.message ? err.message : err);
+    }
+  }
+
+  // True when we hold a live or in-flight link to the peer (anything but a
+  // terminal-dead failed/rejected/degraded). Suppresses redundant co-member
+  // bootstrap invites for links that are already healthy or establishing.
+  async _hasLiveOrPendingLink(peerLinks, peerAccountId) {
+    if (typeof peerLinks.listPeerLinks !== "function") return false;
+    const result = await peerLinks.listPeerLinks({ ownerAccountId: this.ownerAccountId });
+    const items = result && Array.isArray(result.items) ? result.items : [];
+    const match = items.find((it) => it && it.peerAccountId === peerAccountId);
+    if (!match) return false;
+    const dead = match.state === "failed" || match.state === "rejected" || match.state === "degraded";
+    return !dead;
   }
 
   // Look up the peer's current delivery inbox from the peer-link snapshot list
@@ -588,83 +611,6 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     const items = result && Array.isArray(result.items) ? result.items : [];
     const match = items.find((it) => it && typeof it.peerAccountId === "string" && it.peerAccountId === peerAccountId);
     return match && typeof match.peerInboxId === "string" ? match.peerInboxId.trim() : "";
-  }
-
-  // Initiate a peer-link INTRODUCTION with a co-member we have no link to.
-  // Fire-and-forget (failures logged, never thrown into the op applier /
-  // reconcile). Triple-gated to avoid storms and handshake glare:
-  //   1. deterministic initiator — only the lexicographically-smaller accountId
-  //      reaches out; the other side waits for our introduce and responds.
-  //   2. skip if a live-or-pending link already exists.
-  //   3. requires the peer's inbox (from the member.contact op) and our own.
-  triggerIntroduction({ peerAccountId, peerInboxId } = {}) {
-    const remote = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
-    const remoteInbox = typeof peerInboxId === "string" ? peerInboxId.trim() : "";
-    if (!remote || remote === this.ownerAccountId) return;
-    if (!remoteInbox) return;
-    // Deterministic initiator: the smaller accountId initiates, the other waits.
-    if (!(this.ownerAccountId < remote)) return;
-    const peerLinks = this._peerLinkService();
-    if (!peerLinks || typeof peerLinks.requestPeerLinkIntroduction !== "function") return;
-    const sdk = this._sdk();
-    if (!sdk || !sdk.mesh) {
-      this.logger.warn("[ServerPeerLinkProtocolService] introduction skipped — sdk.mesh unavailable");
-      return;
-    }
-    const senderInboxId = this._ownInboxId(sdk);
-    if (!senderInboxId) {
-      this.logger.warn("[ServerPeerLinkProtocolService] introduction skipped — no local inbox id");
-      return;
-    }
-    this._sendIntroductionRequest({ peerLinks, sdk, remote, remoteInbox, senderInboxId }).catch((err) => {
-      this.logger.error("[ServerPeerLinkProtocolService] introduction request failed", err && err.message ? err.message : err);
-    });
-  }
-
-  // Build + send the signed introduction request (the SDK also creates/advances
-  // the local peer-link record). Split out so triggerIntroduction stays a
-  // synchronous fire-and-forget entry point.
-  async _sendIntroductionRequest({ peerLinks, sdk, remote, remoteInbox, senderInboxId }) {
-    if (await this._hasLiveOrPendingLink(peerLinks, remote)) return;
-    const result = await peerLinks.requestPeerLinkIntroduction({
-      ownerAccountId: this.ownerAccountId,
-      peerAccountId: remote,
-      peerInboxId: remoteInbox,
-      senderInboxId,
-    });
-    if (!result || result.alreadyLinked) {
-      if (result && result.snapshot) this._emitPeerLinkUpdated(result.snapshot);
-      return;
-    }
-    const record = result.introductionRecord;
-    if (!record || typeof record.toBytes !== "function") {
-      this.logger.warn("[ServerPeerLinkProtocolService] introduction produced no request record for peer " + remote);
-      return;
-    }
-    if (result.snapshot) this._emitPeerLinkUpdated(result.snapshot);
-    await sdk.mesh.dispatch(
-      {
-        payloadBytes: record.toBytes(),
-        objectId: "introreq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
-        metadata: {},
-      },
-      buildInboxAddress({ inboxId: remoteInbox }),
-    );
-  }
-
-  // True when we already hold a usable or in-flight link to the peer — used to
-  // suppress redundant introductions. rehandshake_requested is our own pending
-  // introduction's state; handshake_*/accept_committed/session_established are
-  // live or in-flight. Only terminal-dead states (failed/rejected/degraded)
-  // allow a fresh introduction.
-  async _hasLiveOrPendingLink(peerLinks, peerAccountId) {
-    if (typeof peerLinks.listPeerLinks !== "function") return false;
-    const result = await peerLinks.listPeerLinks({ ownerAccountId: this.ownerAccountId });
-    const items = result && Array.isArray(result.items) ? result.items : [];
-    const match = items.find((it) => it && it.peerAccountId === peerAccountId);
-    if (!match) return false;
-    const dead = match.state === "failed" || match.state === "rejected" || match.state === "degraded";
-    return !dead;
   }
 
   async _isCoMember(accountId) {
@@ -721,7 +667,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     if (sessionInbox) return sessionInbox;
     // Fall back to the claimed inbox id. session.localInboxId is only populated
     // once session.ready lands; the claimant's inboxId is authoritative and set
-    // at bootstrap, so introductions fired before session info settles still
+    // at bootstrap, so recovery invites fired before session info settles still
     // resolve a routable sender inbox.
     const claimant = this.bus.runtime && this.bus.runtime.inboxClaimant ? this.bus.runtime.inboxClaimant : null;
     return claimant && typeof claimant.inboxId === "string" ? claimant.inboxId.trim() : "";

@@ -527,9 +527,9 @@ export class ServerGroupOpApplier {
       }
       // Mesh bootstrap: we (the inviter) are the only side holding BOTH the new
       // joiner's inbox and the existing members' inboxes, so we advertise peer
-      // routing to everyone. Each pair then establishes a direct peer-link via
-      // the existing X3DH introduction handshake (member.contact handler →
-      // triggerIntroduction), giving the joiner a full mesh rather than a link
+      // routing to everyone. Each pair then establishes a direct peer-link by
+      // re-inviting over the existing invite/accept path (member.contact handler →
+      // bootstrapCoMemberLink), giving the joiner a full mesh rather than a link
       // only to us. See project_group_peerlinks_invite_tree_not_mesh.
       await this.#broadcastKnownContacts(op.groupId).catch((err) => {
         this.#logger.warn("[ServerGroupsService] member.contact broadcast on join failed",
@@ -543,10 +543,10 @@ export class ServerGroupOpApplier {
   // every other for fan-out). For each carried contact we (1) add the co-member
   // to our roster add-only (ensureMembership never resurrects a removed member —
   // anti-resurrection preserved; this is also how a transitively-invited member
-  // first learns of pre-existing members) and (2) fire a peer-link introduction.
-  // The introduction reuses the existing X3DH establishment; it is gated to the
-  // deterministic initiator + missing-link inside the protocol service, so this
-  // is safe to call unconditionally. See project_group_peerlinks_invite_tree_not_mesh.
+  // first learns of pre-existing members) and (2) bootstrap a peer-link by
+  // re-inviting the co-member. bootstrapCoMemberLink reuses the invite/accept
+  // path and skips internally when a live/establishing link already exists, so
+  // this is safe to call unconditionally. See project_group_peerlinks_invite_tree_not_mesh.
   async #applyIncomingMemberContact(op) {
     const contacts = Array.isArray(op.contacts) ? op.contacts : [];
     if (contacts.length === 0) return;
@@ -569,8 +569,10 @@ export class ServerGroupOpApplier {
       if (created) rosterChanged = true;
       const isActive = membership && String(membership.state || "").toLowerCase() === "active";
       // Never mesh with a member we hold as removed/left (don't undo a kick).
-      if (isActive && protocol && typeof protocol.triggerIntroduction === "function") {
-        protocol.triggerIntroduction({ peerAccountId: acct, peerInboxId: inbox });
+      if (isActive && protocol && typeof protocol.bootstrapCoMemberLink === "function") {
+        // Fire-and-forget: establish a link with this co-member by re-inviting
+        // them (skipped internally if a live/establishing link already exists).
+        protocol.bootstrapCoMemberLink({ peerAccountId: acct, peerInboxId: inbox });
       }
     }
     if (rosterChanged) await this.#emitMembersUpdated(op.groupId);

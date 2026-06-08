@@ -3,14 +3,14 @@ import assert from "node:assert/strict";
 
 import { ServerPeerLinkProtocolService } from "../src/server/services/ServerPeerLinkProtocolService.js";
 
-// Phase 2 recipient-side recovery — the GATE. When decryptDirectMessageAnyPeer
-// reports a total miss (THREAD_NOT_READY) with state-attributed
-// recoveryCandidates, the chat-server triggers a rehandshake ONLY when exactly
-// one candidate has crossed the threshold. Zero or ambiguous (>1) candidates
-// are left to retry — the opaque packet cannot identify its sender, so we never
-// guess. This test spies on _triggerRehandshake to assert the gate decision; the
-// real SDK requestRehandshake → dispatch wiring of _triggerRehandshake itself is
-// covered end-to-end by server.peerlink.rehandshake-trigger.test.js.
+// Recipient-side recovery — the GATE. When decryptDirectMessageAnyPeer reports a
+// total miss (THREAD_NOT_READY) with state-attributed recoveryCandidates, the
+// chat-server triggers a recovery invite ONLY when exactly one candidate has
+// crossed the threshold. Zero or ambiguous (>1) candidates are left to retry —
+// the opaque packet cannot identify its sender, so we never guess. This test
+// spies on _triggerRecoveryInvite to assert the gate decision; the real
+// createInvite → dispatch wiring is covered end-to-end by
+// server.peerlink.recovery.test.js.
 
 function makeFakeBus({ runtime } = {}) {
   return {
@@ -48,7 +48,7 @@ function makeService({ recoveryCandidates }) {
   });
   // Spy on the trigger so the gate decision is observed synchronously (the real
   // trigger dispatches async fire-and-forget; its wiring is tested separately).
-  service._triggerRehandshake = ({ peerAccountId }) => { calls.push({ peerAccountId }); };
+  service._triggerRecoveryInvite = ({ peerAccountId }) => { calls.push({ peerAccountId }); };
   return { service, calls };
 }
 

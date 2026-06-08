@@ -105,7 +105,7 @@ test("applying member.contact adds the co-member (add-only) and fires an introdu
   const server = createServer(storage);
 
   const calls = [];
-  server.bus.services.peerLinkProtocol.triggerIntroduction = (args) => calls.push(args);
+  server.bus.services.peerLinkProtocol.bootstrapCoMemberLink = (args) => calls.push(args);
 
   await server.bus.services.groups.handleIncomingGroupOp(
     contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie", displayName: "Newbie" }]),
@@ -129,7 +129,7 @@ test("member.contact never resurrects a removed member, and fires no introductio
   const server = createServer(storage);
 
   const calls = [];
-  server.bus.services.peerLinkProtocol.triggerIntroduction = (args) => calls.push(args);
+  server.bus.services.peerLinkProtocol.bootstrapCoMemberLink = (args) => calls.push(args);
 
   await server.bus.services.groups.handleIncomingGroupOp(
     contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie" }]),
@@ -149,7 +149,7 @@ test("member.contact from a non-member sender is dropped (no roster change, no i
   const server = createServer(storage);
 
   const calls = [];
-  server.bus.services.peerLinkProtocol.triggerIntroduction = (args) => calls.push(args);
+  server.bus.services.peerLinkProtocol.bootstrapCoMemberLink = (args) => calls.push(args);
 
   await server.bus.services.groups.handleIncomingGroupOp(
     contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie" }]),

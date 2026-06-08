@@ -189,7 +189,15 @@ export async function bootstrapChatServer({
     ownerAccountId,
     signer: inviteAuthority.signer,
     verifier: inviteAuthority.verifier,
-    inviteBinding: null,
+    // SSOT for the invite reply binding: every invite this chat-server creates
+    // must route the acceptor's handshake back to our PERSISTENT claimed inbox
+    // (the cap chain anchors on it), NOT the SDK session's ephemeral inbox. Wire
+    // it ONCE here so createInvite is always correctly bound regardless of caller
+    // — user invites (ServerInvitesService) and automated recovery re-invites
+    // (ServerPeerLinkProtocolService) both inherit it. Previously this was null
+    // and every call site had to remember `peerInboxId`; the recovery path forgot
+    // and silently produced bindingless invites (acceptInvite → degraded).
+    inviteBinding: { mailboxId: inboxClaimant.inboxId, capabilityId: inboxClaimant.inboxId },
     cryptoProvider,
     inboxClaimantSigner: inboxClaimant.createCapabilitySigner(),
   });
