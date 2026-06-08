@@ -38,6 +38,7 @@ export class ServerGroupsService extends BaseServerService {
   #clock;
   #broadcaster;
   #opApplier;
+  #offReconnect;
 
   constructor({
     bus,
@@ -84,6 +85,47 @@ export class ServerGroupsService extends BaseServerService {
     this._register("group", "setRole", (payload) => this.setMemberRole(payload));
     this._register("groups", "list", () => this.listGroups());
     this._register("group.members", "list", (payload) => this.listGroupMembers(payload));
+    this.#offReconnect = null;
+  }
+
+  // On start and every SDK reconnect, re-advertise peer routing so group members
+  // mesh (and pre-existing tree-only groups heal). Fire-and-forget — a reconcile
+  // failure must never block service start. Mirrors InboxCatchupService's
+  // onReconnected wiring.
+  async start() {
+    const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
+    if (sdk && sdk.connectivity && typeof sdk.connectivity.onReconnected === "function") {
+      this.#offReconnect = sdk.connectivity.onReconnected(() => {
+        this.reconcileMesh().catch((err) => {
+          this.logger.error("[ServerGroupsService] reconnect mesh reconcile failed: "
+            + (err && err.message ? err.message : err));
+        });
+      });
+    }
+    this.reconcileMesh().catch((err) => {
+      this.logger.error("[ServerGroupsService] startup mesh reconcile failed: "
+        + (err && err.message ? err.message : err));
+    });
+  }
+
+  async stop() {
+    if (typeof this.#offReconnect === "function") {
+      try {
+        this.#offReconnect();
+      } catch (err) {
+        this.logger.error("[ServerGroupsService] reconnect unsubscribe failed: "
+          + (err && err.message ? err.message : err));
+      }
+      this.#offReconnect = null;
+    }
+    await super.stop();
+  }
+
+  // Re-advertise known peer routing across every group (delegated to the op
+  // applier, which owns the broadcaster + peer-link reads). Public so tests and
+  // the reconnect hook can drive it.
+  async reconcileMesh() {
+    return this.#opApplier.reconcileMesh();
   }
 
   async createGroup(payload = {}) {

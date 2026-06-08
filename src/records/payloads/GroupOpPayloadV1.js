@@ -13,6 +13,7 @@ import { CHANNEL_ID_PATTERN } from "./ChatMessagePayloadV1.js";
  *   - channels.sync_request { groupId, actedAtMs, groupOpId }
  *   - group.state    { groupId, title, actedAtMs, groupOpId }
  *   - member.join    { groupId, accountId, inviteId, displayName?, actedAtMs, groupOpId }
+ *   - member.contact { groupId, contacts:[{accountId, inboxId}], actedAtMs, groupOpId }
  *
  * Authorization is enforced on the recipient side: the sender must be a
  * current member of the group; for admin-only ops the sender must be an
@@ -32,6 +33,12 @@ import { CHANNEL_ID_PATTERN } from "./ChatMessagePayloadV1.js";
  * active member (shape B); those forward recipients trust the inviter's
  * forward (sender-must-be-member gate applies as normal).
  *
+ * member.contact propagates peer routing so members can mesh: it carries the
+ * {accountId, inboxId} of one or more members the sender knows directly. It does
+ * NOT establish membership or peer links by itself — recipients record the inbox
+ * (ChatGroupMember.peerInboxId) and use it to run the existing X3DH introduction
+ * handshake against co-members they lack a link to. Pure routing metadata.
+ *
  * The implicit "#general" channel (channelId === "") is undeletable. The
  * channel.delete op handler refuses the empty channelId; the validator
  * here also requires a non-empty channelId for both channel ops.
@@ -45,8 +52,9 @@ export const GROUP_OP_KIND = "rez.group-op.v1";
 
 export const GROUP_OPS = Object.freeze([
   "rename", "kick", "setRole", "leave", "channel.create", "channel.delete",
-  "channels.sync_request", "group.state", "member.join",
+  "channels.sync_request", "group.state", "member.join", "member.contact",
 ]);
+const MAX_CONTACTS_PER_OP = 256;
 export const GROUP_OP_ROLES = Object.freeze(["admin", "member"]);
 const VALID_ROLES = new Set(GROUP_OP_ROLES);
 const MAX_TITLE_LENGTH = 128;
@@ -72,6 +80,9 @@ export class GroupOpPayloadV1 extends WirePayloadRecord {
     // optional display-name hint for the system-message rendering.
     inviteId: { type: "string", trim: true },
     displayName: { type: "string", trim: false, maxLength: MAX_DISPLAY_NAME_LENGTH },
+    // member.contact routing payload: [{accountId, inboxId}]. Element shape is
+    // validated in validate() below (the schema array type stores plain objects).
+    contacts: { type: "array" },
   };
 
   validate() {
@@ -93,6 +104,19 @@ export class GroupOpPayloadV1 extends WirePayloadRecord {
     } else if (this.op === "member.join") {
       this.assert(this.accountId.length > 0, "GroupOpPayloadV1.member.join: accountId required");
       this.assert(this.inviteId.length > 0, "GroupOpPayloadV1.member.join: inviteId required");
+    } else if (this.op === "member.contact") {
+      this.assert(Array.isArray(this.contacts) && this.contacts.length > 0,
+        "GroupOpPayloadV1.member.contact: contacts required (non-empty array)");
+      this.assert(this.contacts.length <= MAX_CONTACTS_PER_OP,
+        `GroupOpPayloadV1.member.contact: contacts exceeds ${MAX_CONTACTS_PER_OP}`);
+      for (const contact of this.contacts) {
+        this.assert(contact && typeof contact === "object" && !Array.isArray(contact),
+          "GroupOpPayloadV1.member.contact: each contact must be an object");
+        this.assert(typeof contact.accountId === "string" && contact.accountId.length > 0,
+          "GroupOpPayloadV1.member.contact: each contact requires accountId");
+        this.assert(typeof contact.inboxId === "string" && contact.inboxId.length > 0,
+          "GroupOpPayloadV1.member.contact: each contact requires inboxId");
+      }
     }
   }
 }

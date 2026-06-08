@@ -179,6 +179,10 @@ export class ServerGroupOpApplier {
       await this.#applyIncomingGroupState(op);
       return true;
     }
+    if (op.op === "member.contact") {
+      await this.#applyIncomingMemberContact(op);
+      return true;
+    }
     return true;
   }
 
@@ -521,6 +525,122 @@ export class ServerGroupOpApplier {
             err && err.message ? err.message : err);
         });
       }
+      // Mesh bootstrap: we (the inviter) are the only side holding BOTH the new
+      // joiner's inbox and the existing members' inboxes, so we advertise peer
+      // routing to everyone. Each pair then establishes a direct peer-link via
+      // the existing X3DH introduction handshake (member.contact handler →
+      // triggerIntroduction), giving the joiner a full mesh rather than a link
+      // only to us. See project_group_peerlinks_invite_tree_not_mesh.
+      await this.#broadcastKnownContacts(op.groupId).catch((err) => {
+        this.#logger.warn("[ServerGroupsService] member.contact broadcast on join failed",
+          err && err.message ? err.message : err);
+      });
+    }
+  }
+
+  // Apply an inbound member.contact op: peer routing shared by an active member
+  // so the rest of the group can MESH (every member needs a direct peer-link to
+  // every other for fan-out). For each carried contact we (1) add the co-member
+  // to our roster add-only (ensureMembership never resurrects a removed member —
+  // anti-resurrection preserved; this is also how a transitively-invited member
+  // first learns of pre-existing members) and (2) fire a peer-link introduction.
+  // The introduction reuses the existing X3DH establishment; it is gated to the
+  // deterministic initiator + missing-link inside the protocol service, so this
+  // is safe to call unconditionally. See project_group_peerlinks_invite_tree_not_mesh.
+  async #applyIncomingMemberContact(op) {
+    const contacts = Array.isArray(op.contacts) ? op.contacts : [];
+    if (contacts.length === 0) return;
+    const protocol = this.#bus.services && this.#bus.services.peerLinkProtocol
+      ? this.#bus.services.peerLinkProtocol
+      : null;
+    let rosterChanged = false;
+    for (const contact of contacts) {
+      const acct = contact && typeof contact.accountId === "string" ? contact.accountId.trim() : "";
+      const inbox = contact && typeof contact.inboxId === "string" ? contact.inboxId.trim() : "";
+      if (!acct || !inbox || acct === this.#ownerAccountId) continue;
+      const displayName = contact && typeof contact.displayName === "string" ? contact.displayName : "";
+      const { membership, created } = await this.#groupStore.ensureMembership({
+        ownerAccountId: this.#ownerAccountId,
+        groupId: op.groupId,
+        accountId: acct,
+        role: "member",
+        displayName,
+      }).catch(() => ({ membership: null, created: false }));
+      if (created) rosterChanged = true;
+      const isActive = membership && String(membership.state || "").toLowerCase() === "active";
+      // Never mesh with a member we hold as removed/left (don't undo a kick).
+      if (isActive && protocol && typeof protocol.triggerIntroduction === "function") {
+        protocol.triggerIntroduction({ peerAccountId: acct, peerInboxId: inbox });
+      }
+    }
+    if (rosterChanged) await this.#emitMembersUpdated(op.groupId);
+  }
+
+  // Build {accountId, inboxId, displayName} for every active member we hold a
+  // routable peer-link for, and fan a member.contact op out to all active
+  // members so they can mesh with each other. The inviter calls this on
+  // member.join (it is the only side with the new joiner's inbox); reconcileMesh
+  // calls it on connect to heal pre-existing tree-only groups. Recipients skip
+  // their own entry. Idempotent.
+  async #broadcastKnownContacts(groupId) {
+    const inboxes = await this.#knownPeerInboxes();
+    if (inboxes.size === 0) return;
+    const members = await this.#groupStore.listMembers({
+      ownerAccountId: this.#ownerAccountId,
+      groupId,
+    }).catch(() => []);
+    const active = (Array.isArray(members) ? members : []).filter((m) =>
+      m && m.state === "active" && m.accountId !== this.#ownerAccountId);
+    const contacts = [];
+    for (const member of active) {
+      const inbox = inboxes.get(member.accountId);
+      if (!inbox) continue;
+      contacts.push({
+        accountId: member.accountId,
+        inboxId: inbox,
+        displayName: typeof member.displayName === "string" ? member.displayName : "",
+      });
+    }
+    if (contacts.length === 0) return;
+    const targets = active.map((m) => m.accountId);
+    if (targets.length === 0) return;
+    const payload = new GroupOpPayloadV1({
+      op: "member.contact",
+      groupId,
+      contacts,
+      actedAtMs: this.#clock(),
+      groupOpId: nowOpId(),
+    });
+    await this.#broadcaster.fanOut({ targets, payload });
+  }
+
+  // accountId → peerInboxId for every peer-link that carries a routable inbox
+  // (the single source of truth for peer routing, per ServerPeerLinkProtocolService).
+  async #knownPeerInboxes() {
+    const map = new Map();
+    const peerLinks = this.#bus.runtime && this.#bus.runtime.peerLinks ? this.#bus.runtime.peerLinks : null;
+    if (!peerLinks || typeof peerLinks.listPeerLinks !== "function") return map;
+    const result = await peerLinks.listPeerLinks({ ownerAccountId: this.#ownerAccountId }).catch(() => null);
+    const items = result && Array.isArray(result.items) ? result.items : [];
+    for (const item of items) {
+      const acct = item && typeof item.peerAccountId === "string" ? item.peerAccountId.trim() : "";
+      const inbox = item && typeof item.peerInboxId === "string" ? item.peerInboxId.trim() : "";
+      if (acct && inbox) map.set(acct, inbox);
+    }
+    return map;
+  }
+
+  // Re-advertise known peer routing across every group on connect/reconnect so
+  // members of a pre-existing tree-only group (created before mesh support) heal
+  // into a full mesh. Idempotent and self-throttling — receivers no-op when a
+  // link already exists. Public: ServerGroupsService wires it to start/reconnect.
+  async reconcileMesh() {
+    const groups = await this.#groupStore.listGroups({ ownerAccountId: this.#ownerAccountId }).catch(() => []);
+    for (const group of (Array.isArray(groups) ? groups : [])) {
+      await this.#broadcastKnownContacts(group.groupId).catch((err) => {
+        this.#logger.warn("[ServerGroupsService] mesh reconcile failed for group " + group.groupId,
+          err && err.message ? err.message : err);
+      });
     }
   }
 

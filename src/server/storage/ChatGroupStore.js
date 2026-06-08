@@ -164,6 +164,25 @@ export class GroupStore {
     return sortByUpdatedThen(await this.memberships.list(owner, gid), "accountId");
   }
 
+  /**
+   * True when `accountId` is an ACTIVE member of any group the local owner is
+   * also in. This store only holds the owner's own groups, so a hit means the
+   * two share at least one group. Used as the receiver-side authorization gate
+   * for peer-link introductions (a co-member may bootstrap a direct link), which
+   * is why removed/left states must NOT count.
+   */
+  async isCoMember({ ownerAccountId, accountId } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const other = typeof accountId === "string" ? accountId.trim() : "";
+    if (!other || other === owner) return false;
+    const groups = await this.listGroups({ ownerAccountId: owner });
+    for (const group of groups) {
+      const membership = await this.memberships.get(owner, group.groupId, other);
+      if (membership && String(membership.state || "").toLowerCase() === "active") return true;
+    }
+    return false;
+  }
+
   async renameGroup({ ownerAccountId, groupId, title } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const id = requireId(groupId, "groupId");

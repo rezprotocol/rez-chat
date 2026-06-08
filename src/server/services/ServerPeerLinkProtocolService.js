@@ -111,6 +111,32 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     const peerLinks = this._peerLinkService();
     if (!peerLinks) return;
 
+    // Introduction response — MUST be checked BEFORE both the rehandshake
+    // response and the regular handshake, since all three match
+    // e2ee:1 + type=x3dh.handshake.v2. Routed on the presence of
+    // `introductionId`; the SDK verifies the envelope + binding (no plaintext
+    // trust). This is the response to a co-member introduction WE initiated.
+    if (bodyObj.e2ee === 1
+        && bodyObj.type === "x3dh.handshake.v2"
+        && bodyObj.handshake
+        && typeof bodyObj.handshake === "object"
+        && bodyObj.handshake.introductionId) {
+      if (typeof peerLinks.handleIntroductionResponse !== "function") return;
+      let result;
+      try {
+        result = await peerLinks.handleIntroductionResponse({
+          ownerAccountId: this.ownerAccountId,
+          packetBytes: payloadBytes,
+        });
+      } catch (introErr) {
+        this.logger.error("[ServerPeerLinkProtocolService] introduction response failed", introErr && introErr.message ? introErr.message : introErr);
+        return;
+      }
+      if (!result) return { consumed: false, decryptOk: false, reason: "introduction-response-noop" };
+      this._emitPeerLinkUpdated(result.snapshot);
+      return { consumed: true, decryptOk: true };
+    }
+
     // Re-handshake response — MUST be checked BEFORE the regular handshake
     // since both match e2ee:1 + type=x3dh.handshake.v2.
     //
@@ -221,6 +247,64 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
           );
         } catch (sendErr) {
           this.logger.error("[ServerPeerLinkProtocolService] rehandshake response send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
+        }
+      }
+      return { consumed: true, decryptOk: true };
+    }
+
+    // Introduction request (co-member mesh bootstrap). Structurally a
+    // rehandshake request, but authorized by CO-MEMBERSHIP rather than an
+    // existing link: the sender must be an active member of a group we are also
+    // in. Like rehandshake it rides UNSEALED to our inbox (no shared ratchet
+    // yet); authenticity is the signed account binding the SDK verifies.
+    if (bodyObj.e2ee === 1
+        && bodyObj.type === "x3dh.introduce.v1"
+        && bodyObj.introduction
+        && typeof bodyObj.introduction === "object") {
+      if (typeof peerLinks.handleIncomingIntroduction !== "function") return;
+      const intro = bodyObj.introduction;
+      const introSender = typeof intro.senderAccountId === "string" ? intro.senderAccountId.trim() : "";
+      // Co-membership gate. If we don't yet know the sender as a co-member, the
+      // member.contact op announcing them may simply not have arrived yet
+      // (same ordering race as push-before-member.join). Leave the deposit
+      // BUFFERED (not consumed) so a later drain — after member.contact applies
+      // — retries it, rather than dropping a legitimate introduction.
+      const coMember = await this._isCoMember(introSender);
+      if (!coMember) {
+        return { consumed: false, decryptOk: false, reason: "introduction-not-co-member" };
+      }
+      const sdk = this._sdk();
+      const ownerInboxId = sdk ? this._ownInboxId(sdk) : "";
+      let result;
+      try {
+        result = await peerLinks.handleIncomingIntroduction({
+          ownerAccountId: this.ownerAccountId,
+          ownerInboxId: ownerInboxId || null,
+          introductionId: intro.introductionId,
+          senderAccountId: intro.senderAccountId,
+          senderInboxId: intro.senderInboxId,
+          bundleJson: intro.bundleJson,
+        });
+      } catch (introErr) {
+        this.logger.error("[ServerPeerLinkProtocolService] introduction processing failed", introErr && introErr.message ? introErr.message : introErr);
+        return;
+      }
+      // null = idempotent no-op (already established). The introduction itself is
+      // handled either way, so it is consumed.
+      if (!result) return { consumed: true, decryptOk: true };
+      this._emitPeerLinkUpdated(result.snapshot);
+      if (result.handshakePacket && result.deliverInboxId && sdk && sdk.mesh) {
+        try {
+          await sdk.mesh.dispatch(
+            {
+              payloadBytes: result.handshakePacket.toBytes(),
+              objectId: "introresp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
+              metadata: {},
+            },
+            buildInboxAddress({ inboxId: result.deliverInboxId }),
+          );
+        } catch (sendErr) {
+          this.logger.error("[ServerPeerLinkProtocolService] introduction response send failed", sendErr && sendErr.message ? sendErr.message : sendErr);
         }
       }
       return { consumed: true, decryptOk: true };
@@ -506,6 +590,98 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     return match && typeof match.peerInboxId === "string" ? match.peerInboxId.trim() : "";
   }
 
+  // Initiate a peer-link INTRODUCTION with a co-member we have no link to.
+  // Fire-and-forget (failures logged, never thrown into the op applier /
+  // reconcile). Triple-gated to avoid storms and handshake glare:
+  //   1. deterministic initiator — only the lexicographically-smaller accountId
+  //      reaches out; the other side waits for our introduce and responds.
+  //   2. skip if a live-or-pending link already exists.
+  //   3. requires the peer's inbox (from the member.contact op) and our own.
+  triggerIntroduction({ peerAccountId, peerInboxId } = {}) {
+    const remote = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
+    const remoteInbox = typeof peerInboxId === "string" ? peerInboxId.trim() : "";
+    if (!remote || remote === this.ownerAccountId) return;
+    if (!remoteInbox) return;
+    // Deterministic initiator: the smaller accountId initiates, the other waits.
+    if (!(this.ownerAccountId < remote)) return;
+    const peerLinks = this._peerLinkService();
+    if (!peerLinks || typeof peerLinks.requestPeerLinkIntroduction !== "function") return;
+    const sdk = this._sdk();
+    if (!sdk || !sdk.mesh) {
+      this.logger.warn("[ServerPeerLinkProtocolService] introduction skipped — sdk.mesh unavailable");
+      return;
+    }
+    const senderInboxId = this._ownInboxId(sdk);
+    if (!senderInboxId) {
+      this.logger.warn("[ServerPeerLinkProtocolService] introduction skipped — no local inbox id");
+      return;
+    }
+    this._sendIntroductionRequest({ peerLinks, sdk, remote, remoteInbox, senderInboxId }).catch((err) => {
+      this.logger.error("[ServerPeerLinkProtocolService] introduction request failed", err && err.message ? err.message : err);
+    });
+  }
+
+  // Build + send the signed introduction request (the SDK also creates/advances
+  // the local peer-link record). Split out so triggerIntroduction stays a
+  // synchronous fire-and-forget entry point.
+  async _sendIntroductionRequest({ peerLinks, sdk, remote, remoteInbox, senderInboxId }) {
+    if (await this._hasLiveOrPendingLink(peerLinks, remote)) return;
+    const result = await peerLinks.requestPeerLinkIntroduction({
+      ownerAccountId: this.ownerAccountId,
+      peerAccountId: remote,
+      peerInboxId: remoteInbox,
+      senderInboxId,
+    });
+    if (!result || result.alreadyLinked) {
+      if (result && result.snapshot) this._emitPeerLinkUpdated(result.snapshot);
+      return;
+    }
+    const record = result.introductionRecord;
+    if (!record || typeof record.toBytes !== "function") {
+      this.logger.warn("[ServerPeerLinkProtocolService] introduction produced no request record for peer " + remote);
+      return;
+    }
+    if (result.snapshot) this._emitPeerLinkUpdated(result.snapshot);
+    await sdk.mesh.dispatch(
+      {
+        payloadBytes: record.toBytes(),
+        objectId: "introreq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
+        metadata: {},
+      },
+      buildInboxAddress({ inboxId: remoteInbox }),
+    );
+  }
+
+  // True when we already hold a usable or in-flight link to the peer — used to
+  // suppress redundant introductions. rehandshake_requested is our own pending
+  // introduction's state; handshake_*/accept_committed/session_established are
+  // live or in-flight. Only terminal-dead states (failed/rejected/degraded)
+  // allow a fresh introduction.
+  async _hasLiveOrPendingLink(peerLinks, peerAccountId) {
+    if (typeof peerLinks.listPeerLinks !== "function") return false;
+    const result = await peerLinks.listPeerLinks({ ownerAccountId: this.ownerAccountId });
+    const items = result && Array.isArray(result.items) ? result.items : [];
+    const match = items.find((it) => it && it.peerAccountId === peerAccountId);
+    if (!match) return false;
+    const dead = match.state === "failed" || match.state === "rejected" || match.state === "degraded";
+    return !dead;
+  }
+
+  async _isCoMember(accountId) {
+    const groupStore = this._groupStore();
+    if (!groupStore || typeof groupStore.isCoMember !== "function") return false;
+    try {
+      return await groupStore.isCoMember({ ownerAccountId: this.ownerAccountId, accountId });
+    } catch (err) {
+      this.logger.warn("[ServerPeerLinkProtocolService] isCoMember check failed", err && err.message ? err.message : err);
+      return false;
+    }
+  }
+
+  _groupStore() {
+    return this.bus.stores && this.bus.stores.groupStore ? this.bus.stores.groupStore : null;
+  }
+
   _emitPeerLinkUpdated(snapshot, remoteDisplayName = "") {
     if (!snapshot || typeof snapshot !== "object") return;
     // Use a distinct input-event name to feed ServerEventService. The
@@ -540,7 +716,14 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
   }
 
   _ownInboxId(sdk) {
-    const identity = typeof sdk.getIdentity === "function" ? sdk.getIdentity() : null;
-    return identity && typeof identity.localInboxId === "string" ? identity.localInboxId.trim() : "";
+    const identity = sdk && typeof sdk.getIdentity === "function" ? sdk.getIdentity() : null;
+    const sessionInbox = identity && typeof identity.localInboxId === "string" ? identity.localInboxId.trim() : "";
+    if (sessionInbox) return sessionInbox;
+    // Fall back to the claimed inbox id. session.localInboxId is only populated
+    // once session.ready lands; the claimant's inboxId is authoritative and set
+    // at bootstrap, so introductions fired before session info settles still
+    // resolve a routable sender inbox.
+    const claimant = this.bus.runtime && this.bus.runtime.inboxClaimant ? this.bus.runtime.inboxClaimant : null;
+    return claimant && typeof claimant.inboxId === "string" ? claimant.inboxId.trim() : "";
   }
 }
