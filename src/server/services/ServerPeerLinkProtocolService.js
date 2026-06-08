@@ -239,7 +239,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         try {
           await this._sdk().mesh.dispatch(
             {
-              payloadBytes: result.handshakePacket,
+              payloadBytes: result.handshakePacket.toBytes(),
               objectId: "rhresp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10),
               metadata: {},
             },

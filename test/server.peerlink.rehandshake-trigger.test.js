@@ -172,7 +172,7 @@ async function establishInviterToAcceptor({ aliceIdentity, bobIdentity, aliceInb
     ownerAccountId: aliceIdentity.accountId,
     packetBytes: capturedHandshakePacket.toBytes(),
   });
-  return alicePeerLinks;
+  return { alicePeerLinks, bobPeerLinks };
 }
 
 test("_triggerRehandshake drives the real SDK requestRehandshake and dispatches an x3dh.rehandshake.v1 request to the peer", async () => {
@@ -182,7 +182,7 @@ test("_triggerRehandshake drives the real SDK requestRehandshake and dispatches 
   const bobInboxId = "inbox:bob-rh";
   const getInviteAuthority = makeAuthorityProvider([aliceIdentity.accountId, bobIdentity.accountId]);
 
-  const alicePeerLinks = await establishInviterToAcceptor({
+  const { alicePeerLinks } = await establishInviterToAcceptor({
     aliceIdentity, bobIdentity, aliceInboxId, bobInboxId, getInviteAuthority,
   });
 
@@ -255,4 +255,78 @@ test("_triggerRehandshake is a safe no-op when the peer has no resolvable inbox"
     senderInboxId: "inbox:alice-solo",
   });
   assert.equal(dispatched.length, 0, "no request dispatched for an unknown peer");
+});
+
+// Regression (v0.4.11): the re-handshake RESPONSE send dispatched the handshake
+// PACKET RECORD as object.payloadBytes instead of its raw bytes. MeshCapability
+// rejects a non-Uint8Array payload ("requires object.payloadBytes (Uint8Array)"),
+// so handleIncomingRehandshake's response NEVER reached the requester — a
+// desynced DM could not self-heal and looped re-handshakes forever. The earlier
+// trigger test only covered the REQUEST; the broken RESPONSE path slipped through
+// because handleIncomingRehandshake returns an E2eeHandshakePacketV1 record (not
+// bytes) and the dispatch site omitted .toBytes(). This drives the REAL SDK end
+// to end: Bob receives Alice's real x3dh.rehandshake.v1 via processDeposit and
+// must dispatch a Uint8Array x3dh.handshake.v2 response back to Alice's inbox.
+test("processDeposit of an x3dh.rehandshake.v1 dispatches a Uint8Array handshake.v2 response to the requester", async () => {
+  const aliceIdentity = createSessionIdentity();
+  const bobIdentity = createSessionIdentity();
+  const aliceInboxId = "inbox:alice-rhresp";
+  const bobInboxId = "inbox:bob-rhresp";
+  const getInviteAuthority = makeAuthorityProvider([aliceIdentity.accountId, bobIdentity.accountId]);
+
+  const { alicePeerLinks, bobPeerLinks } = await establishInviterToAcceptor({
+    aliceIdentity, bobIdentity, aliceInboxId, bobInboxId, getInviteAuthority,
+  });
+
+  // Alice builds a REAL re-handshake request addressed to Bob (carries Alice's
+  // fresh pre-key bundle + reply inbox). These are the exact bytes Bob receives.
+  const request = await alicePeerLinks.requestRehandshake({
+    ownerAccountId: aliceIdentity.accountId,
+    peerAccountId: bobIdentity.accountId,
+    senderInboxId: aliceInboxId,
+  });
+  const requestBytes = request.rehandshakeRecord.toBytes();
+
+  // Bob's protocol service, with the REAL Bob PeerLinkService behind it.
+  const dispatched = [];
+  const fakeSdk = {
+    mesh: {
+      async dispatch(object, address) { dispatched.push({ object, address }); },
+    },
+    getIdentity: () => ({ localInboxId: bobInboxId }),
+  };
+  const bus = makeFakeBus({ runtime: { peerLinks: bobPeerLinks, sdk: fakeSdk } });
+  const bobProtocol = new ServerPeerLinkProtocolService({
+    bus,
+    ownerAccountId: bobIdentity.accountId,
+    logger: { log() {}, info() {}, warn() {}, error() {} },
+  });
+
+  const outcome = await bobProtocol.processDeposit({
+    body: {
+      ciphertextB64: bytesToBase64(requestBytes),
+      mailboxId: bobInboxId,
+      eventId: "evt:rhreq:1",
+    },
+  });
+
+  assert.ok(outcome && outcome.consumed === true, "the re-handshake request is consumed");
+  assert.equal(dispatched.length, 1, "exactly one re-handshake response dispatched");
+  const payload = dispatched[0].object.payloadBytes;
+  assert.ok(payload instanceof Uint8Array, "response payloadBytes is raw Uint8Array, not a packet record");
+  const wire = JSON.parse(new TextDecoder().decode(payload));
+  assert.equal(wire.e2ee, 1);
+  assert.equal(wire.type, "x3dh.handshake.v2", "dispatched the handshake RESPONSE wire type");
+  assert.ok(wire.handshake && typeof wire.handshake === "object", "carries a handshake body");
+  assert.equal(
+    wire.handshake.rehandshakeRequestId,
+    request.rehandshakeRecord.requestId,
+    "response is tagged with the originating requestId so Alice routes it to handleRehandshakeResponse",
+  );
+
+  // Bob's peer-link to Alice advanced to a freshly-established session.
+  const links = await bobPeerLinks.listPeerLinks({ ownerAccountId: bobIdentity.accountId });
+  const aliceLink = links.items.find((it) => it.peerAccountId === aliceIdentity.accountId);
+  assert.ok(aliceLink, "Bob still holds a peer-link to Alice");
+  assert.equal(aliceLink.state, "session_established", "Bob's link advanced to session_established");
 });
