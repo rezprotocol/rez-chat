@@ -667,12 +667,22 @@ export class ServerMessagesService extends BaseServerService {
         sealed.address,
       ))),
     );
+    // Sender-side recovery: a message handed to the mesh for a co-member is now
+    // expected to come back as an end-to-end delivery-ack. Record it per recipient
+    // so a peer whose link is desynced (never acks) gets re-invited. The recipient
+    // is known EXACTLY here (the send side), which the opaque recipient-side path
+    // can't do for a node with multiple peer-links. See ServerPeerLinkProtocolService.
+    const peerLinkProtocol = this.bus.services && this.bus.services.peerLinkProtocol
+      ? this.bus.services.peerLinkProtocol
+      : null;
     let sentCount = 0;
     let failedCount = 0;
     let skippedCount = 0;
     let queuedCount = 0;
     const queuedInboxIds = [];
-    for (const result of results) {
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const target = targets[i];
       if (result.status === "fulfilled") {
         // A queued resolution means the node persisted the deposit into
         // PersistentOutboundQueue but couldn't synchronously route. Count
@@ -685,6 +695,11 @@ export class ServerMessagesService extends BaseServerService {
           }
         } else {
           sentCount++;
+        }
+        // Sent or queued — both reach the relay buffer and warrant an ack.
+        if (peerLinkProtocol && typeof peerLinkProtocol.recordOutboundGroupMessage === "function"
+            && target && typeof target.accountId === "string") {
+          peerLinkProtocol.recordOutboundGroupMessage({ peerAccountId: target.accountId });
         }
         continue;
       }

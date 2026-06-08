@@ -23,6 +23,24 @@ const RECOVERY_INVITE_TTL_MS = 5 * 60 * 1000;
 // new e2ee packet type. Recovery reuses the proven invite/accept path verbatim.
 const RECOVERY_INVITE_KIND = "rez.peerlink.recovery-invite.v1";
 
+// SENDER-SIDE recovery detection (the multi-peer-link healing path). An inbound
+// E2EE packet is opaque — it carries no sender identity — so the recipient
+// cannot attribute an undecryptable message to a specific link when it holds
+// more than one (every idle link looks equally guilty; that ambiguity is why a
+// real group with several contacts never healed via the decrypt-miss trigger).
+// The SENDER, however, knows EXACTLY who it fanned a group message out to. So we
+// also detect a broken link from the send side: every outbound group message to
+// a co-member is expected to come back as a delivery-ack (the recipient auto-acks
+// any message it decrypts). A co-member whose link to us is desynced can never
+// ack, so its unacked count grows monotonically; a healthy member acks and resets
+// to zero. When a peer accrues SENDER_RECOVERY_UNACKED_THRESHOLD unacked group
+// sends AND none has been acked for SENDER_RECOVERY_UNACKED_TIMEOUT_MS, we
+// re-invite THAT peer — exact attribution, no collateral re-key of healthy links.
+// Reuses _triggerRecoveryInvite (+ its per-peer cooldown) verbatim; only the
+// TRIGGER moves to where the sender identity is known for free.
+const SENDER_RECOVERY_UNACKED_THRESHOLD = 3;
+const SENDER_RECOVERY_UNACKED_TIMEOUT_MS = 45_000;
+
 /**
  * ServerPeerLinkProtocolService — chat-server-side handler for peer-link
  * protocol messages flowing over mailbox deposits (Shape A).
@@ -49,6 +67,12 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
   // peerAccountId -> last recovery-invite trigger time (ms). Synchronous burst
   // gate AND the glare "outstanding invite" marker; see the consts above.
   #recoveryInviteAtMsByPeer = new Map();
+  // peerAccountId -> { count, firstAtMs } outbound group messages awaiting an
+  // end-to-end delivery-ack. Reset to empty on ANY ack from that peer (a single
+  // ack proves the us->peer direction works now); a peer that never acks crosses
+  // the threshold and gets re-invited. The single source of sender-side desync
+  // evidence; see SENDER_RECOVERY_* consts above.
+  #outstandingGroupSendsByPeer = new Map();
 
   constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
@@ -282,6 +306,10 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         if (inner && inner.kind === "rez.delivery.ack"
             && typeof inner.senderAccountId === "string"
             && Array.isArray(inner.messageIds)) {
+          // A delivery-ack proves THIS peer decrypted a message we sent — the
+          // us->peer direction is healthy right now. Clear its unacked tally so
+          // sender-side recovery never re-invites a live link.
+          this._noteDeliveryAckReceived(inner.senderAccountId);
           this._emit("delivery.ack", {
             senderAccountId: inner.senderAccountId,
             messageIds: inner.messageIds,
@@ -479,6 +507,54 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       },
       buildInboxAddress({ inboxId: deliverInboxId }),
     );
+  }
+
+  // Record that we fanned an outbound GROUP message out to a co-member and now
+  // expect an end-to-end delivery-ack from them. Called once per delivered
+  // recipient by ServerMessagesService#sendGroupFanOut. A peer that never acks
+  // accrues unacked sends until sender-side recovery re-invites it (exact
+  // attribution — we KNOW who we sent to, unlike the opaque recipient-side path).
+  // Synchronous bookkeeping; also sweeps so an actively-sending user heals fast.
+  recordOutboundGroupMessage({ peerAccountId } = {}) {
+    const remote = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
+    if (!remote || remote === this.ownerAccountId) return;
+    const nowMs = this.#clock();
+    const entry = this.#outstandingGroupSendsByPeer.get(remote);
+    if (entry) {
+      entry.count += 1;
+    } else {
+      this.#outstandingGroupSendsByPeer.set(remote, { count: 1, firstAtMs: nowMs });
+    }
+    this._sweepStaleDeliveries();
+  }
+
+  // Clear a peer's unacked tally — a delivery-ack from them proves the us->peer
+  // direction is healthy. Also sweeps the rest: acks flowing from healthy members
+  // give the sweep cadence even when WE have stopped sending into a dead group.
+  // Protected (not private) as a test seam, mirroring _triggerRecoveryInvite.
+  _noteDeliveryAckReceived(peerAccountId) {
+    const remote = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
+    if (!remote) return;
+    this.#outstandingGroupSendsByPeer.delete(remote);
+    this._sweepStaleDeliveries();
+  }
+
+  // Re-invite every co-member whose link looks desynced from the SEND side:
+  // SENDER_RECOVERY_UNACKED_THRESHOLD+ outbound group messages with no ack for
+  // SENDER_RECOVERY_UNACKED_TIMEOUT_MS. Resets the peer's window after triggering
+  // (a fresh re-invite needs fresh evidence); _triggerRecoveryInvite's own 30s
+  // per-peer cooldown spaces retries while a re-invite is in flight. Public for
+  // direct test drive; otherwise invoked on every send and every inbound ack.
+  _sweepStaleDeliveries() {
+    const nowMs = this.#clock();
+    for (const [peerAccountId, entry] of [...this.#outstandingGroupSendsByPeer.entries()]) {
+      if (!entry || entry.count < SENDER_RECOVERY_UNACKED_THRESHOLD) continue;
+      if (nowMs - entry.firstAtMs < SENDER_RECOVERY_UNACKED_TIMEOUT_MS) continue;
+      // Fresh window so we don't immediately re-evaluate the same peer; the next
+      // unacked sends rebuild evidence if this recovery attempt doesn't take.
+      this.#outstandingGroupSendsByPeer.set(peerAccountId, { count: 0, firstAtMs: nowMs });
+      this._triggerRecoveryInvite({ peerAccountId });
+    }
   }
 
   // Accept an inbound recovery invite: glare tiebreak + authz gate, then reuse
