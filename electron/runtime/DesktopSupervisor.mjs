@@ -244,6 +244,7 @@ export class DesktopSupervisor {
   async connect() {
     this.#requireUnlocked();
     let chatAppChanged = false;
+    let chatServerStarted = false;
     if (!this.#chatApp) {
       if (!this.#startRezChat) {
         return this.#runtimeSummary();
@@ -275,11 +276,15 @@ export class DesktopSupervisor {
         chatServerIdentity,
         allowChatServerIdentityRotation: true,
       });
+      chatServerStarted = true;
     }
     if (!this.#busBridge) {
       this.#busBridge = new DesktopBusBridge({ chatApp: this.#chatApp });
     }
-    if (chatAppChanged) this.#notifyChatAppListeners();
+    // Notify when the chatApp is new OR the chat-server was (re)started on an
+    // existing chatApp (logout→login): consumers like the tray badge bind to
+    // chatApp.chatServer, so a fresh server instance needs a rebind.
+    if (chatAppChanged || chatServerStarted) this.#notifyChatAppListeners();
     return this.#runtimeSummary();
   }
 

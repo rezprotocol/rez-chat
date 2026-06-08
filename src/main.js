@@ -54,6 +54,13 @@ const desktopBridge = window && window.rezDesktop && window.rezDesktop.runtime
   ? window.rezDesktop
   : null;
 
+// On macOS the native title bar is hidden (main.mjs), so the window controls
+// overlap the top-left of the content. Tag the document so CSS can reserve a
+// drag strip / clearance for the traffic lights only on that platform.
+if (window && window.rezDesktop && window.rezDesktop.platform === "darwin") {
+  document.documentElement.classList.add("desktop-mac");
+}
+
 const sdkFactory = ({ account } = {}) => new ChatRuntimeClient({
   wsUrl,
   accountId: account && account.accountId ? String(account.accountId).trim() : null,

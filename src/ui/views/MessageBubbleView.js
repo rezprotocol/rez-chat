@@ -316,7 +316,7 @@ export class MessageBubbleView extends BusComponent {
         bubbleChildren.push(h("p", { className: "text-body-base italic text-on-primary/60 break-words", "data-testid": "message.tombstoned" }, "[deleted]"));
       } else if (text) {
         bubbleChildren.push(h("p", {
-          className: "text-body-base font-medium text-white break-words",
+          className: "text-body-base font-medium text-white break-words [overflow-wrap:anywhere]",
           "data-testid": "message.text",
         }, buildLinkifiedChildren(text, { anchorClass: "underline underline-offset-2 break-all text-white" })));
       }
@@ -325,8 +325,8 @@ export class MessageBubbleView extends BusComponent {
       }
       const bubbleEl = h("div", {
         className: isTombstoned
-          ? "p-4 rounded-2xl rounded-br-none bg-surface-container/60 border border-outline-variant/30 text-on-surface-variant relative overflow-hidden"
-          : "chat-bubble-out p-4 rounded-2xl rounded-br-none text-white relative overflow-hidden",
+          ? "p-4 rounded-2xl rounded-br-none bg-surface-container/60 border border-outline-variant/30 text-on-surface-variant relative overflow-hidden max-w-full min-w-0"
+          : "chat-bubble-out p-4 rounded-2xl rounded-br-none text-white relative overflow-hidden max-w-full min-w-0",
         "data-testid": "message.bubble",
         "data-message-mine": "true",
         "data-message-tombstoned": isTombstoned ? "true" : "false",
@@ -377,7 +377,7 @@ export class MessageBubbleView extends BusComponent {
       otherBubbleChildren.push(h("p", { className: "text-body-base italic text-on-surface-variant/60 break-words", "data-testid": "message.tombstoned" }, "[deleted]"));
     } else if (text) {
       otherBubbleChildren.push(h("p", {
-        className: "text-body-base text-on-surface break-words",
+        className: "text-body-base text-on-surface break-words [overflow-wrap:anywhere]",
         "data-testid": "message.text",
       }, buildLinkifiedChildren(text, { anchorClass: "underline underline-offset-2 break-all text-primary" })));
     }
@@ -386,8 +386,8 @@ export class MessageBubbleView extends BusComponent {
     }
     const otherBubbleEl = h("div", {
       className: isTombstoned
-        ? "p-4 rounded-2xl rounded-bl-none bg-surface-container/60 border border-outline-variant/30 text-on-surface-variant relative overflow-hidden"
-        : "chat-bubble-in p-4 rounded-2xl rounded-bl-none relative overflow-hidden",
+        ? "p-4 rounded-2xl rounded-bl-none bg-surface-container/60 border border-outline-variant/30 text-on-surface-variant relative overflow-hidden max-w-full min-w-0"
+        : "chat-bubble-in p-4 rounded-2xl rounded-bl-none relative overflow-hidden max-w-full min-w-0",
       "data-testid": "message.bubble",
       "data-message-mine": "false",
       "data-message-tombstoned": isTombstoned ? "true" : "false",

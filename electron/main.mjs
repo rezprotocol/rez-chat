@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { scrypt } from "node:crypto";
 import { promisify } from "node:util";
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell, screen, systemPreferences } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell, screen, systemPreferences, Notification } from "electron";
 import { NodeCryptoProvider } from "@rezprotocol/node";
 import { startRezChat } from "../src/index.js";
 import { DesktopVaultService } from "./runtime/DesktopVaultService.mjs";
@@ -57,15 +57,28 @@ const SPLASH_LOGO_PATH = app.isPackaged
   : path.resolve(CHAT_ROOT, "..", "rez-ui", "branding", "filled-silhouette", "rez-icon-full-transparent-filled.png");
 // Cap how far we look for unread when summing — must be >= ChatThreadIndex MAX_INDEX_SIZE.
 const UNREAD_SUM_LIMIT = 500;
+// Backstop poll cadence for the unread badge. Incremental thread.index.updated
+// events are best-effort in this stack (the renderer keeps its own reconcile
+// safety net for the same reason — see ThreadsService's session-connect
+// refetch); a missed event would otherwise freeze the badge after the first
+// change. A cheap periodic recompute guarantees convergence regardless.
+const TRAY_UNREAD_POLL_MS = 10000;
 
-async function recomputeUnreadAndUpdateTray(app) {
+// The unread total and its change events live on the chat-server
+// (ChatServerApp), which the chatApp exposes lazily via `chatApp.chatServer` —
+// null until startChatServer() completes, and null again after logout. The
+// chatApp itself has neither `on` nor `threadIndex`, so binding the tray to it
+// directly always fell through to setUnreadCount(0) and never subscribed; that
+// is why the dock/tray badge never updated. Resolve the server every call.
+async function recomputeUnreadAndUpdateTray(chatApp) {
   if (!desktopTray) return;
-  if (!app || !app.threadIndex || typeof app.threadIndex.listThreadIndex !== "function") {
+  const server = chatApp && chatApp.chatServer ? chatApp.chatServer : null;
+  if (!server || !server.threadIndex || typeof server.threadIndex.listThreadIndex !== "function") {
     desktopTray.setUnreadCount(0);
     return;
   }
   try {
-    const result = await app.threadIndex.listThreadIndex({ limit: UNREAD_SUM_LIMIT });
+    const result = await server.threadIndex.listThreadIndex({ limit: UNREAD_SUM_LIMIT });
     const threads = result && Array.isArray(result.threads) ? result.threads : [];
     let total = 0;
     for (const entry of threads) {
@@ -78,17 +91,27 @@ async function recomputeUnreadAndUpdateTray(app) {
   }
 }
 
-function bindTrayToChatApp(app) {
+function bindTrayToChatApp(chatApp) {
   if (!desktopTray) return () => {};
-  if (!app || typeof app.on !== "function") {
+  const server = chatApp && chatApp.chatServer ? chatApp.chatServer : null;
+  if (!server || typeof server.on !== "function") {
     desktopTray.setUnreadCount(0);
     return () => {};
   }
-  recomputeUnreadAndUpdateTray(app);
-  const off = app.on("thread.index.updated", () => {
-    recomputeUnreadAndUpdateTray(app);
+  recomputeUnreadAndUpdateTray(chatApp);
+  const off = server.on("thread.index.updated", () => {
+    recomputeUnreadAndUpdateTray(chatApp);
   });
-  return typeof off === "function" ? off : () => {};
+  // Backstop the event subscription (see TRAY_UNREAD_POLL_MS): the event path
+  // gives instant updates in the common case; this guarantees the badge can't
+  // get stuck if an event is missed. unref() so a pending tick never holds the
+  // process open at quit.
+  const pollTimer = setInterval(() => recomputeUnreadAndUpdateTray(chatApp), TRAY_UNREAD_POLL_MS);
+  if (pollTimer && typeof pollTimer.unref === "function") pollTimer.unref();
+  return () => {
+    if (typeof off === "function") off();
+    clearInterval(pollTimer);
+  };
 }
 
 function resolveUserDataOverride() {
@@ -512,7 +535,12 @@ function createMainWindow(shellUrl) {
     show: false,
     autoHideMenuBar: true,
     title: "Rez Chat",
-    titleBarStyle: "default",
+    // macOS: hide the native title bar so the window controls (traffic lights)
+    // sit inside the app content. The window stays non-frameless, so native
+    // resizing and the traffic-light buttons keep working; dragging is handled
+    // by the renderer's `titlebar-drag` regions. Other platforms keep their
+    // native frame (a hidden frame there would remove the window controls).
+    titleBarStyle: process.platform === "darwin" ? "hidden" : "default",
     webPreferences: {
       preload: app.isPackaged
             ? path.resolve(__dirname, "preload.cjs").replace("app.asar", "app.asar.unpacked")
@@ -569,6 +597,47 @@ function createMainWindow(shellUrl) {
     setTimeout(done, 8000);
     mainWindow.loadURL(shellUrl);
   });
+}
+
+// Tracks whether the first-run notification-authorization prompt has already
+// run in THIS process, so multiple startup paths can't double-fire it before
+// the on-disk marker is written.
+let notificationAuthorizationBootstrapped = false;
+
+// macOS only: the system shows its "<app> would like to send you notifications"
+// authorization prompt the first time the app POSTS a notification. Our renderer
+// NotificationService only posts when the window is unfocused, so on a fresh
+// install the prompt never appears during normal first-run (the user is looking
+// at the app), the bundle stays unauthorized, and BOTH desktop alerts and the
+// dock unread badge are silently suppressed — the badge is gated by the same
+// Notifications setting. Post one welcome notification, once per profile, while
+// the main window is visible so the prompt surfaces at a moment the user can act
+// on it. Authorization is per-bundle-id, so granting it here also authorizes the
+// renderer's notifications. No-op on non-macOS platforms and after the first run.
+function bootstrapNotificationAuthorization() {
+  if (process.platform !== "darwin") return;
+  if (notificationAuthorizationBootstrapped) return;
+  if (!Notification.isSupported()) return;
+  const markerPath = path.join(app.getPath("userData"), "notification-onboarding.json");
+  if (fs.existsSync(markerPath)) {
+    notificationAuthorizationBootstrapped = true;
+    return;
+  }
+  notificationAuthorizationBootstrapped = true;
+  const welcome = new Notification({
+    title: "Rez Chat",
+    body: "Notifications are on. You'll be alerted to new messages and invites while Rez runs in the background.",
+    silent: true,
+  });
+  welcome.show();
+  try {
+    fs.writeFileSync(markerPath, JSON.stringify({ prompted: true }), { encoding: "utf8" });
+  } catch (err) {
+    // Non-fatal: if the marker can't be written we simply re-prompt next launch,
+    // which macOS coalesces (it won't re-ask once the user has decided).
+    console.warn("[rez-chat:desktop] failed to persist notification onboarding marker",
+      err && err.message ? err.message : err);
+  }
 }
 
 async function startDesktop() {
@@ -645,6 +714,12 @@ async function startDesktop() {
       desktopTray = new DesktopTray({
         iconPath: TRAY_ICON_PATH,
         getWindow: () => mainWindow,
+        onCheckForUpdates: () => {
+          if (!desktopUpdater) return;
+          desktopUpdater.checkNow().catch((err) => {
+            console.warn("[rez-chat:desktop] tray check-for-updates failed", err && err.message ? err.message : err);
+          });
+        },
       });
     } catch (err) {
       console.warn("[rez-chat:desktop] failed to create tray icon", err && err.message ? err.message : err);
@@ -702,6 +777,10 @@ async function startDesktop() {
     // Periodic background update checks for the long-running session (the
     // in-app "update downloaded — restart" banner flow).
     desktopUpdater.start();
+    // First-run only: surface the macOS notification authorization prompt now
+    // that the main window is visible, so desktop alerts — and the dock unread
+    // badge, which the same Notifications setting gates — can be granted.
+    bootstrapNotificationAuthorization();
   }
 }
 

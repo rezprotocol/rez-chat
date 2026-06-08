@@ -123,7 +123,7 @@ export class SidebarNavView extends BusComponent {
     const bottom = h("div", { className: "mt-auto pb-space-lg" }, [this.#avatarBtnEl]);
 
     const rail = h("nav", {
-      className: "flex flex-col items-center py-space-lg gap-space-xl w-sidebar-width h-full border-r border-outline-variant/30 backdrop-blur-xl bg-surface-dim/80",
+      className: "titlebar-rail-inset flex flex-col items-center py-space-lg gap-space-xl w-sidebar-width h-full border-r border-outline-variant/30 backdrop-blur-xl bg-surface-dim/80",
     }, [wordmark, this.#navEl, bottom]);
 
     this._rootEl.replaceChildren(rail);

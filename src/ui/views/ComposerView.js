@@ -1,6 +1,7 @@
 import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { materialIcon } from "../base/icon.js";
+import { EmojiPickerView } from "./EmojiPickerView.js";
 
 const TEXTAREA_MAX_HEIGHT_PX = 200;
 
@@ -45,6 +46,8 @@ export class ComposerView extends BusComponent {
   #errorEl;
   #formEl;
   #attachBtnEl;
+  #moodBtnEl;
+  #emojiPicker;
   #previewRowEl;
   #replyChipEl;
   #threadId;
@@ -60,6 +63,8 @@ export class ComposerView extends BusComponent {
     this.#errorEl = null;
     this.#formEl = null;
     this.#attachBtnEl = null;
+    this.#moodBtnEl = null;
+    this.#emojiPicker = null;
     this.#previewRowEl = null;
     this.#replyChipEl = null;
     this.#threadId = "";
@@ -111,6 +116,10 @@ export class ComposerView extends BusComponent {
     if (typeof this.#replyDraftOff === "function") {
       this.#replyDraftOff();
       this.#replyDraftOff = null;
+    }
+    if (this.#emojiPicker) {
+      this.#emojiPicker.destroy();
+      this.#emojiPicker = null;
     }
     super.unmount();
   }
@@ -178,6 +187,11 @@ export class ComposerView extends BusComponent {
   #buildForm(threadId) {
     this.#threadId = threadId || "";
 
+    if (this.#emojiPicker) {
+      this.#emojiPicker.destroy();
+      this.#emojiPicker = null;
+    }
+
     const input = h("textarea", {
       className: "flex-1 bg-transparent border-none focus:ring-0 focus:outline-none text-body-base font-body-base text-on-surface py-3 resize-none custom-scrollbar placeholder:text-outline-variant",
       placeholder: "Type a secure message...",
@@ -221,6 +235,18 @@ export class ComposerView extends BusComponent {
     const replyChip = h("div", { className: "hidden" });
     this.#replyChipEl = replyChip;
 
+    const emojiPicker = new EmojiPickerView({
+      onSelect: (emoji) => this.#insertEmoji(emoji),
+    });
+    this.#emojiPicker = emojiPicker;
+
+    moodBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (this.#inputEl && this.#inputEl.disabled) return;
+      emojiPicker.toggle(moodBtn);
+    });
+
     const form = h("div", {
       className: "input-tactile rounded-2xl border border-outline-variant/30 p-2 flex items-end gap-2 group focus-within:border-primary/40 transition-all",
     }, [attachBtn, input, moodBtn, sendBtn]);
@@ -233,6 +259,7 @@ export class ComposerView extends BusComponent {
       replyChip,
       previewRow,
       form,
+      emojiPicker.el,
       stateEl,
       errorEl,
       footnote,
@@ -244,6 +271,7 @@ export class ComposerView extends BusComponent {
     this.#errorEl = errorEl;
     this.#formEl = form;
     this.#attachBtnEl = attachBtn;
+    this.#moodBtnEl = moodBtn;
     this.#previewRowEl = previewRow;
 
     this._rootEl.replaceChildren(wrap);
@@ -254,6 +282,7 @@ export class ComposerView extends BusComponent {
       input.disabled = true;
       sendBtn.disabled = true;
       attachBtn.disabled = true;
+      moodBtn.disabled = true;
       this.#disabled = true;
       input.placeholder = "Select a conversation to send";
       return;
@@ -269,12 +298,28 @@ export class ComposerView extends BusComponent {
     this.#applyThreadState(this.#getThread(this.#threadId));
   }
 
+  #insertEmoji(emoji) {
+    const input = this.#inputEl;
+    if (!input || input.disabled) return;
+    const value = typeof input.value === "string" ? input.value : "";
+    const hasSelection = typeof input.selectionStart === "number" && typeof input.selectionEnd === "number";
+    const start = hasSelection ? input.selectionStart : value.length;
+    const end = hasSelection ? input.selectionEnd : value.length;
+    input.value = value.slice(0, start) + emoji + value.slice(end);
+    const caret = start + emoji.length;
+    input.selectionStart = caret;
+    input.selectionEnd = caret;
+    autoResize(input);
+    input.focus();
+  }
+
   #applyThreadState(thread) {
     const input = this.#inputEl;
     const sendBtn = this.#sendBtnEl;
     const stateEl = this.#stateEl;
     const form = this.#formEl;
     const attachBtn = this.#attachBtnEl;
+    const moodBtn = this.#moodBtnEl;
     if (!input || !sendBtn || !stateEl || !form || !attachBtn) return;
 
     const locked = String(thread && thread.accessState || "open").toLowerCase() === "locked";
@@ -286,6 +331,8 @@ export class ComposerView extends BusComponent {
     input.disabled = disabled;
     sendBtn.disabled = disabled;
     attachBtn.disabled = disabled;
+    if (moodBtn) moodBtn.disabled = disabled;
+    if (disabled && this.#emojiPicker) this.#emojiPicker.close();
     if (disabled) {
       input.placeholder = locked ? "Thread is locked" : !ready ? "Thread not ready" : "Sending disabled";
       stateEl.textContent = locked

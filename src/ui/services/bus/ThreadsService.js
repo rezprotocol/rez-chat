@@ -27,6 +27,9 @@ export class ThreadsService extends BaseBusService {
     this._register("threads", "delete", (payload) => this.deleteThread(payload));
     this._register("threads", "createDirect", (payload) => this.createDirect(payload));
     this._listen("runtime.event.thread.index.updated", (record) => this._handleThreadIndexUpdated(record));
+    // When the window regains focus while a conversation is open, the user is
+    // now actually looking at it — clear the unread that accrued while blurred.
+    this._listen("ui.visibility.changed", () => this.#onVisibilityRegained());
     const off = uiStateStore.onChange((evt) => {
       const type = evt && typeof evt.type === "string" ? evt.type : "";
       if (type === "ui.threadListFilter.changed") {
@@ -239,14 +242,18 @@ export class ThreadsService extends BaseBusService {
     const incomingByChannel = record && record.unreadByChannelId && typeof record.unreadByChannelId === "object"
       ? record.unreadByChannelId
       : current.unreadByChannelId;
-    const selectedId = this.getSelectedId();
-    const isSelected = selectedId === id;
-    const activeChannelId = isSelected ? this.#activeChannelIdForThread(id) : "";
-    // When the thread is selected, the active channel is being viewed so its
-    // badge clears locally; other channels' badges remain.
+    // Treat the thread as actively read only when its conversation is open AND
+    // the window is focused + visible — the same blur gate desktop alerts use
+    // (NotificationService). A message arriving while blurred accrues unread
+    // (and badges) even if its conversation is the open one, so the dock badge
+    // and the desktop alert agree.
+    const isActivelyViewing = this.getSelectedId() === id && this.#isAppFocused();
+    const activeChannelId = isActivelyViewing ? this.#activeChannelIdForThread(id) : "";
+    // When actively viewing, the active channel is on screen so its badge
+    // clears locally; other channels' badges remain.
     let displayByChannel = incomingByChannel;
     let displayUnread = incomingUnread;
-    if (isSelected) {
+    if (isActivelyViewing) {
       const next = { ...(incomingByChannel || {}) };
       const dropped = Number(next[activeChannelId] || 0);
       delete next[activeChannelId];
@@ -261,11 +268,33 @@ export class ThreadsService extends BaseBusService {
       unreadByChannelId: displayByChannel,
     }));
     this.bus.emit("threads.updated", { threadId: id });
-    if (isSelected && Number(incomingByChannel && incomingByChannel[activeChannelId] || 0) > 0) {
+    if (isActivelyViewing && Number(incomingByChannel && incomingByChannel[activeChannelId] || 0) > 0) {
       this.markChannelRead({ threadId: id, channelId: activeChannelId }).catch((err) => {
         console.error("[ThreadsService] auto mark-channel-read failed", err);
         this.bus.emit("app.error", { source: "ThreadsService", message: "auto mark-channel-read failed", severity: "info", err });
       });
     }
+  }
+
+  // Mirrors NotificationService's blur gate so the unread badge and desktop
+  // alerts agree on what counts as "seen". Defaults to focused when no uiState
+  // snapshot is available (preserves prior always-read behavior in tests).
+  #isAppFocused() {
+    if (!this._uiStateStore || typeof this._uiStateStore.snapshot !== "function") return true;
+    const snap = this._uiStateStore.snapshot();
+    return snap.focused === true && snap.visible === true;
+  }
+
+  #onVisibilityRegained() {
+    if (!this.#isAppFocused()) return;
+    const id = this.getSelectedId();
+    if (!id) return;
+    const thread = this._threadStore.getThread(id);
+    if (!thread || Number(thread.unreadCount || 0) <= 0) return;
+    const activeChannelId = this.#activeChannelIdForThread(id);
+    this.markChannelRead({ threadId: id, channelId: activeChannelId }).catch((err) => {
+      console.error("[ThreadsService] focus-regain mark-channel-read failed", err);
+      this.bus.emit("app.error", { source: "ThreadsService", message: "focus-regain mark-channel-read failed", severity: "info", err });
+    });
   }
 }

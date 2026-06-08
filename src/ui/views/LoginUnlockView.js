@@ -228,6 +228,7 @@ export class LoginUnlockView extends BusComponent {
     const main = h("main", {
       className: "rez-app min-h-screen w-full flex items-center justify-center p-space-md relative overflow-hidden",
     }, [
+      h("div", { className: "titlebar-strip" }),
       h("div", { className: "fixed inset-0 pointer-events-none z-0" }, [
         h("div", { className: "absolute inset-0 bg-gradient-to-t from-black via-transparent to-transparent opacity-40" }),
         h("div", {

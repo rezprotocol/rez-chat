@@ -259,7 +259,7 @@ body {
   box-shadow: 0 0 20px rgba(0, 218, 243, 0.3);
 }
 
-/* Electron titlebar drag region (frameless window with hiddenInset) */
+/* Electron titlebar drag region (macOS hidden title bar) */
 .titlebar-drag {
   -webkit-app-region: drag;
 }
@@ -268,6 +268,30 @@ body {
 .titlebar-drag input,
 .titlebar-drag [data-no-drag] {
   -webkit-app-region: no-drag;
+}
+
+/* macOS only: a thin draggable strip across the very top of a screen that has
+ * no full-width drag header of its own (the login/create-account screens).
+ * Without it the window can't be moved while logged out. Inert everywhere
+ * else (display:none on web and non-mac, so it never intercepts clicks). */
+.titlebar-strip {
+  display: none;
+}
+.desktop-mac .titlebar-strip {
+  display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  z-index: 20;
+  -webkit-app-region: drag;
+}
+
+/* macOS only: keep the sidebar's top content clear of the traffic-light
+ * buttons that overlap the top-left of the window. */
+.desktop-mac .titlebar-rail-inset {
+  padding-top: 2.5rem;
 }
 
 /* Visible bottom-right resize affordance. The OS handles the actual resize
