@@ -221,6 +221,9 @@ export async function bootstrapChatServer({
     peerLinkService,
     inboxClaimant,
     expectedNodePublicKeyB64,
+    // REZ-2: same account-key authority used for invite envelopes, reused to
+    // sign + verify group membership-consent proofs.
+    accountAuthority: inviteAuthority,
     logger,
   });
 

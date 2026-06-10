@@ -24,6 +24,7 @@ import { InboundDepositPipeline } from "../src/server/runtime/InboundDepositPipe
 import { GROUP_OP_KIND } from "../src/records/payloads/GroupOpPayloadV1.js";
 import { MESSAGE_KIND } from "../src/records/payloads/ChatMessagePayloadV1.js";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
+import { permissiveAccountAuthority, testConsentProof } from "./support/memberConsentDouble.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -83,6 +84,7 @@ async function setupInviterServer() {
   });
   app.bus.runtime.sdk = sdk;
   app.bus.runtime.peerLinks = peerLinks;
+  app.bus.runtime.accountAuthority = permissiveAccountAuthority();
   await app.bus.services.threads.ensureGroupThread({ groupId: GROUP_ID, title: "Pipe", createdAtMs: 4000 });
   await app.bus.stores.groupStore.ensureMembership({
     ownerAccountId: INVITER, groupId: GROUP_ID, accountId: INVITER, role: "admin",
@@ -135,6 +137,7 @@ function joinInner() {
     accountId: JOINER,
     inviteId: INVITE_ID,
     displayName: "Bob",
+    ...testConsentProof(),
     actedAtMs: 6000,
     groupOpId: "gop_join_pipe",
   };

@@ -42,3 +42,7 @@ export { ProfileBroadcastParams } from "./ProfileBroadcastParams.js";
 export { ProfileGetOwnParams } from "./ProfileGetOwnParams.js";
 export { ThreadCreateDirectParams } from "./ThreadCreateDirectParams.js";
 export { LinksUnfurlParams } from "./LinksUnfurlParams.js";
+export { ContactsRequestConnectParams } from "./ContactsRequestConnectParams.js";
+export { ContactsApproveConnectParams } from "./ContactsApproveConnectParams.js";
+export { ContactsDenyConnectParams } from "./ContactsDenyConnectParams.js";
+export { ContactsListConnectRequestsParams } from "./ContactsListConnectRequestsParams.js";

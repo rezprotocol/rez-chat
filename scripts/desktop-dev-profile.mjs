@@ -26,6 +26,14 @@ const PROFILE_DEFAULTS = Object.freeze({
     windowWidth: 680,
     windowHeight: 820,
   }),
+  carol: Object.freeze({
+    desktopPort: 3430,
+    nodeWsPort: 8789,
+    windowX: 380,
+    windowY: 520,
+    windowWidth: 680,
+    windowHeight: 820,
+  }),
 });
 
 export function listDesktopProfiles() {
@@ -195,21 +203,25 @@ function prefixStream(stream, prefix, target, fileStream) {
 }
 
 function printHelp() {
-  console.log(`Usage: node scripts/desktop-dev-profile.mjs <alice|bob>
+  console.log(`Usage: node scripts/desktop-dev-profile.mjs <alice|bob|carol>
 
 Environment overrides:
   REZ_CHAT_DESKTOP_PROFILE_ROOT       Base dir for profiles (default: rez-chat/.local/desktop-profiles)
   REZ_CHAT_USER_DATA_DIR              User-data dir for one manually launched profile
   REZ_CHAT_ALICE_USER_DATA_DIR        Alice user-data dir
   REZ_CHAT_BOB_USER_DATA_DIR          Bob user-data dir
+  REZ_CHAT_CAROL_USER_DATA_DIR        Carol user-data dir
   REZ_CHAT_ALICE_DESKTOP_PORT         Alice shell port (default: 3410)
   REZ_CHAT_BOB_DESKTOP_PORT           Bob shell port (default: 3420)
+  REZ_CHAT_CAROL_DESKTOP_PORT         Carol shell port (default: 3430)
   REZ_CHAT_ALICE_NODE_WS_PORT         Alice embedded node WS port (default: 8787)
   REZ_CHAT_BOB_NODE_WS_PORT           Bob embedded node WS port (default: 8788)
+  REZ_CHAT_CAROL_NODE_WS_PORT         Carol embedded node WS port (default: 8789)
   REZ_CHAT_WINDOW_X/Y                 Window position for one manually launched profile
   REZ_CHAT_WINDOW_WIDTH/HEIGHT        Window size for one manually launched profile
   REZ_CHAT_ALICE_WINDOW_X/Y           Alice window position (default: 24,48)
   REZ_CHAT_BOB_WINDOW_X/Y             Bob window position (default: 736,48)
+  REZ_CHAT_CAROL_WINDOW_X/Y           Carol window position (default: 380,520)
 `);
 }
 
@@ -222,8 +234,8 @@ async function main() {
 
   await prepareElectronNativeModules();
   // prefix:true so a single-profile launch also tees its full log to
-  // <userDataDir>/run.log — needed to capture an offline-accept run where alice
-  // and bob are launched in separate terminals (so one can be quit independently).
+  // <userDataDir>/run.log — needed to capture an offline-accept run where the
+  // profiles are launched in separate terminals (so one can be quit independently).
   const { profile, child } = launchDesktopProfile(arg, { prefix: true });
   console.log("[desktop:" + profile.name + "] userData " + profile.userDataDir);
   console.log("[desktop:" + profile.name + "] run.log " + path.join(profile.userDataDir, "run.log"));

@@ -1,9 +1,12 @@
 import { Hash } from "@rezprotocol/sdk/hash";
-import { IMAGE_KIND } from "../../records/payloads/index.js";
+import { IMAGE_KIND, SYSTEM_EVENT_KIND } from "../../records/payloads/index.js";
 import { nonEmptyString } from "../../records/domain/coerce.js";
 import {
   ChatThread,
   ThreadIndexUpdatedEvent,
+  ThreadUpdatedEvent,
+  ThreadRemovedEvent,
+  MessageDepositedEvent,
   ThreadGetResult,
   ThreadGetParams,
   ThreadReadParams,
@@ -85,6 +88,38 @@ export class ServerThreadsService extends BaseServerService {
     const b64 = Buffer.from(digest.subarray(0, 16)).toString("base64")
       .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
     return "th_" + b64;
+  }
+
+  /**
+   * Every direct (1:1) threadId whose STORED record names this peer. The
+   * threadId is derived from the peer-link id at creation time, but a peer's
+   * link can drift — recovery-via-reinvite replaces the peerLinkId, and old
+   * links fall out of the live peer-links list — so recomputing the id from
+   * the CURRENT links misses threads keyed to a since-replaced link. The
+   * stored record, by contrast, always carries the peerAccountId (every
+   * ensureDirectThread call sets it), so scanning records is the drift-proof
+   * way to find ALL of a peer's direct threads (used by the contact-delete
+   * cascade to avoid stranding orphans). Scans only existing storage records;
+   * orphaned index-only rows have no peerAccountId to match and are handled by
+   * deleteThread directly.
+   */
+  async listDirectThreadIdsForPeer(peerAccountId) {
+    const id = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
+    if (!id) return [];
+    const threadIds = await this.#threadStore.listThreadIds().catch(() => []);
+    const matches = [];
+    for (const raw of Array.isArray(threadIds) ? threadIds : []) {
+      const threadId = typeof raw === "string" ? raw.trim() : "";
+      if (!threadId) continue;
+      const record = await this.#threadStore.getThread(threadId).catch(() => null);
+      if (!record || typeof record !== "object") continue;
+      const type = String(record.threadType || "direct").trim().toLowerCase();
+      const peer = typeof record.peerAccountId === "string" ? record.peerAccountId.trim() : "";
+      if (type === THREAD_TYPES.DIRECT && peer === id) {
+        matches.push(threadId);
+      }
+    }
+    return matches;
   }
 
   extractPreviewText(data) {
@@ -181,6 +216,74 @@ export class ServerThreadsService extends BaseServerService {
     this._emit("runtime.event.thread.index.updated", record);
     this._emit("thread.index.updated", record);
     return record;
+  }
+
+  /**
+   * Persist the locally-derived "connect.accepted" system row into a direct
+   * thread (the 1:1 analog of #persistJoinSystemMessage for groups). SSOT for
+   * this row's shape + side effects: BOTH sides call it — the approver from
+   * approveConnectRequest, and the requester from handleIncomingConnectAccepted
+   * once the acceptance trigger resolves their thread — so the row, index bump,
+   * and live timeline append are identical on both ends.
+   *
+   * Idempotent by messageId (acceptor + actedAtMs), so a re-delivered trigger
+   * or a re-approve collapses onto the same row. Emits message.deposited so an
+   * open timeline appends it live, and bumps the thread index so it surfaces in
+   * the conversation list.
+   */
+  async persistConnectAcceptedSystemMessage({ threadId, acceptorAccountId, acceptorDisplayName = "", actedAtMs = null } = {}) {
+    const id = typeof threadId === "string" ? threadId.trim() : "";
+    const actor = typeof acceptorAccountId === "string" ? acceptorAccountId.trim() : "";
+    if (!id || !actor) return;
+    const ts = Number.isFinite(actedAtMs) ? actedAtMs : this.#clock();
+    const messageId = "sys:connaccept:" + actor + ":" + ts;
+    const payload = {
+      kind: SYSTEM_EVENT_KIND,
+      event: "connect.accepted",
+      actorAccountId: actor,
+      actorDisplayName: typeof acceptorDisplayName === "string" ? acceptorDisplayName : "",
+      actedAtMs: ts,
+    };
+    await this.#threadStore.upsertMessage({
+      messageId,
+      threadId: id,
+      senderAccountId: null,
+      senderKey: "system",
+      payload,
+      text: "",
+      status: "delivered",
+      createdAtMs: ts,
+      acceptedAtMs: ts,
+    }).catch((err) => {
+      this.logger.warn("[ServerThreadsService] connect-accepted system message persist failed",
+        err && err.message ? err.message : err);
+    });
+    const indexRecord = await this.#threadIndex.upsertFromMessage({
+      threadId: id,
+      messageId,
+      ts,
+      preview: null,
+    }).catch((err) => {
+      this.logger.warn("[ServerThreadsService] connect-accepted index upsert failed",
+        err && err.message ? err.message : err);
+      return null;
+    });
+    if (indexRecord) this.emitThreadIndexUpdated(indexRecord);
+    const deposited = new MessageDepositedEvent({
+      threadId: id,
+      message: {
+        messageId,
+        threadId: id,
+        senderAccountId: null,
+        text: "",
+        payload,
+        status: "delivered",
+        createdAtMs: ts,
+        acceptedAtMs: ts,
+      },
+    });
+    this._emit("runtime.event.message.deposited", deposited);
+    this._emit("message.deposited", deposited);
   }
 
   async #loadThreadSummary(threadId, providedThread = null, providedIndex = null) {
@@ -430,12 +533,28 @@ export class ServerThreadsService extends BaseServerService {
 
   async deleteThread(payload = {}) {
     const params = this._coerceParams(payload, ThreadDeleteParams);
-    const deleted = await this.#threadStore.deleteThread(params.threadId);
-    if (deleted) {
+    const recordDeleted = await this.#threadStore.deleteThread(params.threadId);
+    // Clear the conversation-list index row INDEPENDENTLY of the storage
+    // record. A thread can be orphaned — index row present but storage record
+    // already gone — e.g. an older partial teardown that removed the contact
+    // but not the thread. Such a row renders as a bare threadId and was
+    // previously undeletable: recordDeleted came back false, so we skipped
+    // both the index removal and the UI event, and the row stuck forever.
+    const indexRow = await this.#threadIndex.getIndexRecord({ threadId: params.threadId }).catch(() => null);
+    const hadIndexRow = !!indexRow;
+    if (hadIndexRow) {
       await this.#threadIndex.removeThread({ threadId: params.threadId }).catch((err) => {
         this.logger.error("[ServerThreadsService] index removal failed during delete", err && err.message ? err.message : err);
       });
-      this._emit("threads.updated", { threadId: params.threadId, deleted: true });
+    }
+    const deleted = recordDeleted || hadIndexRow;
+    if (deleted) {
+      // Authoritative removal event: the single signal every client store/view
+      // reacts to. Fires for BOTH the direct thread.delete RPC and the
+      // server-initiated cascade (contact delete tears down its DM threads) —
+      // the latter has no client RPC, so without this event the renderer never
+      // learns the thread is gone and it strands as a bare-id row.
+      this._emit("thread.removed", new ThreadRemovedEvent({ threadId: params.threadId }));
     }
     return new ThreadDeleteResult({
       threadId: params.threadId,
@@ -450,8 +569,14 @@ export class ServerThreadsService extends BaseServerService {
       visibilityState: params.visibilityState,
       accessState: params.accessState,
     });
-    return new ThreadStateSetResult({
-      thread: this.decorateThreadView(thread),
-    });
+    const view = this.decorateThreadView(thread);
+    // Archive/hide/lock is account-state, not just acting-device UI. Emit a
+    // bridged thread.updated so every connected client of this account reacts —
+    // today the acting renderer hand-patches, but a second device (multi-tenant
+    // node / mobile) shares this store and must learn via the event.
+    if (view) {
+      this._emit("thread.updated", new ThreadUpdatedEvent({ thread: view }));
+    }
+    return new ThreadStateSetResult({ thread: view });
   }
 }

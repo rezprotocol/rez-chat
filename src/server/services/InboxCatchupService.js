@@ -13,6 +13,16 @@ const DEFAULT_MAX_DECRYPT_ATTEMPTS = 8;
 // seconds-to-minutes) yet bounded — measured from first-failure so genuine
 // recovery of an old offline message still gets the full window.
 const DEFAULT_MAX_QUARANTINE_AGE_MS = 30 * 60 * 1000;
+// REZ-11: a deposit that has failed to decrypt MANY times is almost certainly
+// poison being rescanned on every reconnect (O(buffer) crypto/IO per reconnect on
+// a flaky link). Once it crosses this attempt threshold, hold it under a short
+// backoff so rapid reconnects stop re-decrypting the whole floor. Crucially the
+// threshold leaves the FIRST few retries unthrottled, so a genuine out-of-order
+// message (whose handshake/dependency just arrived) still recovers immediately —
+// only the persistent floor is throttled. The age/attempt quarantine bounds still
+// apply on the attempts that run, so nothing is ever permanently stranded.
+const DECRYPT_RETRY_BACKOFF_MS = 15 * 1000;
+const DECRYPT_BACKOFF_AFTER_ATTEMPTS = 3;
 
 /**
  * On chat-server start (and on every SDK transport reconnect), drain any mailbox
@@ -50,6 +60,9 @@ export class InboxCatchupService extends BaseServerService {
   #processedLog;
   #maxQuarantineAgeMs;
   #clock;
+  // REZ-11: eventId -> earliest ms at which a failed deposit may be re-attempted.
+  // In-memory (per session); bounded by the mailbox buffer cap and pruned on ack.
+  #decryptBackoffUntilMsByEvent = new Map();
 
   constructor({ bus, inboxClaimant, inboundPipeline, processedLog = null, pageLimit = DEFAULT_PAGE_LIMIT, maxDecryptAttempts = DEFAULT_MAX_DECRYPT_ATTEMPTS, maxQuarantineAgeMs = DEFAULT_MAX_QUARANTINE_AGE_MS, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, logger });
@@ -156,6 +169,13 @@ export class InboxCatchupService extends BaseServerService {
         const eventId = item && typeof item.eventId === "string" ? item.eventId : "";
         if (!eventId) continue;
         pageCursor = eventId;
+        // REZ-11: a deposit that failed to decrypt very recently is left buffered
+        // with a short backoff — don't re-fetch/re-decrypt it until the backoff
+        // elapses, so rapid reconnects don't re-scan the whole poison floor.
+        const backoffUntil = this.#decryptBackoffUntilMsByEvent.get(eventId);
+        if (typeof backoffUntil === "number" && this.#clock() < backoffUntil) {
+          continue;
+        }
         const fetched = await sdk.mailbox.fetch({ mailboxId, eventId });
         const ciphertextB64 = fetched && typeof fetched.ciphertextB64 === "string" ? fetched.ciphertextB64 : "";
         const frame = {
@@ -197,6 +217,9 @@ export class InboxCatchupService extends BaseServerService {
 
   // Remove a fully-consumed deposit from the relay buffer and prune its markers.
   async #ackAndForget(sdk, mailboxId, eventId) {
+    // REZ-11: this deposit is leaving the buffer (consumed or quarantined) — drop
+    // its retry-backoff marker so the map tracks only still-buffered deposits.
+    this.#decryptBackoffUntilMsByEvent.delete(eventId);
     try {
       await sdk.mailbox.ack({ mailboxId, eventId });
     } catch (err) {
@@ -261,6 +284,21 @@ export class InboxCatchupService extends BaseServerService {
         + " (" + (tooManyAttempts ? "attempt" : "age") + " bound)",
       );
       await this.#ackAndForget(sdk, mailboxId, eventId);
+      return;
+    }
+    // REZ-11: it's staying buffered. Once it has failed enough times to look like
+    // persistent poison (not a transient out-of-order miss), arm a short backoff
+    // so the next reconnect doesn't immediately re-fetch+re-decrypt it again. The
+    // first few retries are deliberately left unthrottled so genuine out-of-order
+    // recovery stays fast. The wall-clock age bound still advances while skipped,
+    // so nothing is permanently stranded.
+    if (attempts >= DECRYPT_BACKOFF_AFTER_ATTEMPTS) {
+      this.#decryptBackoffUntilMsByEvent.set(eventId, nowMs + DECRYPT_RETRY_BACKOFF_MS);
+      if (this.#decryptBackoffUntilMsByEvent.size > 16384) {
+        for (const [k, until] of this.#decryptBackoffUntilMsByEvent) {
+          if (nowMs >= until) this.#decryptBackoffUntilMsByEvent.delete(k);
+        }
+      }
     }
   }
 }

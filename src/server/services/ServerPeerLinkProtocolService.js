@@ -40,6 +40,20 @@ const RECOVERY_INVITE_KIND = "rez.peerlink.recovery-invite.v1";
 // TRIGGER moves to where the sender identity is known for free.
 const SENDER_RECOVERY_UNACKED_THRESHOLD = 3;
 const SENDER_RECOVERY_UNACKED_TIMEOUT_MS = 45_000;
+// REZ-4: ack-absence is not proof of desync — a relay can selectively drop the
+// E2EE delivery-acks. If we DECRYPTED a message from a peer within this window the
+// link is demonstrably alive in the receive direction, so sender-side recovery
+// must NOT re-key it (that churn is exactly what an ack-dropping relay would
+// weaponise). Mirrors the recipient-side HEALTHY_SESSION_DECRYPT_GUARD.
+const SENDER_RECOVERY_HEALTHY_GUARD_MS = 45_000;
+// REZ-5: global rate limit across ALL peers. The per-peer cooldown alone lets a
+// crafted member.contact fan-out (or an ack-drop campaign) mint N invites at once;
+// this caps the node's total recovery-invite output per rolling window.
+const RECOVERY_INVITE_GLOBAL_WINDOW_MS = 60_000;
+const RECOVERY_INVITE_GLOBAL_MAX = 30;
+// REZ-5: hard cap on the per-peer bookkeeping maps so a node that talks to many
+// distinct peers over its lifetime cannot leak unbounded memory.
+const RECOVERY_MAP_MAX_ENTRIES = 4096;
 
 /**
  * ServerPeerLinkProtocolService — chat-server-side handler for peer-link
@@ -73,6 +87,17 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
   // the threshold and gets re-invited. The single source of sender-side desync
   // evidence; see SENDER_RECOVERY_* consts above.
   #outstandingGroupSendsByPeer = new Map();
+  // REZ-1: peerAccountId -> last time we ACCEPTED an inbound recovery invite from
+  // them. Receive-side cooldown so an authorised peer cannot force unbounded
+  // re-keys of our live session (the outbound cooldown only gates invites WE mint).
+  #inboundRecoveryAtMsByPeer = new Map();
+  // REZ-4: peerAccountId -> last time we successfully DECRYPTED an inbound message
+  // from them. Proves the link is alive in the receive direction; suppresses
+  // sender-side ack-timeout recovery for a demonstrably-live peer.
+  #lastInboundDecryptAtMsByPeer = new Map();
+  // REZ-5: timestamps of recovery invites we have minted, within the rolling
+  // global-rate-limit window. Pruned on each trigger.
+  #recoveryInviteTimestamps = [];
 
   constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
@@ -300,18 +325,38 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         this._emitPeerLinkUpdated(decResult.snapshot);
       }
 
+      // The cryptographically-authenticated sender of THIS packet (from the
+      // decrypted peer-link snapshot). Never a plaintext field.
+      const snapshot = decResult.snapshot;
+      const decryptedSender = snapshot && typeof snapshot.peerAccountId === "string"
+        ? snapshot.peerAccountId.trim() : "";
+      // REZ-4: record that this peer's link is alive in the receive direction so
+      // sender-side ack-timeout recovery won't re-key a demonstrably-live link.
+      if (decryptedSender) {
+        this.#lastInboundDecryptAtMsByPeer.set(decryptedSender, this.#clock());
+      }
+
       try {
         const innerText = new TextDecoder().decode(decResult.plaintextBytes);
         const inner = JSON.parse(innerText);
         if (inner && inner.kind === "rez.delivery.ack"
             && typeof inner.senderAccountId === "string"
             && Array.isArray(inner.messageIds)) {
+          // REZ-7: trust the cryptographically-authenticated decrypt sender, NOT
+          // the plaintext senderAccountId. A peer must not be able to clear
+          // ANOTHER peer's recovery state or flip another peer's delivery status
+          // by naming them in the ack body.
+          if (decryptedSender && inner.senderAccountId.trim() !== decryptedSender) {
+            this.logger.warn("[ServerPeerLinkProtocolService] delivery-ack sender mismatch (claimed "
+              + inner.senderAccountId.trim() + " != authenticated " + decryptedSender + "); ignoring");
+            return { consumed: true, decryptOk: true };
+          }
           // A delivery-ack proves THIS peer decrypted a message we sent — the
           // us->peer direction is healthy right now. Clear its unacked tally so
           // sender-side recovery never re-invites a live link.
-          this._noteDeliveryAckReceived(inner.senderAccountId);
+          this._noteDeliveryAckReceived(decryptedSender);
           this._emit("delivery.ack", {
-            senderAccountId: inner.senderAccountId,
+            senderAccountId: decryptedSender,
             messageIds: inner.messageIds,
           });
           return { consumed: true, decryptOk: true };
@@ -325,9 +370,6 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       // payload kind and sender's messageId are known — only real chat
       // messages should trigger a delivery ack, and the ack must carry the
       // sender's local messageId (not the relay eventId).
-      const snapshot = decResult.snapshot;
-      const decryptedSender = snapshot && typeof snapshot.peerAccountId === "string"
-        ? snapshot.peerAccountId.trim() : "";
       // Return the decrypted user message for the pipeline to apply (awaited,
       // in deposit order) — NOT an emit. A fire-and-forget emit here let a
       // group message race ahead of the sender's member.join and get dropped
@@ -446,8 +488,17 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     // Read here; commit the timestamp only once we're actually about to dispatch,
     // so an early-return (no sdk) does not start a cooldown that delays a retry.
     const nowMs = this.#clock();
+    this.#pruneStaleMap(this.#recoveryInviteAtMsByPeer, nowMs, RECOVERY_INVITE_TTL_MS);
     const lastAtMs = this.#recoveryInviteAtMsByPeer.get(remote);
     if (typeof lastAtMs === "number" && nowMs - lastAtMs < RECOVERY_INVITE_TRIGGER_COOLDOWN_MS) return;
+    // REZ-5: global rate limit across all peers. Prune the rolling window, then cap
+    // total mints per window so one crafted fan-out can't burst the whole group.
+    this.#recoveryInviteTimestamps = this.#recoveryInviteTimestamps.filter(
+      (t) => nowMs - t < RECOVERY_INVITE_GLOBAL_WINDOW_MS);
+    if (this.#recoveryInviteTimestamps.length >= RECOVERY_INVITE_GLOBAL_MAX) {
+      this.logger.warn("[ServerPeerLinkProtocolService] recovery invite suppressed — global rate limit reached");
+      return;
+    }
     const peerLinks = this._peerLinkService();
     if (!peerLinks || typeof peerLinks.createInvite !== "function") return;
     const sdk = this._sdk();
@@ -456,6 +507,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       return;
     }
     this.#recoveryInviteAtMsByPeer.set(remote, nowMs);
+    this.#recoveryInviteTimestamps.push(nowMs);
     const remoteInbox = typeof peerInboxId === "string" ? peerInboxId.trim() : "";
     this._sendRecoveryInvite({ peerLinks, sdk, remote, peerInboxId: remoteInbox }).catch((err) => {
       this.logger.error("[ServerPeerLinkProtocolService] recovery invite send failed", err && err.message ? err.message : err);
@@ -547,13 +599,42 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
   // direct test drive; otherwise invoked on every send and every inbound ack.
   _sweepStaleDeliveries() {
     const nowMs = this.#clock();
+    this.#pruneStaleMap(this.#lastInboundDecryptAtMsByPeer, nowMs, SENDER_RECOVERY_HEALTHY_GUARD_MS * 4);
     for (const [peerAccountId, entry] of [...this.#outstandingGroupSendsByPeer.entries()]) {
       if (!entry || entry.count < SENDER_RECOVERY_UNACKED_THRESHOLD) continue;
       if (nowMs - entry.firstAtMs < SENDER_RECOVERY_UNACKED_TIMEOUT_MS) continue;
+      // REZ-4: ack absence is not proof of desync — a relay can selectively drop
+      // delivery-acks. If we DECRYPTED a message from this peer recently, the link
+      // is demonstrably alive; re-keying would be churn a relay could weaponise to
+      // pin the link in perpetual re-establishment. Reset the window and skip.
+      const lastDecryptAtMs = this.#lastInboundDecryptAtMsByPeer.get(peerAccountId);
+      if (typeof lastDecryptAtMs === "number" && nowMs - lastDecryptAtMs < SENDER_RECOVERY_HEALTHY_GUARD_MS) {
+        this.#outstandingGroupSendsByPeer.set(peerAccountId, { count: 0, firstAtMs: nowMs });
+        continue;
+      }
       // Fresh window so we don't immediately re-evaluate the same peer; the next
       // unacked sends rebuild evidence if this recovery attempt doesn't take.
       this.#outstandingGroupSendsByPeer.set(peerAccountId, { count: 0, firstAtMs: nowMs });
       this._triggerRecoveryInvite({ peerAccountId });
+    }
+  }
+
+  // REZ-5: keep the per-peer bookkeeping maps bounded — drop entries older than
+  // maxAgeMs, then hard-cap total size (oldest-insertion-first) so a node that
+  // talks to many distinct peers over its lifetime cannot leak unbounded memory.
+  #pruneStaleMap(map, nowMs, maxAgeMs) {
+    for (const [key, val] of map) {
+      const at = typeof val === "number"
+        ? val
+        : (val && typeof val.firstAtMs === "number" ? val.firstAtMs : 0);
+      if (nowMs - at >= maxAgeMs) map.delete(key);
+    }
+    if (map.size > RECOVERY_MAP_MAX_ENTRIES) {
+      let excess = map.size - RECOVERY_MAP_MAX_ENTRIES;
+      for (const key of map.keys()) {
+        if (excess-- <= 0) break;
+        map.delete(key);
+      }
     }
   }
 
@@ -578,6 +659,35 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       return { consumed: true, decryptOk: false, reason: "recovery-invite-bad-sender" };
     }
 
+    // REZ-1: the envelope's declared creator MUST be the identity that signed it.
+    // acceptInvite verifies the signature against `signerRef` and the verifier
+    // binds signerRef.accountId to hash(signerRef.signerPublicKeyB64) — but it does
+    // NOT bind signerRef.accountId to creatorAccountId. Without this check a peer
+    // could set creatorAccountId=Alice (a co-member, so the authz gate below
+    // passes) while signing with their OWN self-consistent signerRef, and drive a
+    // forceReestablish teardown of OUR live session with Alice — a cross-target
+    // session-reset DoS. Binding signer==creator means only the real account
+    // holder (who can sign for that key) can recover-invite as that identity.
+    const signerRef = envelope && typeof envelope.signerRef === "object" ? envelope.signerRef : null;
+    const signerAccountId = signerRef && typeof signerRef.accountId === "string" ? signerRef.accountId.trim() : "";
+    if (signerAccountId !== sender) {
+      this.logger.warn("[ServerPeerLinkProtocolService] recovery invite signerRef/creator mismatch (signer "
+        + (signerAccountId || "<none>") + " != creator " + sender + "); dropping");
+      return { consumed: true, decryptOk: false, reason: "recovery-invite-signer-mismatch" };
+    }
+
+    const nowMs = this.#clock();
+    // REZ-1: receive-side rate limit. A valid recovery invite re-keys our live
+    // session with this peer (discarding the working ratchet); without a receive
+    // gate an authorised co-member could force unbounded re-keys. The outbound
+    // cooldown (#recoveryInviteAtMsByPeer) only throttles invites WE mint. One
+    // re-key per peer per window is enough to heal a genuinely broken link.
+    this.#pruneStaleMap(this.#inboundRecoveryAtMsByPeer, nowMs, RECOVERY_INVITE_TTL_MS);
+    const lastInboundAtMs = this.#inboundRecoveryAtMsByPeer.get(sender);
+    if (typeof lastInboundAtMs === "number" && nowMs - lastInboundAtMs < RECOVERY_INVITE_TRIGGER_COOLDOWN_MS) {
+      return { consumed: true, decryptOk: true, reason: "recovery-invite-throttled" };
+    }
+
     // GLARE TIEBREAK. If we ALSO have a recovery invite outstanding to this sender
     // and WE are the canonical inviter (smaller accountId wins), ignore theirs —
     // ours stands and they will accept it. Otherwise proceed; one matched pair
@@ -598,6 +708,9 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       return { consumed: false, decryptOk: false, reason: "recovery-invite-unauthorized" };
     }
 
+    // Commit the receive-side cooldown now (before the re-key): even a re-key that
+    // later fails counts toward the throttle so a peer cannot hammer us (REZ-1).
+    this.#inboundRecoveryAtMsByPeer.set(sender, nowMs);
     const senderInboxId = this._ownInboxId(sdk);
     let result;
     try {

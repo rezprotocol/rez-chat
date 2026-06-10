@@ -35,6 +35,13 @@ export class ChatGroupMember extends RRecord {
     const joinedAtMs = raw.joinedAtMs == null ? null : toFiniteNumber(raw.joinedAtMs, 0);
     this.joinedAtMs = joinedAtMs;
     this.updatedAtMs = raw.updatedAtMs == null ? joinedAtMs : toFiniteNumber(raw.updatedAtMs, joinedAtMs || 0);
+    // REZ-2 membership-consent proof: the member's account-key signature over
+    // { groupId, accountId }. Null for locally-trusted rows that need no proof
+    // (the local owner, and the group creator — verified via the createdBy
+    // binding). Persisted so the inviter can re-advertise each member's proof via
+    // member.contact, letting transitively-introduced members verify each other.
+    this.joinerSignerPublicKeyB64 = nonEmptyString(raw.joinerSignerPublicKeyB64) || null;
+    this.joinerSigB64 = nonEmptyString(raw.joinerSigB64) || null;
     this._seal();
   }
 

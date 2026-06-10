@@ -1,10 +1,12 @@
 import { BusComponent } from "../base/BusComponent.js";
 import { AppShellView } from "../views/AppShellView.js";
+import { ConnectRequestAlertView } from "../views/ConnectRequestAlertView.js";
 
 export class MainScene extends BusComponent {
   constructor({ bus } = {}) {
     super({ bus });
     this._view = null;
+    this._connectAlerts = null;
   }
 
   mount(mountEl) {
@@ -12,6 +14,10 @@ export class MainScene extends BusComponent {
     if (!this._rootEl) return;
     this._view = new AppShellView({ bus: this.bus });
     this._view.mount(this._rootEl);
+    const alertSlot = document.createElement("div");
+    this._rootEl.appendChild(alertSlot);
+    this._connectAlerts = new ConnectRequestAlertView({ bus: this.bus });
+    this._connectAlerts.mount(alertSlot);
     this._onFocus = () => {
       this.bus.stores.uiState.setVisibility({ focused: true });
       this.bus.emit("ui.visibility.changed", { focused: true });
@@ -42,6 +48,10 @@ export class MainScene extends BusComponent {
     if (this._onVisibility) {
       document.removeEventListener("visibilitychange", this._onVisibility);
       this._onVisibility = null;
+    }
+    if (this._connectAlerts) {
+      this._connectAlerts.unmount();
+      this._connectAlerts = null;
     }
     if (this._view) {
       this._view.unmount();

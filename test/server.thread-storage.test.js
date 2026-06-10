@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { ThreadStoreService, THREAD_TYPES } from "../src/server/storage/ChatThreadStore.js";
 import { ThreadIndexService } from "../src/server/storage/ChatThreadIndex.js";
+import { ServerThreadsService } from "../src/server/services/ServerThreadsService.js";
 import { ContactStore } from "../src/server/storage/ChatContactStore.js";
 import { BackupStoreService } from "../src/server/storage/ChatBackupStore.js";
 
@@ -256,6 +257,112 @@ test("chat contact store owns contact relationship semantics", async () => {
     displayName: "B",
   });
   assert.equal(renamed.contact.displayName, "B");
+});
+
+function makeThreadsService(storageProvider, ownerAccountId, clock) {
+  const threadStore = createThreadStore(storageProvider, ownerAccountId, clock);
+  const threadIndex = createThreadIndex(storageProvider, ownerAccountId, threadStore, clock);
+  const emitted = [];
+  const bus = {
+    registerFunction() {},
+    emit(name, payload) { emitted.push({ name, payload }); },
+  };
+  const service = new ServerThreadsService({
+    bus,
+    threadStore,
+    threadIndex,
+    // deleteThread does not touch contact/group stores; stubs satisfy the
+    // constructor's truthy-store requirement.
+    contactStore: {},
+    groupStore: {},
+    ownerAccountId,
+    clock,
+  });
+  return { service, threadStore, threadIndex, emitted };
+}
+
+test("deleteThread removes an ORPHANED index row (storage record already gone) and emits the drop", async () => {
+  const { service, threadStore, threadIndex, emitted } = makeThreadsService(
+    new MemoryStorageProvider(), "rez:acct:A", () => 6000);
+  const threadId = "th_ORPHANAAAAAAAAAAAAAAAA";
+
+  // Build a real thread + index row, then delete ONLY the storage record to
+  // reproduce the orphan a pre-cascade contact delete used to strand.
+  await ensureReadyDirectThread(threadStore, threadId);
+  await threadStore.upsertDepositedMessage({
+    threadId, messageId: "m1", senderKey: "dev:B", senderAccountId: "rez:acct:B",
+    packetB64: "AQID", acceptedAtMs: 6100,
+  });
+  await threadIndex.upsertOnMessageAccepted({
+    threadId, messageId: "m1", createdAtMs: 6100, senderAccountId: "rez:acct:B", preview: "hi",
+  });
+  await threadStore.deleteThread(threadId);
+  assert.equal(await threadStore.getThread(threadId), null, "precondition: record gone");
+  assert.notEqual(await threadIndex.getIndexRecord({ threadId }), null, "precondition: index row stranded");
+
+  const result = await service.deleteThread({ threadId });
+
+  assert.equal(result.deleted, true, "orphaned thread reports deleted");
+  assert.equal(await threadIndex.getIndexRecord({ threadId }), null, "index row removed");
+  assert.ok(
+    emitted.some((e) => e.name === "thread.removed" && e.payload && e.payload.threadId === threadId),
+    "emits thread.removed so every client store/view drops the row",
+  );
+});
+
+test("setThreadState emits thread.updated so other devices of the account learn the archive/hide", async () => {
+  const { service, threadStore, emitted } = makeThreadsService(
+    new MemoryStorageProvider(), "rez:acct:A", () => 6000);
+  const threadId = "th_STATESYNCAAAAAAAAAAAAAA";
+  await ensureReadyDirectThread(threadStore, threadId);
+
+  const result = await service.setThreadState({ threadId, visibilityState: "hidden" });
+  assert.equal(result.thread.visibilityState, "hidden", "RPC result reflects the new state");
+  const evt = emitted.find((e) => e.name === "thread.updated");
+  assert.ok(evt, "emits a bridged thread.updated");
+  assert.equal(evt.payload.thread.threadId, threadId);
+  assert.equal(evt.payload.thread.visibilityState, "hidden",
+    "event carries the persisted state so a second device reconciles");
+});
+
+test("listDirectThreadIdsForPeer finds a peer's direct threads by STORED record, ignoring peer-link drift", async () => {
+  const { service, threadStore } = makeThreadsService(
+    new MemoryStorageProvider(), "rez:acct:A", () => 7000);
+
+  // Two direct threads for the same peer keyed to DIFFERENT (drifted) peer-link
+  // ids — the cascade can't recompute the second from the live link list, but
+  // both stored records name the same peerAccountId.
+  await threadStore.ensureThread({
+    threadId: "th_PEERLINK1AAAAAAAAAAAA", threadType: THREAD_TYPES.DIRECT,
+    peerAccountId: "rez:acct:bob", peerInboxId: "inbox:bob",
+  });
+  await threadStore.ensureThread({
+    threadId: "th_PEERLINK2BBBBBBBBBBBB", threadType: THREAD_TYPES.DIRECT,
+    peerAccountId: "rez:acct:bob", peerInboxId: "inbox:bob",
+  });
+  // An unrelated peer's direct thread + a group thread must NOT match.
+  await threadStore.ensureThread({
+    threadId: "th_OTHERPEERCCCCCCCCCCCC", threadType: THREAD_TYPES.DIRECT,
+    peerAccountId: "rez:acct:carol", peerInboxId: "inbox:carol",
+  });
+  await threadStore.ensureThread({
+    threadId: "th_GROUPDDDDDDDDDDDDDDDD", threadType: THREAD_TYPES.GROUP, groupId: "grp_x",
+  });
+
+  const ids = await service.listDirectThreadIdsForPeer("rez:acct:bob");
+  assert.deepEqual(ids.sort(), ["th_PEERLINK1AAAAAAAAAAAA", "th_PEERLINK2BBBBBBBBBBBB"]);
+
+  // A peer with no threads, and an empty id, both yield nothing.
+  assert.deepEqual(await service.listDirectThreadIdsForPeer("rez:acct:nobody"), []);
+  assert.deepEqual(await service.listDirectThreadIdsForPeer(""), []);
+});
+
+test("deleteThread on a fully-absent thread is a clean no-op (deleted:false, no event)", async () => {
+  const { service, emitted } = makeThreadsService(
+    new MemoryStorageProvider(), "rez:acct:A", () => 6000);
+  const result = await service.deleteThread({ threadId: "th_NEVEREXISTEDAAAAAAAAA" });
+  assert.equal(result.deleted, false);
+  assert.equal(emitted.length, 0, "no spurious drop event for a thread that never existed");
 });
 
 test("chat backup store owns chat.backup.v1 artifact semantics over opaque storage", async () => {

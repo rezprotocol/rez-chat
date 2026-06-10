@@ -92,12 +92,36 @@ export class GroupStore {
     return sortByUpdatedThen(await this.groups.list(owner), "groupId");
   }
 
-  async ensureMembership({ ownerAccountId, groupId, accountId, role = "member", displayName = null } = {}) {
+  async ensureMembership({ ownerAccountId, groupId, accountId, role = "member", displayName = null, joinProof = null } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const gid = requireId(groupId, "groupId");
     const member = requireId(accountId, "accountId");
+    const proofPub = joinProof && typeof joinProof.joinerSignerPublicKeyB64 === "string" ? joinProof.joinerSignerPublicKeyB64.trim() : "";
+    const proofSig = joinProof && typeof joinProof.joinerSigB64 === "string" ? joinProof.joinerSigB64.trim() : "";
     const existing = await this.memberships.get(owner, gid, member);
-    if (existing) return { membership: existing, created: false };
+    if (existing) {
+      // REZ-2: attach the consent proof to a previously proofless row (e.g. the
+      // inviter membership added at invite-accept, or a row created before its
+      // member.contact proof arrived) so it can later be re-advertised. Never
+      // change role/state/displayName here — that stays ensureMembership-neutral.
+      const hasProof = typeof existing.joinerSigB64 === "string" && existing.joinerSigB64;
+      if (proofPub && proofSig && !hasProof) {
+        // The proof is bound to { groupId, accountId, displayName } — store the
+        // EXACT name it was signed over so a later re-advertisement re-verifies
+        // (REZ-2 / TRUST-3). A proofless row's prior name (e.g. the inviter row
+        // added at accept) is superseded by the verified self-signed name.
+        const boundName = typeof displayName === "string" && displayName.trim() ? displayName.trim() : null;
+        const upgraded = this.memberships.coerce({
+          ...existing.toJSON(),
+          ...(boundName ? { displayName: boundName } : {}),
+          joinerSignerPublicKeyB64: proofPub,
+          joinerSigB64: proofSig,
+        });
+        await this.memberships.set(upgraded, owner, gid, member);
+        return { membership: upgraded, created: false };
+      }
+      return { membership: existing, created: false };
+    }
     const now = asInt(this.clock(), Date.now());
     const name = typeof displayName === "string" && displayName.trim() ? displayName.trim() : null;
     const created = this.memberships.coerce({
@@ -112,6 +136,8 @@ export class GroupStore {
       displayName: name,
       joinedAtMs: now,
       updatedAtMs: now,
+      joinerSignerPublicKeyB64: proofPub || null,
+      joinerSigB64: proofSig || null,
     });
     if (!created) throw new Error("ChatGroupStore.ensureMembership produced invalid row");
     await this.memberships.set(created, owner, gid, member);
@@ -127,10 +153,12 @@ export class GroupStore {
    * (e.g. against a fresh post-removal invite). No-op (revived:false) when the
    * row is absent or already active. Rejoin restores the supplied role.
    */
-  async reviveMembership({ ownerAccountId, groupId, accountId, role = "member", displayName = null } = {}) {
+  async reviveMembership({ ownerAccountId, groupId, accountId, role = "member", displayName = null, joinProof = null } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const gid = requireId(groupId, "groupId");
     const member = requireId(accountId, "accountId");
+    const proofPub = joinProof && typeof joinProof.joinerSignerPublicKeyB64 === "string" ? joinProof.joinerSignerPublicKeyB64.trim() : "";
+    const proofSig = joinProof && typeof joinProof.joinerSigB64 === "string" ? joinProof.joinerSigB64.trim() : "";
     const existing = await this.memberships.get(owner, gid, member);
     if (!existing || String(existing.state || "").toLowerCase() !== "removed") {
       return { membership: existing || null, revived: false };
@@ -144,6 +172,8 @@ export class GroupStore {
       // Refresh the name from the rejoin op when present; otherwise keep what
       // the prior membership carried (spread above).
       ...(name ? { displayName: name } : {}),
+      // Refresh the consent proof from the fresh re-admit op when present.
+      ...(proofPub && proofSig ? { joinerSignerPublicKeyB64: proofPub, joinerSigB64: proofSig } : {}),
       updatedAtMs: now,
     });
     if (!revived) throw new Error("ChatGroupStore.reviveMembership produced invalid row");

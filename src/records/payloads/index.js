@@ -30,6 +30,8 @@ import { GroupOpPayloadV1, GROUP_OP_KIND } from "./GroupOpPayloadV1.js";
 import { ChatImagePayloadV1, IMAGE_KIND } from "./ChatImagePayloadV1.js";
 import { ChatAvatarPayloadV1, AVATAR_KIND } from "./ChatAvatarPayloadV1.js";
 import { ChatSystemEventPayloadV1, SYSTEM_EVENT_KIND } from "./ChatSystemEventPayloadV1.js";
+import { ConnectRequestPayloadV1, CONNECT_REQUEST_KIND } from "./ConnectRequestPayloadV1.js";
+import { ChatConnectAcceptedPayloadV1, CONNECT_ACCEPTED_KIND } from "./ChatConnectAcceptedPayloadV1.js";
 import { FileManifestV1, FileChunkV1 } from "@rezprotocol/sdk/filetransfer";
 import { ProfilePayloadV1 } from "@rezprotocol/sdk/profile";
 
@@ -46,6 +48,8 @@ export {
   ChatImagePayloadV1,
   ChatAvatarPayloadV1,
   ChatSystemEventPayloadV1,
+  ConnectRequestPayloadV1,
+  ChatConnectAcceptedPayloadV1,
   FileManifestV1,
   FileChunkV1,
   ProfilePayloadV1,
@@ -57,6 +61,8 @@ export {
   IMAGE_KIND,
   AVATAR_KIND,
   SYSTEM_EVENT_KIND,
+  CONNECT_REQUEST_KIND,
+  CONNECT_ACCEPTED_KIND,
 };
 
 function extractPayloadSender(record, ctx) {
@@ -132,6 +138,38 @@ const ENTRIES = [
     },
   },
   {
+    kind: CONNECT_REQUEST_KIND,
+    recordClass: ConnectRequestPayloadV1,
+    async dispatch(record, ctx, services) {
+      const contactsService = services && services.contacts;
+      if (!contactsService || typeof contactsService.handleIncomingConnectRequest !== "function") return false;
+      const consumed = await contactsService.handleIncomingConnectRequest(record, {
+        senderAccountId: extractPayloadSender(record, ctx),
+        groupId: ctx && typeof ctx.groupId === "string" ? ctx.groupId : "",
+      });
+      return Boolean(consumed);
+    },
+  },
+  {
+    kind: CONNECT_ACCEPTED_KIND,
+    recordClass: ChatConnectAcceptedPayloadV1,
+    // The peer approved a connect-request we sent. By the time this dispatches,
+    // the direct-content delivery gate has already (a) verified we held a
+    // pending OUTGOING request to this sender, (b) activated the contact, and
+    // (c) resolved/created our direct thread (ctx.threadId). Here we persist the
+    // requester-side "connect.accepted" system row into that thread. Consumed
+    // (returns true) so the trigger itself never renders as a bubble.
+    async dispatch(record, ctx, services) {
+      const contactsService = services && services.contacts;
+      if (!contactsService || typeof contactsService.handleIncomingConnectAccepted !== "function") return false;
+      const consumed = await contactsService.handleIncomingConnectAccepted(record, {
+        senderAccountId: extractPayloadSender(record, ctx),
+        threadId: ctx && typeof ctx.threadId === "string" ? ctx.threadId : "",
+      });
+      return Boolean(consumed);
+    },
+  },
+  {
     kind: FILE_MANIFEST_KIND,
     recordClass: FileManifestV1,
     async dispatch(record, ctx, services) {
@@ -165,7 +203,14 @@ const ENTRIES = [
     async dispatch(record, ctx, services) {
       const ft = services && services.fileTransfer;
       if (!ft || typeof ft.storeFile !== "function") return true;
-      await ft.storeFile(record.fileHashHex, record.fileDataB64);
+      // storeFile verifies the bytes hash to fileHashHex (TRUST-2). A mismatch is
+      // a poisoning attempt — consume (drop) it; never let it fall through to the
+      // message-persist path.
+      try {
+        await ft.storeFile(record.fileHashHex, record.fileDataB64);
+      } catch (err) {
+        return true;
+      }
       return true;
     },
   },

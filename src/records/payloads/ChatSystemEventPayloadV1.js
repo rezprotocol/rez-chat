@@ -15,23 +15,27 @@ import { SchemaRecord } from "../SchemaRecord.js";
  * Schema deliberately narrow: one `event` enum + the minimum context
  * needed to render a localized sentence client-side.
  *
- *   - event           "member.join"                    (only value in v1)
- *   - groupId         the group the event happened in
- *   - actorAccountId  the account whose state changed (e.g. who joined)
+ *   - event           "member.join" | "connect.accepted"
+ *   - groupId         the group the event happened in (group events only;
+ *                     omitted for 1:1 events such as connect.accepted)
+ *   - actorAccountId  the account whose state changed (e.g. who joined, or
+ *                     who accepted the connect request)
  *   - actorDisplayName optional cached display name for rendering
  *   - actedAtMs       authoritative timestamp of the underlying op
  */
 
 export const SYSTEM_EVENT_KIND = "rez.chat.system-event.v1";
 
-export const SYSTEM_EVENTS = Object.freeze(["member.join"]);
+export const SYSTEM_EVENTS = Object.freeze(["member.join", "connect.accepted"]);
 
 export class ChatSystemEventPayloadV1 extends SchemaRecord {
   static type = SYSTEM_EVENT_KIND;
   static schema = {
     kind: { type: "string", required: true, trim: true, default: SYSTEM_EVENT_KIND },
     event: { type: "enum", values: [...SYSTEM_EVENTS], required: true },
-    groupId: { type: "string", required: true, trim: true },
+    // Group events carry the group they happened in; 1:1 events (connect.accepted)
+    // have no group, so groupId is optional rather than required.
+    groupId: { type: "string", trim: true },
     actorAccountId: { type: "string", required: true, trim: true },
     actorDisplayName: { type: "string", trim: false, maxLength: 128 },
     actedAtMs: { type: "int", required: true },

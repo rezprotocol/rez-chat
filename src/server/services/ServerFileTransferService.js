@@ -1,5 +1,6 @@
 import { FileTransferService, FileManifestV1 } from "@rezprotocol/sdk/filetransfer";
 import { base64ToBytes, bytesToBase64 } from "@rezprotocol/sdk/client";
+import { Hash } from "@rezprotocol/sdk/hash";
 
 function defaultAttachmentPreview(mimeType, fileName) {
   if (typeof mimeType === "string" && mimeType.toLowerCase().startsWith("image/")) {
@@ -55,13 +56,38 @@ export class ServerFileTransferService extends BaseServerService {
     if (typeof fileDataB64 !== "string" || !fileDataB64) {
       throw new Error("storeFile requires fileDataB64");
     }
-    await this.#kvStore.set("file:" + fileHashHex.trim(), fileDataB64);
+    const claimed = fileHashHex.trim();
+    // TRUST-2: the store is content-addressed by hash, so we CAN verify the bytes
+    // match the key — therefore we always do. Without this a peer could store
+    // arbitrary bytes under another file's hash and poison the content-addressed
+    // store (every consumer addresses by the authenticated payload.fileHashHex).
+    let actual;
+    try {
+      actual = Hash.sha256Hex(base64ToBytes(fileDataB64));
+    } catch (err) {
+      throw new Error("storeFile: undecodable fileDataB64");
+    }
+    if (actual !== claimed) {
+      throw new Error("storeFile: content does not match fileHashHex (rejected)");
+    }
+    await this.#kvStore.set("file:" + claimed, fileDataB64);
   }
 
   async retrieveFileB64(fileHashHex) {
     if (typeof fileHashHex !== "string" || !fileHashHex.trim()) return null;
-    const b64 = await this.#kvStore.get("file:" + fileHashHex.trim());
-    return typeof b64 === "string" ? b64 : null;
+    const key = fileHashHex.trim();
+    const b64 = await this.#kvStore.get("file:" + key);
+    if (typeof b64 !== "string") return null;
+    // TRUST-2 (read side): re-verify the stored bytes against the content address
+    // every time. Cheap, and it makes the store self-validating regardless of how
+    // an entry was written (defends against local-state corruption too).
+    let actual;
+    try {
+      actual = Hash.sha256Hex(base64ToBytes(b64));
+    } catch (err) {
+      return null;
+    }
+    return actual === key ? b64 : null;
   }
 
   async start() {

@@ -83,6 +83,12 @@ export class GroupOpPayloadV1 extends WirePayloadRecord {
     // member.contact routing payload: [{accountId, inboxId}]. Element shape is
     // validated in validate() below (the schema array type stores plain objects).
     contacts: { type: "array" },
+    // member.join membership-consent proof (REZ-2): the joiner's account-key
+    // signature over { groupId, accountId } proving THIS account consented to join.
+    // Optional on the record so an unsigned op still constructs; the applier
+    // requires + verifies it before conferring membership (drops otherwise).
+    joinerSignerPublicKeyB64: { type: "string", trim: true },
+    joinerSigB64: { type: "string", trim: true },
   };
 
   validate() {

@@ -63,7 +63,7 @@ async function depositMessage(store, threadId, {
   // the wire payload onto the row before persisting.
   const inReplyToMessageId = payload && typeof payload.inReplyToMessageId === "string"
     ? payload.inReplyToMessageId : "";
-  await store.upsertDepositedMessage({
+  return store.upsertDepositedMessage({
     threadId,
     messageId,
     senderKey: senderAccountId,
@@ -300,18 +300,30 @@ test("out-of-order: edit arriving before target is buffered and drained on inser
   assert.equal(buffered.reason, "target_not_found");
   assert.equal(buffered.buffered, true);
 
-  await depositMessage(store, threadId, {
+  const persist = await depositMessage(store, threadId, {
     messageId: "m1",
     senderAccountId: "rez:acct:peer",
     text: "original body",
     acceptedAtMs: 13_000,
   });
+  // The deposit must report that buffered mutations folded in, so the event
+  // layer knows to emit message.updated on top of message.deposited.
+  assert.equal(persist.mutated, true, "deposit reports the drained mutation");
+  assert.ok(persist.message, "deposit returns the mutated message");
+  assert.equal(persist.message.text, "edited body");
 
   const result = await store.listMessages({ threadId, limit: 10 });
   const drained = result.items.find((m) => m.messageId === "m1");
   assert.ok(drained, "target should exist after insert");
   assert.equal(drained.text, "edited body");
   assert.equal(drained.editedAtMs, 12_500);
+});
+
+test("plain deposit (no buffered mutations) reports mutated:false", async () => {
+  const { store, threadId } = await makeReadyStore();
+  const persist = await depositMessage(store, threadId, { messageId: "m1", text: "hi" });
+  assert.equal(persist.inserted, true);
+  assert.equal(persist.mutated, false, "no drain → no follow-up message.updated");
 });
 
 test("out-of-order: multiple mutations apply in receivedAtMs order on drain", async () => {

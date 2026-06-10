@@ -77,6 +77,14 @@ export class GroupMemberRowView extends BusComponent {
     const canManage = queries.groups.canSelfSetRole(this.#groupId, memberId);
 
     const actions = h("div", { className: "flex items-center gap-1 shrink-0" }, []);
+    const session = this.bus.stores.session;
+    const isSelf = session && typeof session.isSelf === "function" && session.isSelf(memberId);
+    const contactStore = this.bus.stores.contacts;
+    const contact = contactStore && typeof contactStore.getContact === "function" ? contactStore.getContact(memberId) : null;
+    const relState = contact ? contact.relationshipState : null;
+    if (!isSelf && relState !== "active" && relState !== "blocked") {
+      actions.appendChild(relState === "invited" ? this._buildPendingIndicator() : this._buildConnectButton(name));
+    }
     if (canManage) {
       actions.appendChild(this._buildRoleToggle(isAdmin));
       actions.appendChild(this._buildKickButton(name));
@@ -99,6 +107,34 @@ export class GroupMemberRowView extends BusComponent {
         : h("span", { className: "text-label-micro font-label-technical text-on-surface-variant/60 uppercase" }, "member"),
       actions,
     ]));
+  }
+
+  _buildConnectButton(name) {
+    const groupId = this.#groupId;
+    const memberId = this.#memberId;
+    const btn = h("button", {
+      type: "button",
+      className: ACTION_BTN_CLASS,
+      title: "Connect",
+      "aria-label": "Connect with " + name,
+    }, [materialIcon("person_add", { size: 16 })]);
+    btn.addEventListener("click", (evt) => {
+      evt.stopPropagation();
+      btn.disabled = true;
+      this.bus.call("contacts", "requestConnect", { peerAccountId: memberId, groupId }).catch((err) => {
+        btn.disabled = false;
+        console.error("[GroupMemberRowView] connect request failed", err);
+        this.bus.emit("app.error", { source: "GroupMemberRowView", message: "connect request failed", severity: "warn", err });
+      });
+    });
+    return btn;
+  }
+
+  _buildPendingIndicator() {
+    return h("span", {
+      className: "text-label-micro font-label-technical text-on-surface-variant/60 uppercase flex items-center gap-1",
+      title: "Connection request pending",
+    }, [materialIcon("hourglass_empty", { size: 14 }), "Requested"]);
   }
 
   _buildRoleToggle(isAdmin) {

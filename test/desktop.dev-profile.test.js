@@ -29,6 +29,28 @@ test("desktop dev profiles isolate Alice and Bob by default", () => {
   assert.notEqual(alice.userDataDir, bob.userDataDir);
 });
 
+test("desktop dev carol profile is isolated for three-up A>B B>C testing", () => {
+  const carol = resolveDesktopProfile("carol", {});
+
+  assert.equal(carol.name, "carol");
+  assert.equal(carol.desktopPort, 3430);
+  assert.equal(carol.nodeWsPort, 8789);
+  assert.equal(carol.windowX, 380);
+  assert.equal(carol.windowY, 520);
+  assert.equal(carol.windowWidth, 680);
+  assert.equal(carol.windowHeight, 820);
+  assert.equal(carol.userDataDir.endsWith(path.join("rez-chat", ".local", "desktop-profiles", "carol")), true);
+
+  const alice = resolveDesktopProfile("alice", {});
+  const bob = resolveDesktopProfile("bob", {});
+  assert.notEqual(carol.desktopPort, alice.desktopPort);
+  assert.notEqual(carol.desktopPort, bob.desktopPort);
+  assert.notEqual(carol.nodeWsPort, alice.nodeWsPort);
+  assert.notEqual(carol.nodeWsPort, bob.nodeWsPort);
+  assert.notEqual(carol.userDataDir, alice.userDataDir);
+  assert.notEqual(carol.userDataDir, bob.userDataDir);
+});
+
 test("desktop dev profile env overrides are profile-specific", () => {
   const alice = resolveDesktopProfile("alice", {
     REZ_CHAT_DESKTOP_PROFILE_ROOT: "/tmp/rez-desktop-profiles",

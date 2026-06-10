@@ -72,6 +72,9 @@ export class SidebarNavView extends BusComponent {
       if (evt && evt.type === "ui.activeTab.changed") this.#refreshNavHighlight();
     });
     this._subscribe(stores.threads, () => this.#refreshChatUnreadBadge());
+    if (stores.connectRequests) {
+      this._subscribe(stores.connectRequests, () => this.#refreshContactsBadge());
+    }
     this._subscribe(stores.connection, () => this.#refreshStatusIndicator());
     this._subscribe(stores.session, () => this.#refreshStatusIndicator());
     this.render();
@@ -131,6 +134,7 @@ export class SidebarNavView extends BusComponent {
     this.#ownAvatarView.mount(this.#avatarSlot);
 
     this.#refreshChatUnreadBadge();
+    this.#refreshContactsBadge();
     this.#refreshStatusIndicator();
   }
 
@@ -202,6 +206,26 @@ export class SidebarNavView extends BusComponent {
       "data-role": "nav-badge",
       "aria-label": total + " unread",
     }));
+  }
+
+  #refreshContactsBadge() {
+    if (!this.#navEl) return;
+    const contactsBtn = this.#navEl.querySelector("[data-nav-id='contacts']");
+    if (!contactsBtn) return;
+    const slot = contactsBtn.querySelector("[data-role='nav-badge-slot']");
+    if (!slot) return;
+    const queries = this.bus.queries;
+    const count = queries && queries.contacts && typeof queries.contacts.incomingConnectRequestCount === "function"
+      ? queries.contacts.incomingConnectRequestCount() : 0;
+    if (count <= 0) {
+      slot.replaceChildren();
+      return;
+    }
+    slot.replaceChildren(h("span", {
+      className: "flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-primary text-on-primary text-[10px] font-bold leading-none status-glow-cyan",
+      "data-role": "nav-badge",
+      "aria-label": count + " pending connection request" + (count === 1 ? "" : "s"),
+    }, String(count > 9 ? "9+" : count)));
   }
 
   #refreshStatusIndicator() {

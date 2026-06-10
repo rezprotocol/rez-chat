@@ -21,6 +21,7 @@ import { GroupOpPayloadV1 } from "../src/records/payloads/GroupOpPayloadV1.js";
 import { SYSTEM_EVENT_KIND } from "../src/records/payloads/ChatSystemEventPayloadV1.js";
 import { encodeInviteCodeV3 } from "@rezprotocol/sdk/client";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
+import { permissiveAccountAuthority, testConsentProof } from "./support/memberConsentDouble.js";
 
 // Realistic DER-SPKI Ed25519 key the v3 code commits to; the inner envelope
 // must be signed by the same identity (signerRef.signerPublicKeyB64).
@@ -60,6 +61,9 @@ function createServer({ identity, sdk, peerLinks, clock = () => 1000 } = {}) {
   });
   app.bus.runtime.sdk = sdk;
   app.bus.runtime.peerLinks = peerLinks;
+  // REZ-2: membership-consent proofs are signed/verified through the account
+  // authority; install the permissive double for these synthetic-ID tests.
+  app.bus.runtime.accountAuthority = permissiveAccountAuthority();
   return app;
 }
 
@@ -216,6 +220,7 @@ test("inviter side: inbound member.join materializes membership + persists syste
     inviteId,
     displayName: "Bob",
     actedAtMs: 6000,
+    ...testConsentProof(),
     groupOpId: "gop_join_1",
   });
   await server.bus.services.groups.handleIncomingGroupOp(op, {
@@ -267,6 +272,7 @@ test("inviter side: shape-B fan-out forwards member.join to other existing membe
     inviteId,
     displayName: "Bob",
     actedAtMs: 6000,
+    ...testConsentProof(),
     groupOpId: "gop_join_gamma",
   });
   await server.bus.services.groups.handleIncomingGroupOp(op, {
@@ -303,6 +309,7 @@ test("inviter side: redelivery of the same member.join is a no-op (idempotent)",
     inviteId,
     displayName: "Bob",
     actedAtMs: 6000,
+    ...testConsentProof(),
     groupOpId: "gop_join_delta",
   });
   await server.bus.services.groups.handleIncomingGroupOp(op, { senderAccountId: joinerAccountId });
@@ -339,6 +346,7 @@ test("inviter side: member.join with unknown inviteId is dropped (no membership 
     accountId: joinerAccountId,
     inviteId: "plinv_does_not_exist",
     actedAtMs: 7000,
+    ...testConsentProof(),
     groupOpId: "gop_forged",
   });
   await server.bus.services.groups.handleIncomingGroupOp(forgedOp, { senderAccountId: joinerAccountId });
@@ -389,6 +397,7 @@ test("forwarded member.join: honored when forwarder is an active group member", 
     accountId: bobAccountId,
     inviteId: "plinv_alice_issued_bobs",
     actedAtMs: 9100,
+    ...testConsentProof(),
     groupOpId: "gop_forwarded_join",
   });
   // Forwarded BY Alice (an active member), not by Bob himself.
@@ -432,6 +441,7 @@ test("forwarded member.join: dropped when forwarder is not an active group membe
     accountId: bobAccountId,
     inviteId: "plinv_x",
     actedAtMs: 10100,
+    ...testConsentProof(),
     groupOpId: "gop_mallory_forwarded",
   });
   await server.bus.services.groups.handleIncomingGroupOp(op, { senderAccountId: malloryAccountId });
@@ -496,6 +506,7 @@ test("inviter side: member.join is dropped when invite authorization fails (expi
 
   await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
     op: "member.join", groupId, accountId: joiner, inviteId, displayName: "Bob",
+    ...testConsentProof(),
     actedAtMs: 6000, groupOpId: "gop_authz",
   }), { senderAccountId: joiner });
 
@@ -526,6 +537,7 @@ test("inviter side: a kicked member is re-admitted ONLY by an invite issued AFTE
   clockRef.now = 150;
   await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
     op: "member.join", groupId, accountId: joiner, inviteId: staleInvite, displayName: "Bob",
+    ...testConsentProof(),
     actedAtMs: 150, groupOpId: "gop_j1",
   }), { senderAccountId: joiner });
   let bob = await server.bus.stores.groupStore.getMembership({
@@ -543,6 +555,7 @@ test("inviter side: a kicked member is re-admitted ONLY by an invite issued AFTE
   clockRef.now = 250;
   await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
     op: "member.join", groupId, accountId: joiner, inviteId: staleInvite, displayName: "Bob",
+    ...testConsentProof(),
     actedAtMs: 250, groupOpId: "gop_replay",
   }), { senderAccountId: joiner });
   bob = await server.bus.stores.groupStore.getMembership({
@@ -554,6 +567,7 @@ test("inviter side: a kicked member is re-admitted ONLY by an invite issued AFTE
   clockRef.now = 350;
   await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
     op: "member.join", groupId, accountId: joiner, inviteId: freshInvite, displayName: "Bob",
+    ...testConsentProof(),
     actedAtMs: 350, groupOpId: "gop_fresh",
   }), { senderAccountId: joiner });
   bob = await server.bus.stores.groupStore.getMembership({
@@ -594,6 +608,7 @@ test("forwarded member.join CANNOT resurrect a removed member (only adds new one
 
   await server.bus.services.groups.handleIncomingGroupOp(new GroupOpPayloadV1({
     op: "member.join", groupId, accountId: bob, inviteId: "plinv_w",
+    ...testConsentProof(),
     actedAtMs: 9100, groupOpId: "gop_fwd",
   }), { senderAccountId: alice });
 

@@ -24,7 +24,7 @@ export class NotificationService extends BaseBusService {
     this.#requestPermission();
     this._listen("session.unlocked", () => this.#requestPermission());
     this._listen("runtime.event.message.deposited", (record) => this.#onMessageDeposited(record));
-    this._listen("runtime.event.invite.received", () => this.#onInviteReceived());
+    this._listen("runtime.event.connectRequest.updated", (record) => this.#onConnectRequestUpdated(record));
   }
 
   #requestPermission() {
@@ -90,15 +90,26 @@ export class NotificationService extends BaseBusService {
     });
   }
 
-  #onInviteReceived() {
+  // Incoming connect requests. The focus gate is also the dedupe: a user's own
+  // approve/deny happens while the app is focused, so only genuinely new
+  // incoming requests (which can arrive while the app is backgrounded) notify.
+  // Native notifications have no action buttons here — clicking routes to the
+  // Contacts tab, where the Pending section carries Approve/Deny.
+  #onConnectRequestUpdated(record) {
     if (!this.#notificationsAllowed()) return;
     if (this.#isAppFocused()) return;
-
+    const peerAccountId = nonEmptyString(record && record.peerAccountId);
+    const queries = this.bus.queries;
+    const direction = queries && queries.contacts && typeof queries.contacts.connectRequestDirection === "function"
+      ? queries.contacts.connectRequestDirection(peerAccountId) : null;
+    if (direction !== "incoming") return;
+    const name = queries && queries.contacts ? queries.contacts.displayName(peerAccountId) : null;
     this.#fireNotification({
       title: "Rez",
-      body: "New invite received",
-      tag: "invite-" + Date.now(),
+      body: (name || "Someone") + " wants to connect",
+      tag: "connect-" + peerAccountId,
       threadId: null,
+      navigateTab: "contacts",
     });
   }
 
@@ -135,7 +146,7 @@ export class NotificationService extends BaseBusService {
     return { title, icon };
   }
 
-  #fireNotification({ title, body, tag, threadId, icon }) {
+  #fireNotification({ title, body, tag, threadId, icon, navigateTab = null }) {
     if (typeof Notification === "undefined") return;
     try {
       const notification = new Notification(title, {
@@ -150,6 +161,11 @@ export class NotificationService extends BaseBusService {
           if (threadId) {
             this.bus.call("threads", "select", { threadId }).catch((err) => {
               console.error("[NotificationService] select thread failed", err);
+            });
+          }
+          if (navigateTab) {
+            this.bus.call("ui", "navigateTab", { to: navigateTab }).catch((err) => {
+              console.error("[NotificationService] navigate tab failed", err);
             });
           }
         } catch (err) {
