@@ -143,7 +143,24 @@ export class NotificationService extends BaseBusService {
         tag,
         icon: icon || ICON_URL,
         silent: false,
+        // Tauri shell extension: banner buttons. "reply" puts an inline
+        // Reply field on message notifications ("accept-reject" exists for
+        // consent prompts). Unknown-option no-op on the web/Electron
+        // Notification implementations.
+        rezActions: threadId ? "reply" : "",
       });
+      // Tauri shell extension (see installRezDesktopShim): fires with the
+      // text typed into the banner's Reply field. Plain property on other
+      // platforms — never called.
+      if (threadId) {
+        notification.onreply = (text) => {
+          const replyText = String(text || "").trim();
+          if (!replyText) return;
+          this.bus.call("messages", "send", { threadId, text: replyText }).catch((err) => {
+            console.error("[NotificationService] inline reply send failed", err);
+          });
+        };
+      }
       notification.onclick = () => {
         try {
           if (typeof window !== "undefined" && window.focus) window.focus();

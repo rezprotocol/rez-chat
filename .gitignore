@@ -37,3 +37,5 @@ rez.config.json
 # personal scratch
 rez-chat-architecture-audit.html
 theme/
+src-tauri/binaries/
+src-tauri/target/

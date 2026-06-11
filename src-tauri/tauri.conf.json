@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Rez Chat",
+  "version": "../package.json",
+  "identifier": "com.rezprotocol.chat",
+  "build": {
+    "frontendDist": "../artifacts/rez-chat"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:*; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "nsis", "appimage", "deb"],
+    "icon": ["../build/icon.icns", "../build/icon.ico", "../build/icon.png"],
+    "createUpdaterArtifacts": true,
+    "externalBin": ["binaries/node"],
+    "resources": {
+      "../package.json": "package.json",
+      "../src": "src",
+      "../node_modules/@rezprotocol/core/src": "node_modules/@rezprotocol/core/src",
+      "../node_modules/@rezprotocol/core/package.json": "node_modules/@rezprotocol/core/package.json",
+      "../node_modules/@rezprotocol/sdk/src": "node_modules/@rezprotocol/sdk/src",
+      "../node_modules/@rezprotocol/sdk/package.json": "node_modules/@rezprotocol/sdk/package.json",
+      "../node_modules/@rezprotocol/node/src": "node_modules/@rezprotocol/node/src",
+      "../node_modules/@rezprotocol/node/package.json": "node_modules/@rezprotocol/node/package.json",
+      "../node_modules/@rezprotocol/ui/src": "node_modules/@rezprotocol/ui/src",
+      "../node_modules/@rezprotocol/ui/branding": "node_modules/@rezprotocol/ui/branding",
+      "../node_modules/@rezprotocol/ui/package.json": "node_modules/@rezprotocol/ui/package.json",
+      "../node_modules/ws": "node_modules/ws",
+      "../node_modules/better-sqlite3": "node_modules/better-sqlite3",
+      "../node_modules/bindings": "node_modules/bindings",
+      "../node_modules/file-uri-to-path": "node_modules/file-uri-to-path"
+    },
+    "macOS": {
+      "hardenedRuntime": true,
+      "entitlements": "../build/entitlements.mac.plist",
+      "minimumSystemVersion": "10.15"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/rezprotocol/rez-chat/releases/latest/download/latest.json"
+      ],
+      "pubkey": "REPLACE_WITH_TAURI_SIGNER_PUBKEY"
+    }
+  }
+}

@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<!--
+  Boot splash for the Tauri shell. Port of the self-contained splash page
+  electron/main.mjs generated inline (palette mirrors src/ui/styles.css:
+  #071518 base, cyan accent, dot-matrix grid). Lives in public/ so Vite
+  copies it verbatim into artifacts/rez-chat where the Tauri asset protocol
+  serves it. Status text arrives via the "splash:status" Tauri event.
+-->
+<style>
+  html,body{margin:0;height:100%;background:#071518;color:#d6e5e8;font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
+  body{background-image:radial-gradient(circle at center, rgba(0,218,243,.04) 0%, transparent 70%),radial-gradient(#1a2a2d 1px, transparent 1px);background-size:100% 100%,24px 24px}
+  .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;opacity:0;animation:fadein .45s ease forwards}
+  [data-tauri-drag-region]{-webkit-user-select:none;user-select:none}
+  .mark{font-size:30px;font-weight:700;letter-spacing:.5px}
+  .spin{width:26px;height:26px;border:3px solid rgba(0,240,255,.15);border-top-color:#00f0ff;border-radius:50%;animation:r .8s linear infinite}
+  #msg{min-height:18px;color:#8aa6ab;text-align:center;max-width:360px;padding:0 16px;font-size:11px;letter-spacing:.18em;text-transform:uppercase}
+  .wrap.error #msg{color:#ff003c;font-weight:600}
+  .wrap.error .spin{display:none}
+  @keyframes r{to{transform:rotate(360deg)}}
+  @keyframes fadein{to{opacity:1}}
+</style>
+</head>
+<body>
+<div class="wrap" id="wrap" data-tauri-drag-region>
+  <div class="mark">Rez</div>
+  <div class="spin"></div>
+  <div id="msg">Starting&hellip;</div>
+</div>
+<script>
+  (function () {
+    function setStatus(s) {
+      try {
+        document.getElementById("msg").textContent = (s && s.message) || "";
+        document.getElementById("wrap").classList.toggle("error", !!(s && s.phase === "error"));
+      } catch (e) {}
+    }
+    var tauri = window.__TAURI__;
+    if (tauri && tauri.event && typeof tauri.event.listen === "function") {
+      tauri.event.listen("splash:status", function (event) {
+        setStatus(event && event.payload ? event.payload : null);
+      });
+    }
+  })();
+</script>
+</body>
+</html>

@@ -1,6 +1,10 @@
 /**
  * Bus-driven entry: boots the class-based ChatApp and scene host directly.
  */
+// MUST stay the first import: installs window.rezDesktop under the Tauri
+// shell before the synchronous bridge detection below runs. No-op under
+// Electron (preload owns the bridge) and in plain browsers.
+import "./ui/desktop/installRezDesktopShim.js";
 import "./styles/fonts.css";
 import "./styles/tailwind.css";
 import "@rezprotocol/ui/framework/theme.css";

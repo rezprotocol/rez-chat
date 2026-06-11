@@ -26,6 +26,14 @@ const PROFILE_DEFAULTS = Object.freeze({
     windowWidth: 680,
     windowHeight: 820,
   }),
+  carol: Object.freeze({
+    desktopPort: 3430,
+    nodeWsPort: 8789,
+    windowX: 1448,
+    windowY: 48,
+    windowWidth: 680,
+    windowHeight: 820,
+  }),
 });
 
 export function listDesktopProfiles() {
@@ -89,11 +97,27 @@ export function resolveDesktopProfile(profileName, env = process.env) {
   };
 }
 
+/**
+ * Shell selection (Tauri migration): REZ_CHAT_SHELL=tauri (or
+ * options.shell="tauri") launches the Tauri debug binary instead of
+ * Electron. Electron stays the default until the Electron path is retired.
+ */
+function resolveShellKind(options) {
+  const fromOptions = String(options.shell || "").trim().toLowerCase();
+  if (fromOptions) return fromOptions;
+  return String(process.env.REZ_CHAT_SHELL || "electron").trim().toLowerCase();
+}
+
 export function launchDesktopProfile(profileName, options = {}) {
   const profile = resolveDesktopProfile(profileName, options.env || process.env);
   fs.mkdirSync(profile.userDataDir, { recursive: true });
 
-  const child = spawn(electronCommand(), ["./electron/main.mjs"], {
+  const shellKind = resolveShellKind(options);
+  const [command, args] = shellKind === "tauri"
+    ? [tauriCommand(), []]
+    : [electronCommand(), ["./electron/main.mjs"]];
+
+  const child = spawn(command, args, {
     cwd: CHAT_ROOT,
     env: {
       ...process.env,
@@ -147,6 +171,18 @@ function electronCommand() {
   return binName;
 }
 
+function tauriCommand() {
+  const binName = process.platform === "win32" ? "rez-chat-shell.exe" : "rez-chat-shell";
+  const debugBin = path.join(CHAT_ROOT, "src-tauri", "target", "debug", binName);
+  if (!fs.existsSync(debugBin)) {
+    throw new Error(
+      "Tauri shell binary missing at " + debugBin
+      + " — build it first: cargo build --manifest-path src-tauri/Cargo.toml",
+    );
+  }
+  return debugBin;
+}
+
 function resolvePath(value) {
   const raw = String(value || "").trim();
   if (!raw) throw new Error("Path value required");
@@ -195,21 +231,25 @@ function prefixStream(stream, prefix, target, fileStream) {
 }
 
 function printHelp() {
-  console.log(`Usage: node scripts/desktop-dev-profile.mjs <alice|bob>
+  console.log(`Usage: node scripts/desktop-dev-profile.mjs <alice|bob|carol>
 
 Environment overrides:
   REZ_CHAT_DESKTOP_PROFILE_ROOT       Base dir for profiles (default: rez-chat/.local/desktop-profiles)
   REZ_CHAT_USER_DATA_DIR              User-data dir for one manually launched profile
   REZ_CHAT_ALICE_USER_DATA_DIR        Alice user-data dir
   REZ_CHAT_BOB_USER_DATA_DIR          Bob user-data dir
+  REZ_CHAT_CAROL_USER_DATA_DIR        Carol user-data dir
   REZ_CHAT_ALICE_DESKTOP_PORT         Alice shell port (default: 3410)
   REZ_CHAT_BOB_DESKTOP_PORT           Bob shell port (default: 3420)
+  REZ_CHAT_CAROL_DESKTOP_PORT         Carol shell port (default: 3430)
   REZ_CHAT_ALICE_NODE_WS_PORT         Alice embedded node WS port (default: 8787)
   REZ_CHAT_BOB_NODE_WS_PORT           Bob embedded node WS port (default: 8788)
+  REZ_CHAT_CAROL_NODE_WS_PORT         Carol embedded node WS port (default: 8789)
   REZ_CHAT_WINDOW_X/Y                 Window position for one manually launched profile
   REZ_CHAT_WINDOW_WIDTH/HEIGHT        Window size for one manually launched profile
   REZ_CHAT_ALICE_WINDOW_X/Y           Alice window position (default: 24,48)
   REZ_CHAT_BOB_WINDOW_X/Y             Bob window position (default: 736,48)
+  REZ_CHAT_CAROL_WINDOW_X/Y           Carol window position (default: 1448,48)
 `);
 }
 
@@ -220,7 +260,12 @@ async function main() {
     return;
   }
 
-  await prepareElectronNativeModules();
+  // The Electron-ABI better-sqlite3 swap is poison for the Tauri path: the
+  // sidecar is plain Node and needs the plain-Node prebuild.
+  const tauriShell = resolveShellKind({}) === "tauri";
+  if (!tauriShell) {
+    await prepareElectronNativeModules();
+  }
   // prefix:true so a single-profile launch also tees its full log to
   // <userDataDir>/run.log — needed to capture an offline-accept run where alice
   // and bob are launched in separate terminals (so one can be quit independently).
@@ -235,11 +280,13 @@ async function main() {
   const finish = async (code, signal) => {
     if (exiting) return;
     exiting = true;
-    try {
-      await restoreNodeNativeModules();
-    } catch (err) {
-      console.error("[desktop:native] restore failed:", err && err.message ? err.message : err);
-      if (code == null || code === 0) code = 1;
+    if (!tauriShell) {
+      try {
+        await restoreNodeNativeModules();
+      } catch (err) {
+        console.error("[desktop:native] restore failed:", err && err.message ? err.message : err);
+        if (code == null || code === 0) code = 1;
+      }
     }
     if (signal) {
       process.exit(signalExitCode(signal));

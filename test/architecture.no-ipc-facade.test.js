@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DesktopSupervisor } from "../electron/runtime/DesktopSupervisor.mjs";
+import { DesktopSupervisor } from "../src/desktop/runtime/DesktopSupervisor.js";
 import { DesktopRuntimeClient } from "../src/client/runtime/DesktopRuntimeClient.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,7 +35,10 @@ test("guardrail: preload exposes no per-directive chat namespace", () => {
 });
 
 test("guardrail: registerDesktopIpc registers only generic + lifecycle IPC handlers", () => {
-  const file = path.join(CHAT_ROOT, "electron/runtime/registerDesktopIpc.mjs");
+  // Canonical location since the Tauri migration; electron/runtime/ holds a
+  // re-export stub. Both the Electron IPC path and the sidecar's control
+  // uplink register channels through this one file.
+  const file = path.join(CHAT_ROOT, "src/desktop/runtime/registerDesktopIpc.js");
   const src = fs.readFileSync(file, "utf8");
   const handles = [...src.matchAll(/ipcMain\.handle\(\s*["']([^"']+)["']/g)].map((m) => m[1]);
   const allowed = new Set([
@@ -73,6 +76,56 @@ test("guardrail: registerDesktopIpc registers only generic + lifecycle IPC handl
   }
   // Must include the generic dispatcher.
   assert.ok(handles.includes("bus:call"), "registerDesktopIpc must register `bus:call`");
+});
+
+test("guardrail: sidecar crypto channels stay a fixed primitive allowlist", () => {
+  const file = path.join(CHAT_ROOT, "src/desktop/runtime/registerDesktopCryptoChannels.js");
+  const src = fs.readFileSync(file, "utf8");
+  const handles = [...src.matchAll(/ipcMain\.handle\(\s*["']([^"']+)["']/g)].map((m) => m[1]);
+  const allowed = new Set([
+    "desktop:generateSigningKeyPair",
+    "desktop:sign",
+    "desktop:verify",
+    "desktop:dhGenerateKeyPair",
+    "desktop:dhDerive",
+    "desktop:scrypt",
+  ]);
+  for (const channel of handles) {
+    assert.ok(
+      allowed.has(channel),
+      "Forbidden hand-coded channel `" + channel + "` in registerDesktopCryptoChannels. "
+      + "Only crypto primitives belong here; bus directives MUST flow through `bus:call`. "
+      + "See CLAUDE.md §3 Transport Generality."
+    );
+  }
+});
+
+test("guardrail: control transport files do not enumerate chat directives", () => {
+  // The control uplink and sidecar entry must stay generic over the bus
+  // protocol: channels arrive via registerDesktopIpc, directives via
+  // `bus:call`. A literal "namespace.directive" string in these files means
+  // someone reintroduced a per-directive facade on the new transport.
+  const files = [
+    "src/desktop/transport/DesktopControlUplink.js",
+    "src/desktop/sidecar-main.js",
+    "src/ui/desktop/installRezDesktopShim.js",
+    "src/ui/desktop/ControlChannelClient.js",
+  ];
+  const directivePattern = /["'](session|threads|message|messages|invites|groups|contacts|channels|peerlink|profile)\.[a-zA-Z][a-zA-Z0-9]*["']/g;
+  for (const rel of files) {
+    const src = fs.readFileSync(path.join(CHAT_ROOT, rel), "utf8");
+    const stripped = src
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    const hits = [...stripped.matchAll(directivePattern)].map((m) => m[0]);
+    assert.deepEqual(
+      hits,
+      [],
+      rel + " enumerates bus directives (" + hits.join(", ") + "). "
+      + "All chat directives MUST flow through the generic `bus:call` channel. "
+      + "See CLAUDE.md §3 Transport Generality."
+    );
+  }
 });
 
 test("guardrail: DesktopSupervisor does not enumerate bus directives as methods", () => {

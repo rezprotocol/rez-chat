@@ -10,6 +10,8 @@ export class ChatWebsocketUplink {
   #chatServer;
   #bus;
   #bridgeToken;
+  #allowedOrigins;
+  #reservedUpgradePaths;
   #logger;
   #router;
   #clients;
@@ -18,7 +20,16 @@ export class ChatWebsocketUplink {
   #wss;
   #upgradeHandler;
 
-  constructor({ server, chatBridge = null, chatServer = null, bus = null, bridgeToken = "", logger = console } = {}) {
+  constructor({
+    server,
+    chatBridge = null,
+    chatServer = null,
+    bus = null,
+    bridgeToken = "",
+    allowedOrigins = [],
+    reservedUpgradePaths = [],
+    logger = console,
+  } = {}) {
     if (!server || typeof server.on !== "function") {
       throw new Error("ChatWebsocketUplink requires server");
     }
@@ -33,6 +44,23 @@ export class ChatWebsocketUplink {
       throw new Error("ChatWebsocketUplink requires bus or chatServer event emitter");
     }
     this.#bridgeToken = typeof bridgeToken === "string" ? bridgeToken : "";
+    // Non-loopback origins allowed to open this WS (exact-match strings).
+    // Tauri webviews send tauri://localhost (macOS/Linux) or
+    // http://tauri.localhost (Windows); default behavior stays loopback-only.
+    this.#allowedOrigins = new Set(
+      (Array.isArray(allowedOrigins) ? allowedOrigins : [])
+        .map((origin) => String(origin || "").trim())
+        .filter((origin) => origin.length > 0),
+    );
+    // Upgrade pathnames owned by ANOTHER uplink on the same HTTP server
+    // (e.g. the sidecar's /control channel). This uplink must leave those
+    // sockets alone instead of destroying them; unknown paths are still
+    // destroyed here.
+    this.#reservedUpgradePaths = new Set(
+      (Array.isArray(reservedUpgradePaths) ? reservedUpgradePaths : [])
+        .map((p) => String(p || "").trim())
+        .filter((p) => p.length > 0),
+    );
     this.#logger = logger || console;
     this.#router = new BridgeRouter();
     if (this.#chatBridge && typeof this.#chatBridge.getSpec === "function") {
@@ -190,6 +218,7 @@ export class ChatWebsocketUplink {
   #handleUpgrade(req, socket, head) {
     const pathname = this.#normalizePathname(req.url || "/");
     if (pathname !== "/ws") {
+      if (this.#reservedUpgradePaths.has(pathname)) return;
       socket.destroy();
       return;
     }
@@ -198,7 +227,7 @@ export class ChatWebsocketUplink {
       return;
     }
     const origin = req.headers.origin || "";
-    if (origin && !this.#isLoopbackOrigin(origin)) {
+    if (origin && !this.#isAllowedOrigin(origin)) {
       socket.destroy();
       return;
     }
@@ -360,6 +389,12 @@ export class ChatWebsocketUplink {
     } catch {
       return false;
     }
+  }
+
+  #isAllowedOrigin(origin) {
+    if (!origin || typeof origin !== "string") return false;
+    if (this.#allowedOrigins.has(origin.trim())) return true;
+    return this.#isLoopbackOrigin(origin);
   }
 
   #tokensMatch(left, right) {

@@ -126,6 +126,12 @@ export async function startRezChat(options = {}) {
     e2eDebug: String(process.env.REZ_E2E_DEBUG || "").trim() === "1",
     chatServer: null,
     bridgeToken,
+    // Tauri sidecar mode: webview origins are non-loopback, the /control
+    // uplink shares this HTTP server, and /health carries instance identity
+    // for the sidecar lock. All default to no-ops outside the sidecar.
+    allowedOrigins: Array.isArray(options.allowedOrigins) ? options.allowedOrigins : [],
+    reservedUpgradePaths: Array.isArray(options.reservedUpgradePaths) ? options.reservedUpgradePaths : [],
+    healthInfo: options.healthInfo != null ? options.healthInfo : null,
   }).start();
 
   const shellAddr = shell.address || {};

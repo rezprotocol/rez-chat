@@ -30,6 +30,9 @@ export class ChatShellHost {
   #chatBridge;
   #chatServer;
   #bridgeToken;
+  #allowedOrigins;
+  #reservedUpgradePaths;
+  #healthInfo;
   #logger;
   #server;
   #bridge;
@@ -48,6 +51,9 @@ export class ChatShellHost {
     chatBridge = null,
     chatServer = null,
     bridgeToken = "",
+    allowedOrigins = [],
+    reservedUpgradePaths = [],
+    healthInfo = null,
     logger = console,
   } = {}) {
     if (!uiRoot) throw new Error("ChatShellHost requires uiRoot");
@@ -65,6 +71,12 @@ export class ChatShellHost {
     this.#chatServer = chatServer;
     this.#chatBridge = chatBridge || (chatServer && chatServer.bridge ? chatServer.bridge : null);
     this.#bridgeToken = typeof bridgeToken === "string" ? bridgeToken : "";
+    this.#allowedOrigins = Array.isArray(allowedOrigins) ? allowedOrigins : [];
+    this.#reservedUpgradePaths = Array.isArray(reservedUpgradePaths) ? reservedUpgradePaths : [];
+    // Extra fields merged into the /health response (object or function).
+    // The Tauri sidecar reports {sidecar:true, instanceId} here so the
+    // InstanceLock stale-cleanup can verify a lock's owner before killing.
+    this.#healthInfo = healthInfo;
     this.#logger = logger || console;
     this.#server = null;
     this.#bridge = null;
@@ -103,6 +115,8 @@ export class ChatShellHost {
       chatBridge: this.#chatBridge,
       chatServer: this.#chatServer,
       bridgeToken: this.#bridgeToken,
+      allowedOrigins: this.#allowedOrigins,
+      reservedUpgradePaths: this.#reservedUpgradePaths,
       logger: this.#logger,
     }).start();
     this.#address = this.#getAddress(this.#server);
@@ -167,7 +181,7 @@ export class ChatShellHost {
     const pathname = this.#normalizePathname(req.url || "/");
     if (pathname === "/health") {
       res.writeHead(200, { "content-type": "application/json", ...securityHeaders });
-      res.end(JSON.stringify({ ok: true, tsMs: Date.now() }));
+      res.end(JSON.stringify({ ok: true, tsMs: Date.now(), ...this.#resolveHealthInfo() }));
       return;
     }
     if ((pathname === "/keystore/put" || pathname === "/keystore/fetch") && req.method === "POST") {
@@ -254,6 +268,24 @@ export class ChatShellHost {
       "x-frame-options": "DENY",
       "x-content-type-options": "nosniff",
     };
+  }
+
+  #resolveHealthInfo() {
+    if (typeof this.#healthInfo === "function") {
+      try {
+        const info = this.#healthInfo();
+        return info && typeof info === "object" ? info : {};
+      } catch (err) {
+        if (this.#logger && typeof this.#logger.warn === "function") {
+          this.#logger.warn("[shell] healthInfo provider failed", err && err.message ? err.message : err);
+        }
+        return {};
+      }
+    }
+    if (this.#healthInfo && typeof this.#healthInfo === "object") {
+      return this.#healthInfo;
+    }
+    return {};
   }
 
   #normalizePathname(urlRaw) {
