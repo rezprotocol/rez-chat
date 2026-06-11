@@ -29,8 +29,8 @@ const PROFILE_DEFAULTS = Object.freeze({
   carol: Object.freeze({
     desktopPort: 3430,
     nodeWsPort: 8789,
-    windowX: 1448,
-    windowY: 48,
+    windowX: 380,
+    windowY: 520,
     windowWidth: 680,
     windowHeight: 820,
   }),
@@ -249,7 +249,7 @@ Environment overrides:
   REZ_CHAT_WINDOW_WIDTH/HEIGHT        Window size for one manually launched profile
   REZ_CHAT_ALICE_WINDOW_X/Y           Alice window position (default: 24,48)
   REZ_CHAT_BOB_WINDOW_X/Y             Bob window position (default: 736,48)
-  REZ_CHAT_CAROL_WINDOW_X/Y           Carol window position (default: 1448,48)
+  REZ_CHAT_CAROL_WINDOW_X/Y           Carol window position (default: 380,520)
 `);
 }
 
@@ -267,8 +267,8 @@ async function main() {
     await prepareElectronNativeModules();
   }
   // prefix:true so a single-profile launch also tees its full log to
-  // <userDataDir>/run.log — needed to capture an offline-accept run where alice
-  // and bob are launched in separate terminals (so one can be quit independently).
+  // <userDataDir>/run.log — needed to capture an offline-accept run where the
+  // profiles are launched in separate terminals (so one can be quit independently).
   const { profile, child } = launchDesktopProfile(arg, { prefix: true });
   console.log("[desktop:" + profile.name + "] userData " + profile.userDataDir);
   console.log("[desktop:" + profile.name + "] run.log " + path.join(profile.userDataDir, "run.log"));

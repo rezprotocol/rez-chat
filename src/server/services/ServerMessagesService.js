@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { REZ_CONTRACT_TYPES } from "@rezprotocol/sdk/client";
 import {
   MessageSendParams,
@@ -135,7 +136,11 @@ export class ServerMessagesService extends BaseServerService {
     const inReplyToMessageId = typeof params.inReplyToMessageId === "string" ? params.inReplyToMessageId.trim() : "";
     const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
     const now = this.#clock();
-    const messageId = params.messageId || ("local_" + now);
+    // TRUST-1: include a random component so a message's id is UNGUESSABLE. A
+    // co-member must not be able to predict (and pre-seed/suppress) a future
+    // message's id; the recipient-side sender-binding guard is the hard stop, this
+    // removes the guess entirely.
+    const messageId = params.messageId || ("local_" + now + "_" + randomUUID().slice(0, 8));
     // Idempotency on messageId. A resend (tap-to-retry on a failed bubble)
     // re-enters this method with the same messageId. recordOutboundDeposit
     // already overwrites the DB row in place via _upsertMessageUnlocked,

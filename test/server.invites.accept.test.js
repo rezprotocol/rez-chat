@@ -162,6 +162,13 @@ test("invite.accept materializes a ready direct thread and sidebar index row", a
   assert.equal(listed.threads[0].threadReady, true);
   assert.equal(listed.threads[0].sendAllowed, true);
   assert.equal(events.some((record) => record.threadId === accepted.threadId), true);
+
+  // STRICT contacts/groups separation: a DIRECT (1:1) invite DOES make the
+  // inviter a contact on the acceptor side.
+  const contacts = await server.bus.call("contacts", "list", {});
+  assert.equal(contacts.items.length, 1, "direct invite creates one contact");
+  assert.equal(contacts.items[0].accountId, "rez:acct:alice");
+  assert.equal(contacts.items[0].relationshipState, "active");
 });
 
 test("invite.create forwards title; invite.accept materializes the group with that title", async () => {
@@ -279,6 +286,13 @@ test("invite.create forwards title; invite.accept materializes the group with th
   assert.ok(groupThread, "group thread materialized");
   assert.equal(groupThread.title, "Secret Group",
     "thread.title populated from envelope title");
+
+  // STRICT contacts/groups separation: accepting a GROUP invite grants
+  // membership only — it must NOT create a 1:1 contact (or every group join
+  // would flood the contact + conversation list). The inviter is reached via an
+  // explicit connect-request instead.
+  const contacts = await server.bus.call("contacts", "list", {});
+  assert.equal(contacts.items.length, 0, "group invite must NOT create a contact");
 });
 
 // --- H2: true founder + invite-create membership gate ----------------------

@@ -4,9 +4,21 @@ import {
   GroupRemovedEvent,
 } from "../../records/index.js";
 import { GroupOpPayloadV1 } from "../../records/payloads/GroupOpPayloadV1.js";
+import { verifyMemberJoinProof } from "../../records/payloads/memberJoinProof.js";
 import { SYSTEM_EVENT_KIND } from "../../records/payloads/ChatSystemEventPayloadV1.js";
 
 const CREATOR_ROLE = "creator";
+// REZ-2: cap how many co-member peer-link bootstraps a single inbound
+// member.contact op may spawn. The contacts array is record-capped at 256;
+// without this an op could fire a burst of outbound handshakes at attacker-chosen
+// inboxes. The node-global recovery-invite rate limit (ServerPeerLinkProtocol-
+// Service) is the primary throttle; this bounds per-op fan-out as defence in
+// depth. Legit large groups still heal across reconnects (reconcileMesh
+// re-broadcasts; already-established links are skipped internally).
+const MAX_BOOTSTRAP_PER_CONTACT_OP = 64;
+// REZ-9: clamp an attacker-chosen op.actedAtMs to our clock (+ skew) before using
+// it for last-writer-wins, so a far-future timestamp can't win every rename race.
+const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 function nowOpId() {
   return "gop_" + randomUUID().replace(/-/g, "");
@@ -187,13 +199,17 @@ export class ServerGroupOpApplier {
   }
 
   async #applyIncomingRename(op) {
+    // REZ-9: actedAtMs is attacker-controlled. Clamp to our clock (+ skew) so a
+    // far-future timestamp can't perpetually win LWW against contemporaneous
+    // legitimate renames.
+    const actedAtMs = Math.min(Number(op.actedAtMs) || 0, this.#clock() + MAX_CLOCK_SKEW_MS);
     const existingGroup = await this.#groupStore.getGroup({
       ownerAccountId: this.#ownerAccountId,
       groupId: op.groupId,
     }).catch(() => null);
     if (existingGroup
         && Number.isFinite(Number(existingGroup.updatedAtMs))
-        && Number(existingGroup.updatedAtMs) >= op.actedAtMs) {
+        && Number(existingGroup.updatedAtMs) >= actedAtMs) {
       return;
     }
     const { group } = await this.#groupStore.renameGroup({
@@ -359,6 +375,24 @@ export class ServerGroupOpApplier {
     const joiner = typeof op.accountId === "string" ? op.accountId.trim() : "";
     if (!sender || !joiner) return;
     if (joiner === this.#ownerAccountId) return;
+    // REZ-2: require + verify the joiner's membership-consent proof on BOTH the
+    // self-announce and forwarded paths. Without it a member could forge a join
+    // for an account whose account key they don't hold (roster injection). The
+    // proof is signed by the joiner over { groupId, accountId } and forwarded
+    // verbatim, so a forwarder cannot fabricate it.
+    const consentOk = await this.#verifyConsent(op.groupId, joiner, op.displayName, {
+      joinerSignerPublicKeyB64: op.joinerSignerPublicKeyB64,
+      joinerSigB64: op.joinerSigB64,
+    });
+    if (!consentOk) {
+      this.#logger.warn("[ServerGroupsService] dropping member.join for " + joiner
+        + ": missing/invalid consent proof (group " + op.groupId + ")");
+      return;
+    }
+    const joinProof = {
+      joinerSignerPublicKeyB64: op.joinerSignerPublicKeyB64,
+      joinerSigB64: op.joinerSigB64,
+    };
     const isSelfAnnounce = sender === joiner;
 
     // Current local membership for the joiner drives add-vs-revive and the
@@ -463,6 +497,7 @@ export class ServerGroupOpApplier {
         accountId: joiner,
         role: "member",
         displayName: joinerDisplayName,
+        joinProof,
       }).catch(() => ({ revived: false }));
       changed = revived;
     } else {
@@ -472,6 +507,7 @@ export class ServerGroupOpApplier {
         accountId: joiner,
         role: "member",
         displayName: joinerDisplayName,
+        joinProof,
       }).catch(() => ({ created: false }));
       changed = created;
     }
@@ -553,29 +589,98 @@ export class ServerGroupOpApplier {
     const protocol = this.#bus.services && this.#bus.services.peerLinkProtocol
       ? this.#bus.services.peerLinkProtocol
       : null;
+    // The group's verified creator (group.createdBy is bound to groupId via
+    // groupId = hash(createdBy:salt), checked at invite-accept). A contact entry
+    // marked isCreator is accepted only when it matches this — the creator has no
+    // join-proof, so the createdBy binding IS their proof.
+    const group = await this.#groupStore.getGroup({
+      ownerAccountId: this.#ownerAccountId, groupId: op.groupId,
+    }).catch(() => null);
+    const createdBy = group && typeof group.createdBy === "string" ? group.createdBy.trim() : "";
     let rosterChanged = false;
+    let bootstrapped = 0;
     for (const contact of contacts) {
       const acct = contact && typeof contact.accountId === "string" ? contact.accountId.trim() : "";
       const inbox = contact && typeof contact.inboxId === "string" ? contact.inboxId.trim() : "";
       if (!acct || !inbox || acct === this.#ownerAccountId) continue;
       const displayName = contact && typeof contact.displayName === "string" ? contact.displayName : "";
+      // REZ-2: confer membership ONLY for a cryptographically-verified member — a
+      // valid consent proof for { groupId, acct }, or the creator (createdBy
+      // binding). member.contact is otherwise pure routing metadata; an
+      // unverifiable entry is NOT added to the roster (closes roster injection).
+      let joinProof = null;
+      let verified = false;
+      if (contact && contact.isCreator === true) {
+        // The createdBy binding (hash(createdBy:salt) === groupId, checked at
+        // accept) IS the founder's membership warrant — no join-proof needed.
+        verified = Boolean(createdBy) && acct === createdBy;
+        // But the founder's NAME is only trustworthy if self-signed: verify their
+        // self-proof when carried so we can persist (and re-advertise) a name we
+        // can vouch for. Absent/invalid proof → membership stands, name unchanged.
+        const proof = contact && typeof contact.joinProof === "object" ? contact.joinProof : null;
+        if (verified && proof && await this.#verifyConsent(op.groupId, acct, displayName, proof)) {
+          joinProof = {
+            joinerSignerPublicKeyB64: proof.joinerSignerPublicKeyB64,
+            joinerSigB64: proof.joinerSigB64,
+          };
+        }
+      } else {
+        const proof = contact && typeof contact.joinProof === "object" ? contact.joinProof : null;
+        verified = await this.#verifyConsent(op.groupId, acct, displayName, proof);
+        if (verified) {
+          joinProof = {
+            joinerSignerPublicKeyB64: proof.joinerSignerPublicKeyB64,
+            joinerSigB64: proof.joinerSigB64,
+          };
+        }
+      }
+      if (!verified) {
+        this.#logger.warn("[ServerGroupsService] member.contact: dropping unverifiable member "
+          + acct + " (group " + op.groupId + ")");
+        continue;
+      }
       const { membership, created } = await this.#groupStore.ensureMembership({
         ownerAccountId: this.#ownerAccountId,
         groupId: op.groupId,
         accountId: acct,
         role: "member",
         displayName,
+        joinProof,
       }).catch(() => ({ membership: null, created: false }));
       if (created) rosterChanged = true;
       const isActive = membership && String(membership.state || "").toLowerCase() === "active";
       // Never mesh with a member we hold as removed/left (don't undo a kick).
-      if (isActive && protocol && typeof protocol.bootstrapCoMemberLink === "function") {
+      // REZ-2: bound the outbound-handshake fan-out a single op may trigger.
+      if (isActive && protocol && typeof protocol.bootstrapCoMemberLink === "function"
+          && bootstrapped < MAX_BOOTSTRAP_PER_CONTACT_OP) {
+        bootstrapped += 1;
         // Fire-and-forget: establish a link with this co-member by re-inviting
         // them (skipped internally if a live/establishing link already exists).
         protocol.bootstrapCoMemberLink({ peerAccountId: acct, peerInboxId: inbox });
       }
     }
     if (rosterChanged) await this.#emitMembersUpdated(op.groupId);
+  }
+
+  // REZ-2: verify a membership-consent proof against the account-key authority.
+  // Returns false (fail-closed) when the authority is absent or the proof is
+  // missing/invalid. The authority is wired in bootstrapChatServer; tests that
+  // drive the group services directly install a double on bus.runtime.accountAuthority.
+  async #verifyConsent(groupId, accountId, displayName, proof) {
+    const authority = this.#bus.runtime && this.#bus.runtime.accountAuthority
+      ? this.#bus.runtime.accountAuthority : null;
+    if (!authority) {
+      this.#logger.error("[ServerGroupsService] consent verification unavailable — no account authority");
+      return false;
+    }
+    return verifyMemberJoinProof({
+      authority,
+      groupId,
+      accountId,
+      displayName,
+      joinerSignerPublicKeyB64: proof ? proof.joinerSignerPublicKeyB64 : "",
+      joinerSigB64: proof ? proof.joinerSigB64 : "",
+    });
   }
 
   // Build {accountId, inboxId, displayName} for every active member we hold a
@@ -586,25 +691,61 @@ export class ServerGroupOpApplier {
   // their own entry. Idempotent.
   async #broadcastKnownContacts(groupId) {
     const inboxes = await this.#knownPeerInboxes();
-    if (inboxes.size === 0) return;
+    const group = await this.#groupStore.getGroup({
+      ownerAccountId: this.#ownerAccountId, groupId,
+    }).catch(() => null);
+    const createdBy = group && typeof group.createdBy === "string" ? group.createdBy.trim() : "";
+    const ownInbox = this.#bus.runtime && this.#bus.runtime.inboxClaimant
+      && typeof this.#bus.runtime.inboxClaimant.inboxId === "string"
+      ? this.#bus.runtime.inboxClaimant.inboxId.trim() : "";
     const members = await this.#groupStore.listMembers({
       ownerAccountId: this.#ownerAccountId,
       groupId,
     }).catch(() => []);
-    const active = (Array.isArray(members) ? members : []).filter((m) =>
-      m && m.state === "active" && m.accountId !== this.#ownerAccountId);
+    // INCLUDE the owner this time (recipients skip their own entry): a member can
+    // only be re-advertised onward by a peer who holds its consent proof, so the
+    // owner must advertise ITSELF (with its own proof, or the creator marker) for
+    // transitively-introduced members to learn — and verify — it. See REZ-2.
+    const active = (Array.isArray(members) ? members : []).filter((m) => m && m.state === "active");
     const contacts = [];
     for (const member of active) {
-      const inbox = inboxes.get(member.accountId);
+      const acct = member.accountId;
+      const inbox = acct === this.#ownerAccountId ? ownInbox : inboxes.get(acct);
       if (!inbox) continue;
-      contacts.push({
-        accountId: member.accountId,
+      const entry = {
+        accountId: acct,
         inboxId: inbox,
         displayName: typeof member.displayName === "string" ? member.displayName : "",
-      });
+      };
+      // REZ-2: attach the verifiable warrant for this member's membership so the
+      // recipient can confer it without trusting us. Creator -> createdBy marker;
+      // everyone else -> their persisted consent proof. A member we cannot vouch
+      // for verifiably (no proof, not the creator) is omitted, never asserted.
+      if (createdBy && acct === createdBy) {
+        entry.isCreator = true;
+        // The createdBy marker authenticates the founder's IDENTITY, but not their
+        // display NAME. Carry the founder's self-signed proof when present so the
+        // recipient can verify the name too (TRUST-3) — otherwise a forwarder could
+        // rename the creator. Founders self-sign at invite time (createInvite ->
+        // ensureSelfMembershipProof); a not-yet-signed founder is marker-only.
+        if (member.joinerSignerPublicKeyB64 && member.joinerSigB64) {
+          entry.joinProof = {
+            joinerSignerPublicKeyB64: member.joinerSignerPublicKeyB64,
+            joinerSigB64: member.joinerSigB64,
+          };
+        }
+      } else if (member.joinerSignerPublicKeyB64 && member.joinerSigB64) {
+        entry.joinProof = {
+          joinerSignerPublicKeyB64: member.joinerSignerPublicKeyB64,
+          joinerSigB64: member.joinerSigB64,
+        };
+      } else {
+        continue;
+      }
+      contacts.push(entry);
     }
     if (contacts.length === 0) return;
-    const targets = active.map((m) => m.accountId);
+    const targets = active.map((m) => m.accountId).filter((a) => a !== this.#ownerAccountId);
     if (targets.length === 0) return;
     const payload = new GroupOpPayloadV1({
       op: "member.contact",
@@ -668,6 +809,10 @@ export class ServerGroupOpApplier {
       ? this.#bus.services.threads.groupThreadId(groupId)
       : null;
     if (!threadId) return;
+    // TRUST: actedAtMs is attacker-chosen; clamp to our clock (+ skew) so a joiner
+    // can't place their "joined" banner arbitrarily far in the past/future in
+    // everyone's timeline (mirrors the rename clamp).
+    const clampedActedAtMs = Math.min(Number(actedAtMs) || this.#clock(), this.#clock() + MAX_CLOCK_SKEW_MS);
     const messageId = "sys:join:" + groupOpId;
     const payload = {
       kind: SYSTEM_EVENT_KIND,
@@ -675,7 +820,7 @@ export class ServerGroupOpApplier {
       groupId,
       actorAccountId,
       actorDisplayName: typeof actorDisplayName === "string" ? actorDisplayName : "",
-      actedAtMs,
+      actedAtMs: clampedActedAtMs,
     };
     await this.#threadStore.upsertMessage({
       messageId,
@@ -686,8 +831,8 @@ export class ServerGroupOpApplier {
       payload,
       text: "",
       status: "delivered",
-      createdAtMs: actedAtMs,
-      acceptedAtMs: actedAtMs,
+      createdAtMs: clampedActedAtMs,
+      acceptedAtMs: clampedActedAtMs,
     }).catch((err) => {
       this.#logger.warn("[ServerGroupsService] system join message persist failed",
         err && err.message ? err.message : err);

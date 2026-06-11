@@ -245,7 +245,17 @@ export class ServerProfileService extends BaseServerService {
       accountId: senderAccountId.trim(),
     });
 
-    if (existing && typeof existing.updatedAtMs === "number" && existing.updatedAtMs >= profile.updatedAtMs) {
+    // Profiles only UPDATE an existing contact; they never CREATE one. Contacts
+    // come solely from an explicit 1:1 flow (direct invite / connect-request
+    // approval). A profile from a peer we hold no contact record for — e.g. a
+    // group co-member sharing a fan-out peer-link — must not mint a contact, or
+    // group membership would leak into the contact/conversation list. We still
+    // acknowledge the profile (return true); there is simply nothing to store.
+    if (!existing) {
+      return true;
+    }
+
+    if (typeof existing.updatedAtMs === "number" && existing.updatedAtMs >= profile.updatedAtMs) {
       return true;
     }
 

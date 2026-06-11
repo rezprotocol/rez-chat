@@ -6,6 +6,7 @@ import { GroupDetailView } from "./GroupDetailView.js";
 import { InviteFormsView } from "./InviteFormsView.js";
 import { ContactRowView } from "./ContactRowView.js";
 import { GroupRowView } from "./GroupRowView.js";
+import { PendingRequestsSectionView } from "./PendingRequestsSectionView.js";
 
 const FILTER_CONTACTS = "contacts";
 const FILTER_GROUPS = "groups";
@@ -39,6 +40,7 @@ export class ContactsTabView extends BusComponent {
   #paneHost;
   #paneSlotEl;
   #lastSelectedGroupId;
+  #pendingSection;
 
   constructor({ bus } = {}) {
     super({ bus });
@@ -50,6 +52,7 @@ export class ContactsTabView extends BusComponent {
     this.#paneHost = null;
     this.#paneSlotEl = null;
     this.#lastSelectedGroupId = null;
+    this.#pendingSection = null;
   }
 
   mount(parentEl) {
@@ -103,9 +106,16 @@ export class ContactsTabView extends BusComponent {
     ]);
     sidebar.appendChild(header);
 
-    this.#listEl = h("div", { className: "flex-1 overflow-y-auto custom-scrollbar" }, []);
+    const scrollArea = h("div", { className: "flex-1 overflow-y-auto custom-scrollbar" }, []);
+    const pendingSlot = h("div", {});
+    this.#pendingSection = new PendingRequestsSectionView({ bus: this.bus });
+    this.#pendingSection.mount(pendingSlot);
+    scrollArea.appendChild(pendingSlot);
+
+    this.#listEl = h("div", {}, []);
     this.#listState = "";
-    sidebar.appendChild(this.#listEl);
+    scrollArea.appendChild(this.#listEl);
+    sidebar.appendChild(scrollArea);
 
     this.#paneSlotEl = h("section", { className: "flex-1 min-w-0 flex flex-col relative h-full chat-canvas-recessed" }, []);
 
@@ -266,6 +276,10 @@ export class ContactsTabView extends BusComponent {
 
   unmount() {
     this.#teardownRows();
+    if (this.#pendingSection) {
+      this.#pendingSection.unmount();
+      this.#pendingSection = null;
+    }
     if (this.#paneHost) {
       this.#paneHost.unmount();
       this.#paneHost = null;

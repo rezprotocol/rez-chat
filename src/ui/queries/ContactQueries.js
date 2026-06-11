@@ -50,4 +50,27 @@ export class ContactQueries {
     }
     return out;
   }
+
+  // Incoming connect requests awaiting this user's approve/deny.
+  incomingConnectRequests() {
+    const store = this.#stores.connectRequests;
+    if (!store || typeof store.getIncoming !== "function") return [];
+    return store.getIncoming();
+  }
+
+  incomingConnectRequestCount() {
+    const store = this.#stores.connectRequests;
+    if (!store || typeof store.incomingCount !== "function") return 0;
+    return store.incomingCount();
+  }
+
+  // The pending direction for a given peer ("incoming" | "outgoing" | null) —
+  // lets a row show Approve/Deny vs "Requested".
+  connectRequestDirection(accountId) {
+    const store = this.#stores.connectRequests;
+    if (!store || typeof store.getByPeer !== "function") return null;
+    const req = store.getByPeer(accountId);
+    if (!req || req.state !== "pending") return null;
+    return req.direction === "incoming" ? "incoming" : "outgoing";
+  }
 }

@@ -6,6 +6,7 @@ import { UiStateStore } from "../stores/UiStateStore.js";
 import { ThreadStore } from "../stores/ThreadStore.js";
 import { MessageStore } from "../stores/MessageStore.js";
 import { ContactStore } from "../stores/ContactStore.js";
+import { ConnectRequestStore } from "../stores/ConnectRequestStore.js";
 import { GroupStore } from "../stores/GroupStore.js";
 import { ChannelStore } from "../stores/ChannelStore.js";
 import { InviteStore } from "../stores/InviteStore.js";
@@ -80,6 +81,7 @@ export class ChatApp {
     this.bus.stores.threads = new ThreadStore({ bus: this.bus });
     this.bus.stores.messages = new MessageStore({ bus: this.bus });
     this.bus.stores.contacts = new ContactStore({ bus: this.bus });
+    this.bus.stores.connectRequests = new ConnectRequestStore({ bus: this.bus });
     this.bus.stores.groups = new GroupStore({ bus: this.bus });
     this.bus.stores.channels = new ChannelStore({ bus: this.bus });
     this.bus.stores.invites = new InviteStore({ bus: this.bus });
@@ -165,6 +167,7 @@ export class ChatApp {
       contacts: new ContactsService({
         bus: this.bus,
         contactStore: this.bus.stores.contacts,
+        connectRequestStore: this.bus.stores.connectRequests,
       }),
       groups: new GroupsService({
         bus: this.bus,

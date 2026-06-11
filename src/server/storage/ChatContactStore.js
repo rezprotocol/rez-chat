@@ -78,6 +78,14 @@ export class ContactStore {
     });
   }
 
+  async delete({ ownerAccountId, accountId } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const contact = requireId(accountId, "accountId");
+    const existing = await this.get({ ownerAccountId: owner, accountId: contact });
+    await this.contacts.delete(owner, contact);
+    return { deleted: Boolean(existing) };
+  }
+
   async rename({ ownerAccountId, accountId, displayName } = {}) {
     return this.upsert({ ownerAccountId, accountId, patch: { displayName } });
   }

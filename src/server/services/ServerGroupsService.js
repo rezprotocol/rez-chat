@@ -20,6 +20,7 @@ import {
 } from "../../records/index.js";
 import { ChatGroupMember } from "../../records/domain/ChatGroupMember.js";
 import { GroupOpPayloadV1 } from "../../records/payloads/GroupOpPayloadV1.js";
+import { signMemberJoinProof } from "../../records/payloads/memberJoinProof.js";
 import { BaseServerService } from "../base/BaseServerService.js";
 import { ServerGroupBroadcaster } from "./ServerGroupBroadcaster.js";
 import { ServerGroupOpApplier } from "./ServerGroupOpApplier.js";
@@ -438,16 +439,87 @@ export class ServerGroupsService extends BaseServerService {
     const inviter = typeof inviterAccountId === "string" ? inviterAccountId.trim() : "";
     const id = typeof inviteId === "string" ? inviteId.trim() : "";
     if (!gid || !inviter || !id) return;
+    // REZ-2: sign a membership-consent proof with our account key. Recipients
+    // (the inviter, and every forward recipient) verify it before conferring our
+    // membership, so a member cannot forge a join for an account they don't hold.
+    const authority = this.bus.runtime && this.bus.runtime.accountAuthority ? this.bus.runtime.accountAuthority : null;
+    if (!authority || !authority.signer) {
+      this.logger.error("[ServerGroupsService] member.join NOT sent — no account authority to sign consent proof");
+      return;
+    }
+    const ownName = typeof displayName === "string" ? displayName : "";
+    let proof;
+    try {
+      proof = await signMemberJoinProof({
+        signer: authority.signer, groupId: gid, accountId: this.ownerAccountId, displayName: ownName,
+      });
+    } catch (err) {
+      this.logger.error("[ServerGroupsService] member.join consent-proof signing failed",
+        err && err.message ? err.message : err);
+      return;
+    }
+    // Persist our own proof + the EXACT name it was signed over onto our
+    // self-membership row, so the mesh-bootstrap path (#broadcastKnownContacts) can
+    // re-advertise us — name and proof must stay a matched pair to re-verify.
+    await this.#groupStore.ensureMembership({
+      ownerAccountId: this.ownerAccountId, groupId: gid, accountId: this.ownerAccountId,
+      displayName: ownName, joinProof: proof,
+    }).catch((err) => {
+      this.logger.warn("[ServerGroupsService] failed to persist own member.join proof",
+        err && err.message ? err.message : err);
+    });
     const payload = new GroupOpPayloadV1({
       op: "member.join",
       groupId: gid,
       accountId: this.ownerAccountId,
       inviteId: id,
-      displayName: typeof displayName === "string" ? displayName : "",
+      displayName: ownName,
+      joinerSignerPublicKeyB64: proof.joinerSignerPublicKeyB64,
+      joinerSigB64: proof.joinerSigB64,
       actedAtMs: this.#clock(),
       groupOpId: nowOpId(),
     });
     await this.#broadcaster.fanOut({ targets: [inviter], payload });
+  }
+
+  // The founder is the only member who never runs the member.join path (they
+  // CREATED the group instead of joining it), so their self-membership row
+  // carries no name-bound consent proof — and #broadcastKnownContacts would
+  // advertise them with an empty displayName, leaving invitees with a nameless
+  // creator row. Sign a self consent-proof now, bound to the EXACT name they're
+  // inviting under, so co-members can cryptographically VERIFY the founder's
+  // display name (not merely trust a forwarder — TRUST-3). No-op once a proof
+  // exists (joiners already have one; a founder re-signs only the first time).
+  async ensureSelfMembershipProof({ groupId, displayName = "" } = {}) {
+    const gid = typeof groupId === "string" ? groupId.trim() : "";
+    const name = typeof displayName === "string" ? displayName.trim() : "";
+    if (!gid || !name) return;
+    const existing = await this.#getMembership(gid, this.ownerAccountId);
+    if (!existing) return;
+    const hasProof = typeof existing.joinerSigB64 === "string" && existing.joinerSigB64;
+    if (hasProof) return;
+    const authority = this.bus.runtime && this.bus.runtime.accountAuthority ? this.bus.runtime.accountAuthority : null;
+    if (!authority || !authority.signer) {
+      this.logger.error("[ServerGroupsService] cannot sign founder self-proof — no account authority");
+      return;
+    }
+    let proof;
+    try {
+      proof = await signMemberJoinProof({
+        signer: authority.signer, groupId: gid, accountId: this.ownerAccountId, displayName: name,
+      });
+    } catch (err) {
+      this.logger.error("[ServerGroupsService] founder self-proof signing failed",
+        err && err.message ? err.message : err);
+      return;
+    }
+    await this.#groupStore.ensureMembership({
+      ownerAccountId: this.ownerAccountId, groupId: gid, accountId: this.ownerAccountId,
+      displayName: name, joinProof: proof,
+    }).catch((err) => {
+      this.logger.warn("[ServerGroupsService] failed to persist founder self-proof",
+        err && err.message ? err.message : err);
+    });
   }
 
   async #getMembership(groupId, accountId) {

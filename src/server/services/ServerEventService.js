@@ -1,5 +1,7 @@
 import {
+  ChatMessage,
   MessageDepositedEvent,
+  MessageUpdatedEvent,
   PeerLinkUpdatedEvent,
 } from "../../records/index.js";
 import { getPayloadEntry } from "../../records/payloads/index.js";
@@ -85,12 +87,25 @@ export class ServerEventService extends BaseServerService {
     let threadReady = true;
 
     const peerLinkId = typeof body.peerLinkId === "string" ? body.peerLinkId : "";
+    const activeInviteId = typeof body.activeInviteId === "string" ? body.activeInviteId : "";
 
     // Peer-link snapshots are pure crypto plumbing — they materialize the
     // direct-thread record, contact, and trigger the profile send. Group
     // membership is established by the explicit `member.join` op handled
     // by ServerGroupsService; do NOT touch group state here.
     if (body.state === "established" || body.state === "session_established") {
+      // STRICT contacts/groups separation. A link establishes INVISIBLY (no DM
+      // thread, no conversation-list row, no contact, no profile exchange) unless
+      // it represents an explicit 1:1 relationship. Joining a big group
+      // establishes a transport link per member; none may surface, or the
+      // conversation list is spammed. We materialize ONLY when we already hold a
+      // contact record (an `invited` connect-request placeholder, or an active
+      // contact) OR the link was opened by a real DIRECT invite. Group invites
+      // and the auto co-member mesh-bootstrap match neither, so they stay
+      // invisible — the peer connects explicitly via connect-request.
+      if (peerAccountId && !(await this.#shouldMaterializeDirectLink(peerAccountId, activeInviteId))) {
+        return;
+      }
       if (peerAccountId) {
         if (!threadId && this.bus.services.threads && typeof this.bus.services.threads.directThreadIdForPeerLink === "function") {
           threadId = this.bus.services.threads.directThreadIdForPeerLink(peerLinkId, peerAccountId);
@@ -118,6 +133,8 @@ export class ServerEventService extends BaseServerService {
         }
       }
       if (peerAccountId) {
+        // We only reach here for a materializing link (gated above), so create/
+        // activate the contact directly.
         await this.bus.services.contacts.ensureActiveContact({
           accountId: peerAccountId,
           displayName: remoteDisplayName,
@@ -251,16 +268,61 @@ export class ServerEventService extends BaseServerService {
       }
     }
     if (!thread && payloadSender) {
-      const resolved = await this.#resolveDirectThreadForSender({
-        senderAccountId: payloadSender,
-        createdAtMs: this.#clock(),
-      });
-      if (resolved && resolved.threadId && resolved.thread) {
-        threadId = resolved.threadId;
-        thread = resolved.thread;
+      // Direct-content delivery gate (the 1:1 analog of the group authz gate
+      // below): only an APPROVED (active) contact may open/deliver into a direct
+      // thread. Co-members share a transport peer-link for group fan-out, but a
+      // 1:1 DM requires connect-request approval — otherwise any co-member could
+      // DM a thread into existence and spam the conversation list. Keyed to the
+      // cryptographically-authenticated envelopeSender (not the self-declared
+      // payloadSender) so impersonation can't pass the gate. Threadless control
+      // payloads (connect-request) carry no payload senderAccountId, so they
+      // never enter this branch; they dispatch below via envelopeSender.
+      const authedDirectSender = envelopeSender || payloadSender;
+      let senderAllowed = this.bus.services.contacts
+        && typeof this.bus.services.contacts.isActiveContact === "function"
+        ? await this.bus.services.contacts.isActiveContact(authedDirectSender)
+        : true;
+      // A peer we sent a connect-request to has now ACCEPTED it: this very
+      // content, authenticated and decrypted over the established link, is the
+      // acceptance proof. The inviter-side snapshot gate can't catch this when we
+      // were already co-members (the link is reused, so the snapshot carries the
+      // co-member invite id, not our direct one), so the contact is still stuck
+      // `invited` here. Activate it and let the message through instead of
+      // dropping it — see ServerContactsService.acceptOutgoingConnectRequest.
+      if (!senderAllowed && this.bus.services.contacts
+          && typeof this.bus.services.contacts.acceptOutgoingConnectRequest === "function") {
+        senderAllowed = await this.bus.services.contacts.acceptOutgoingConnectRequest(authedDirectSender);
+      }
+      if (senderAllowed) {
+        const resolved = await this.#resolveDirectThreadForSender({
+          senderAccountId: payloadSender,
+          createdAtMs: this.#clock(),
+        });
+        if (resolved && resolved.threadId && resolved.thread) {
+          threadId = resolved.threadId;
+          thread = resolved.thread;
+        }
+      } else {
+        this.logger.warn("[ServerEventService] dropped direct content from non-contact " + authedDirectSender);
       }
     }
     const peerAcct = thread && typeof thread.peerAccountId === "string" ? thread.peerAccountId.trim() : "";
+
+    // SECURITY (REZ-3) — direct-thread sender binding. For a 1:1 thread the
+    // message MUST come from that thread's peer. `threadId` is attacker-supplied;
+    // the direct-content gate above (isActiveContact) only runs when the thread had
+    // to be RESOLVED from the sender (the `!thread` branch). When the attacker
+    // supplies an existing direct threadId that resolved a thread, that gate is
+    // skipped and the group gate below ignores non-group threads — so without this
+    // check a co-member who can deliver an authenticated payload could pass any
+    // direct threadId and have their message attributed to (and edit/tombstone/
+    // react AS) the thread's real peer. envelopeSender is cryptographically
+    // authenticated; drop when it doesn't own the resolved direct thread.
+    if (thread && thread.threadType === "direct" && envelopeSender && peerAcct && peerAcct !== envelopeSender) {
+      this.logger.warn("[ServerEventService] dropped direct content: thread peer "
+        + peerAcct + " != authenticated sender " + envelopeSender);
+      return;
+    }
 
     // SECURITY — authoritative group-content authorization (audit pass 5, H1).
     // The decision lives in ServerGroupAuthzGate; we own the side effects. The
@@ -335,8 +397,9 @@ export class ServerEventService extends BaseServerService {
 
     const now = this.#clock();
     let messagePersisted = false;
+    let persistedMutated = null;
     if (threadId && canonicalMessageId) {
-      await this.bus.stores.threadStore.upsertDepositedMessage({
+      const persistResult = await this.bus.stores.threadStore.upsertDepositedMessage({
         messageId: canonicalMessageId,
         threadId,
         senderKey: senderAccountId || mailboxId,
@@ -346,11 +409,21 @@ export class ServerEventService extends BaseServerService {
         status: "delivered",
         text: previewText,
         payload: decodedPayload,
-      }).then(() => {
-        messagePersisted = true;
       }).catch((err) => {
         this.logger.error("[ServerEventService] inbound message persist failed", err && err.message ? err.message : err);
+        return null;
       });
+      if (persistResult) {
+        messagePersisted = true;
+        // Out-of-order mutations (edit/reaction/tombstone delivered before their
+        // target) were buffered and folded in on deposit. The message.deposited
+        // event below carries the BASE message, so capture the mutated row and
+        // emit message.updated after it — otherwise the fold is invisible until
+        // a refetch.
+        if (persistResult.mutated && persistResult.message) {
+          persistedMutated = persistResult.message;
+        }
+      }
 
       const indexRecord = await this.bus.stores.threadIndex.upsertFromMessage({
         threadId,
@@ -438,6 +511,16 @@ export class ServerEventService extends BaseServerService {
     });
     this._emit("runtime.event.message.deposited", record);
     this._emit("message.deposited", record);
+
+    // Follow the base deposit with the folded-in state when buffered mutations
+    // drained on arrival, so the renderer applies the edit/reaction/tombstone
+    // instead of showing the un-mutated message until the next refetch.
+    if (persistedMutated) {
+      const mutatedMessage = persistedMutated instanceof ChatMessage
+        ? persistedMutated
+        : new ChatMessage({ ...persistedMutated, threadId });
+      this._emit("message.updated", new MessageUpdatedEvent({ threadId, message: mutatedMessage }));
+    }
   }
 
   async #handleDeliveryAck(event) {
@@ -484,6 +567,35 @@ export class ServerEventService extends BaseServerService {
    */
   async flushDeferredGroupMessages(groupId, accountId) {
     await this.#deferred.flush(groupId, accountId, (event) => this.#handleMailboxDeposited(event));
+  }
+
+  // STRICT contacts/groups separation gate for the peer-link-established path.
+  // This path materializes the INVITER/REQUESTER side (the acceptor materializes
+  // its own thread synchronously inside ServerInvitesService.acceptInvite). A
+  // direct thread + conversation-list row appears ONLY when:
+  //   (a) the contact is already ACTIVE — re-establishment/recovery of a link we
+  //       have already accepted, or
+  //   (b) the link was opened by a real DIRECT invite we minted (the out-of-band
+  //       "Generate invite code" flow, or a connect-request whose peer just
+  //       ACCEPTED — the snapshot's activeInviteId is that direct invite).
+  // Deliberately NOT keyed on a mere contact RECORD: an outgoing connect-request
+  // leaves an `invited` placeholder for pending UI, but the peer has not accepted
+  // yet — its only snapshots are co-member/heartbeat/recovery links carrying a
+  // DIFFERENT invite id, so they fall through here and no premature DM thread is
+  // shown. A group invite (membership only) and the auto co-member mesh-bootstrap
+  // also match neither, so they establish invisibly. Fail closed (invisible).
+  async #shouldMaterializeDirectLink(peerAccountId, activeInviteId) {
+    const contacts = this.bus.services && this.bus.services.contacts ? this.bus.services.contacts : null;
+    if (contacts && typeof contacts.isActiveContact === "function"
+        && await contacts.isActiveContact(peerAccountId)) {
+      return true;
+    }
+    const invites = this.bus.services && this.bus.services.invites ? this.bus.services.invites : null;
+    if (activeInviteId && invites && typeof invites.isDirectContactInvite === "function"
+        && invites.isDirectContactInvite(activeInviteId)) {
+      return true;
+    }
+    return false;
   }
 
   async #resolveDirectThreadForSender({ senderAccountId, createdAtMs } = {}) {

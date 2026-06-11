@@ -574,18 +574,35 @@ export class ThreadStoreService {
       const thread = await this.getThread(id);
       this._assertThreadReadyForMessaging(thread, { threadId: id });
       const existingMessages = await this._loadMessages(id);
+      const incomingSender = nonEmpty(senderAccountId);
+      let effectiveMid = mid;
       const existing = existingMessages.find((row) => row.messageId === mid) || null;
       if (existing) {
-        return { inserted: false, message: existing };
+        const existingSender = nonEmpty(existing.senderAccountId);
+        // Genuine idempotent re-delivery: same authenticated sender (or we have no
+        // sender identity to distinguish by) → collapse, as before.
+        if (!incomingSender || !existingSender || existingSender === incomingSender) {
+          return { inserted: false, message: existing, mutated: false };
+        }
+        // TRUST-1: messageId is attacker-choosable, so one account must NEVER be
+        // able to collide/pre-seed an id to SUPPRESS another account's message
+        // (first-write-wins would silently drop the legitimate one). The
+        // authenticated sender is the source of truth: bind the stored id to it so
+        // BOTH messages survive. The original id keeps resolving the first row;
+        // edit/tombstone author-checks already gate on senderAccountId, so the
+        // disambiguated row can only ever be mutated by its real owner.
+        effectiveMid = mid + "@" + incomingSender;
+        const dupe = existingMessages.find((row) => row.messageId === effectiveMid) || null;
+        if (dupe) return { inserted: false, message: dupe, mutated: false };
       }
       const stored = await this._upsertMessageUnlocked({
-        messageId: mid,
+        messageId: effectiveMid,
         threadId: id,
         packetB64,
         text,
         payload,
         senderKey: normalizedSenderKey,
-        senderAccountId: nonEmpty(senderAccountId),
+        senderAccountId: incomingSender,
         status: initialStatus,
         sentAtMs: initialStatus === "pending" ? null : createdAt,
         acceptedAtMs: initialStatus === "delivered" ? createdAt : null,
@@ -597,9 +614,13 @@ export class ThreadStoreService {
       }
       const drained = await this._drainPendingMutationsUnlocked({
         threadId: id,
-        targetMessageId: mid,
+        targetMessageId: effectiveMid,
       });
-      return { inserted: true, message: drained || stored };
+      // `mutated` tells the caller the freshly-deposited row already had
+      // out-of-order edits/reactions/tombstones folded in, so it knows to emit
+      // message.updated on top of message.deposited — otherwise those mutations
+      // are persisted but never reach the renderer until a refetch.
+      return { inserted: true, message: drained || stored, mutated: Boolean(drained) };
     });
   }
 

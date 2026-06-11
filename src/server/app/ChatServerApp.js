@@ -1,4 +1,4 @@
-import { ThreadStoreService, ThreadIndexService, ContactStore, GroupStore, ChannelStore, LinkPreviewStore } from "../storage/index.js";
+import { ThreadStoreService, ThreadIndexService, ContactStore, ConnectRequestStore, GroupStore, ChannelStore, LinkPreviewStore } from "../storage/index.js";
 import { ChatServerBus } from "./ChatServerBus.js";
 import { ChatBridge } from "../transport/ChatBridge.js";
 import { InboundDepositPipeline } from "../runtime/InboundDepositPipeline.js";
@@ -40,6 +40,7 @@ export class ChatServerApp {
     peerLinkService = null,
     inboxClaimant = null,
     expectedNodePublicKeyB64 = "",
+    accountAuthority = null,
     logger = console,
   } = {}) {
     if (!Array.isArray(uplinks) || uplinks.length === 0) {
@@ -64,6 +65,11 @@ export class ChatServerApp {
     // runtime — chat-server uses this inboxId for invites/deposits instead
     // of the SDK session's ephemeral assignment.
     this.bus.runtime.inboxClaimant = inboxClaimant;
+    // Account-key signer/verifier (REZ-2): the same authority that signs invite
+    // envelopes, used here to sign + verify membership-consent proofs on group
+    // ops. bootstrapChatServer passes the real authority; tests that drive the
+    // group services directly install a double on bus.runtime.accountAuthority.
+    this.bus.runtime.accountAuthority = accountAuthority;
     this.#createServices({ identity, uplinks, clock, sdk, peerLinkService, inboxClaimant, expectedNodePublicKeyB64, logger });
     this.#bridge = new ChatBridge({
       bus: this.bus,
@@ -161,6 +167,10 @@ export class ChatServerApp {
       storageProvider,
       clock: this.#clock,
     });
+    this.bus.stores.connectRequestStore = new ConnectRequestStore({
+      storageProvider,
+      clock: this.#clock,
+    });
     this.bus.stores.groupStore = new GroupStore({
       storageProvider,
       clock: this.#clock,
@@ -218,6 +228,7 @@ export class ChatServerApp {
       contacts: new ServerContactsService({
         bus: this.bus,
         contactStore: this.bus.stores.contactStore,
+        connectRequestStore: this.bus.stores.connectRequestStore,
         ownerAccountId: this.#ownerAccountId,
         clock,
         logger,

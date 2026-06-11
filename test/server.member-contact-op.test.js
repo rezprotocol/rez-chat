@@ -5,6 +5,7 @@ import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupStore } from "../src/server/storage/ChatGroupStore.js";
 import { GroupOpPayloadV1, groupOpPayloadToBytes } from "../src/records/payloads/GroupOpPayloadV1.js";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
+import { permissiveAccountAuthority, testConsentProof } from "./support/memberConsentDouble.js";
 
 /**
  * member.contact op coverage: peer-routing propagation that lets a transitively
@@ -57,6 +58,7 @@ function createServer(storage) {
       ...makeSealDispatch(),
       getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
     },
+    accountAuthority: permissiveAccountAuthority(),
   });
 }
 
@@ -108,7 +110,7 @@ test("applying member.contact adds the co-member (add-only) and fires an introdu
   server.bus.services.peerLinkProtocol.bootstrapCoMemberLink = (args) => calls.push(args);
 
   await server.bus.services.groups.handleIncomingGroupOp(
-    contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie", displayName: "Newbie" }]),
+    contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie", displayName: "Newbie", joinProof: testConsentProof() }]),
     { senderAccountId: SENDER },
   );
 
@@ -132,7 +134,7 @@ test("member.contact never resurrects a removed member, and fires no introductio
   server.bus.services.peerLinkProtocol.bootstrapCoMemberLink = (args) => calls.push(args);
 
   await server.bus.services.groups.handleIncomingGroupOp(
-    contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie" }]),
+    contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie", joinProof: testConsentProof() }]),
     { senderAccountId: SENDER },
   );
 

@@ -23,10 +23,40 @@ import {
  * (`sdk.durableRecords`), so accepts succeed with the inviter offline.
  */
 export class ServerInvitesService extends BaseServerService {
+  // inviteIds we minted as REAL direct (1:1) invites — the out-of-band "Generate
+  // invite code" flow and connect-request approvals. The peer-link-established
+  // path consults this to materialize the INVITER's contact + DM thread for a
+  // genuine direct invite, while staying invisible for group invites
+  // (kind:"group", never added) and the auto co-member mesh-bootstrap (which is
+  // minted straight through the SDK peerLinks, bypassing createInvite). Bounded
+  // FIFO so it can't grow without limit across a long session.
+  #directContactInviteIds;
+  #directInviteOrder;
+
   constructor({ bus, logger = console } = {}) {
     super({ bus, logger });
+    this.#directContactInviteIds = new Set();
+    this.#directInviteOrder = [];
     this._register("invite", "create", (payload) => this.createInvite(payload));
     this._register("invite", "accept", (payload) => this.acceptInvite(payload));
+  }
+
+  /** True when inviteId was minted here as a real direct (1:1) contact invite. */
+  isDirectContactInvite(inviteId) {
+    const id = typeof inviteId === "string" ? inviteId.trim() : "";
+    return id.length > 0 && this.#directContactInviteIds.has(id);
+  }
+
+  #rememberDirectContactInvite(inviteId) {
+    const id = typeof inviteId === "string" ? inviteId.trim() : "";
+    if (!id || this.#directContactInviteIds.has(id)) return;
+    this.#directContactInviteIds.add(id);
+    this.#directInviteOrder.push(id);
+    const MAX = 512;
+    while (this.#directInviteOrder.length > MAX) {
+      const evicted = this.#directInviteOrder.shift();
+      this.#directContactInviteIds.delete(evicted);
+    }
   }
 
   async createInvite(payload = {}) {
@@ -88,6 +118,21 @@ export class ServerInvitesService extends BaseServerService {
     const title = kind === "group" && typeof params.title === "string" && params.title.trim()
       ? params.title.trim() : null;
 
+    // The founder never runs the member.join path, so their self-membership row
+    // has no name-bound consent proof and #broadcastKnownContacts would advertise
+    // them nameless — invitees would see a blank creator. Sign one now, bound to
+    // the EXACT creatorDisplayName this invite carries, so co-members can VERIFY
+    // the founder's name rather than trust a forwarder. No-op once a proof exists.
+    if (kind === "group" && groupId && creatorDisplayName) {
+      const groupsService = this.bus.services && this.bus.services.groups ? this.bus.services.groups : null;
+      if (groupsService && typeof groupsService.ensureSelfMembershipProof === "function") {
+        await groupsService.ensureSelfMembershipProof({ groupId, displayName: creatorDisplayName }).catch((err) => {
+          this.logger.error("[ServerInvitesService] founder self-proof ensure failed",
+            err && err.message ? err.message : err);
+        });
+      }
+    }
+
     const result = await peerLinks.createInvite({
       creatorDisplayName,
       kind,
@@ -98,6 +143,14 @@ export class ServerInvitesService extends BaseServerService {
       maxUses,
       expiresAtMs: Date.now() + expiresInDays * 24 * 60 * 60 * 1000,
     });
+
+    // Remember REAL direct invites so the established path can materialize the
+    // inviter's contact (the acceptor is unknown at create time, so the inviter
+    // has no pre-existing contact record to key off). Group invites are NOT
+    // remembered — group membership never auto-creates a contact.
+    if (kind === "direct") {
+      this.#rememberDirectContactInvite(result.inviteId);
+    }
 
     const inviteCode = encodeInviteCodeV3({
       inviteId: result.inviteId,
@@ -220,7 +273,13 @@ export class ServerInvitesService extends BaseServerService {
     const peerInboxId = typeof snapshot.peerInboxId === "string" ? snapshot.peerInboxId.trim() || null : null;
     const title = typeof envelopeObj.title === "string" && envelopeObj.title.trim() ? envelopeObj.title.trim() : null;
 
-    if (peerAccountId && this.bus.services.contacts) {
+    // Contacts and groups are deliberately separate: accepting a GROUP invite
+    // grants membership only — it must NOT create a 1:1 contact (otherwise every
+    // group you join floods your contact list / conversation list). Only a DIRECT
+    // (1:1) invite — the out-of-band code or a connect-request approval — makes
+    // the inviter a contact. groupId is the authoritative discriminator (it comes
+    // from the signed invite envelope).
+    if (peerAccountId && !groupId && this.bus.services.contacts) {
       await this.bus.services.contacts.ensureActiveContact({
         accountId: peerAccountId,
         displayName: remoteDisplayName,

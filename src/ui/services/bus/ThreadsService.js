@@ -27,6 +27,8 @@ export class ThreadsService extends BaseBusService {
     this._register("threads", "delete", (payload) => this.deleteThread(payload));
     this._register("threads", "createDirect", (payload) => this.createDirect(payload));
     this._listen("runtime.event.thread.index.updated", (record) => this._handleThreadIndexUpdated(record));
+    this._listen("runtime.event.thread.updated", (record) => this._handleThreadUpdated(record));
+    this._listen("runtime.event.thread.removed", (record) => this._handleThreadRemoved(record));
     // When the window regains focus while a conversation is open, the user is
     // now actually looking at it — clear the unread that accrued while blurred.
     this._listen("ui.visibility.changed", () => this.#onVisibilityRegained());
@@ -201,13 +203,12 @@ export class ThreadsService extends BaseBusService {
     if (selectedId === id) {
       this._uiStateStore.setSelectedThreadId(null);
     }
-    const result = await client.call("thread.delete", { threadId: id });
-    if (result && result.deleted) {
-      this._threadStore.removeThread(id);
-      this._messageStore.forgetThread(id);
-      this.bus.emit("threads.updated", { threadId: id });
-    }
-    return result;
+    // The server deletes the thread and emits thread.removed; _handleThreadRemoved
+    // drops the store row + messages. We only own the local selection here (so the
+    // open conversation closes immediately); the store mutation is event-driven so
+    // server-initiated deletes (e.g. the contact-delete cascade) reconcile the same
+    // way as this explicit RPC.
+    return client.call("thread.delete", { threadId: id });
   }
 
   async createDirect({ accountId } = {}) {
@@ -225,6 +226,30 @@ export class ThreadsService extends BaseBusService {
       this._uiStateStore.setSelectedThreadId(threadId);
     }
     return thread;
+  }
+
+  _handleThreadUpdated(record) {
+    const thread = record && record.thread ? record.thread : null;
+    if (!thread) return;
+    const id = nonEmptyString(thread.threadId);
+    if (!id) return;
+    // Authoritative thread-state change (archive/hide/lock) from the server —
+    // the acting device already patched optimistically; this is how a SECOND
+    // device sharing the account learns. upsertThread replaces the row with the
+    // server's persisted truth (unread fields included, so nothing regresses).
+    this._threadStore.upsertThread(thread);
+    this.bus.emit("threads.updated", { threadId: id });
+  }
+
+  _handleThreadRemoved(record) {
+    const id = nonEmptyString(record && record.threadId);
+    if (!id) return;
+    if (this.getSelectedId() === id) {
+      this._uiStateStore.setSelectedThreadId(null);
+    }
+    this._threadStore.removeThread(id);
+    this._messageStore.forgetThread(id);
+    this.bus.emit("threads.updated", { threadId: id });
   }
 
   _handleThreadIndexUpdated(record) {

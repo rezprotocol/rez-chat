@@ -75,11 +75,16 @@ export class SystemEventRowView extends BusComponent {
       const label = this.#actorLabel(payload);
       return label + " joined the group";
     }
+    if (payload.event === "connect.accepted") {
+      const label = this.#actorLabel(payload);
+      return label + " accepted the chat request";
+    }
     return "";
   }
 
   #iconFor(event) {
     if (event === "member.join") return "person_add";
+    if (event === "connect.accepted") return "handshake";
     return "info";
   }
 

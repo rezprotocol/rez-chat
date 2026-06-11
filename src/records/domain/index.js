@@ -1,6 +1,7 @@
 export { ChatThread } from "./ChatThread.js";
 export { ChatMessage } from "./ChatMessage.js";
 export { ChatContact } from "./ChatContact.js";
+export { ConnectRequest } from "./ConnectRequest.js";
 export { ChatInvite } from "./ChatInvite.js";
 export { ChatGroup } from "./ChatGroup.js";
 export { ChatGroupMember } from "./ChatGroupMember.js";

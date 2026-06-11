@@ -42,3 +42,7 @@ export { ProfileBroadcastResult } from "./ProfileBroadcastResult.js";
 export { ProfileGetOwnResult } from "./ProfileGetOwnResult.js";
 export { AvatarGetResult } from "./AvatarGetResult.js";
 export { LinksUnfurlResult } from "./LinksUnfurlResult.js";
+export { ContactsRequestConnectResult } from "./ContactsRequestConnectResult.js";
+export { ContactsApproveConnectResult } from "./ContactsApproveConnectResult.js";
+export { ContactsDenyConnectResult } from "./ContactsDenyConnectResult.js";
+export { ContactsListConnectRequestsResult } from "./ContactsListConnectRequestsResult.js";
