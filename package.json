@@ -16,6 +16,7 @@
     "tauri:dev:alice": "npm run desktop:build:web && cargo build --manifest-path src-tauri/Cargo.toml && REZ_CHAT_SHELL=tauri node scripts/desktop-dev-profile.mjs alice",
     "tauri:dev:bob": "npm run desktop:build:web && cargo build --manifest-path src-tauri/Cargo.toml && REZ_CHAT_SHELL=tauri node scripts/desktop-dev-profile.mjs bob",
     "tauri:dev:carol": "npm run desktop:build:web && cargo build --manifest-path src-tauri/Cargo.toml && REZ_CHAT_SHELL=tauri node scripts/desktop-dev-profile.mjs carol",
+    "tauri:dev:three": "npm run desktop:build:web && cargo build --manifest-path src-tauri/Cargo.toml && REZ_CHAT_SHELL=tauri node scripts/desktop-dev-three.mjs",
     "tauri:check": "cargo check --manifest-path src-tauri/Cargo.toml",
     "desktop:dev": "npm run desktop:build:web && node scripts/desktop-dev-profile.mjs alice",
     "desktop:dev:profile": "node scripts/desktop-dev-profile.mjs",
