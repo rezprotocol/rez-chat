@@ -47,6 +47,7 @@ export function registerDesktopRuntimeIpc({ ipcMain, supervisor, biometricGate =
   };
 
   ipcMain.handle("desktop:vault:status", () => invoke(() => supervisor.vaultStatus()));
+  ipcMain.handle("desktop:environment:capabilities", () => invoke(() => supervisor.environmentCapabilities()));
   ipcMain.handle("desktop:vault:createAccount", (_event, args = {}) => invoke((params) => supervisor.createAccount(params), args));
   ipcMain.handle("desktop:vault:unlock", (_event, args = {}) => invoke((params) => supervisor.unlock(params), args));
   ipcMain.handle("desktop:vault:unlockWithDevice", (_event, args = {}) => invoke(async (params) => {

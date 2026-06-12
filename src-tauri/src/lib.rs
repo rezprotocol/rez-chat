@@ -258,6 +258,9 @@ fn handle_host_request(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     match op {
+        "keychain.probe" => Ok(serde_json::json!({
+            "available": keychain::probe(),
+        })),
         "keychain.getOrCreateDeviceKey" => {
             let key_b64 = keychain::get_or_create_device_key()?;
             Ok(serde_json::json!({ "keyB64": key_b64 }))

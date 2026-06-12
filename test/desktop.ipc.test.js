@@ -90,6 +90,7 @@ test("desktop IPC registers only generic bus + lifecycle channels", () => {
 
   const expected = [
     "bus:call",
+    "desktop:environment:capabilities",
     "desktop:runtime:connect",
     "desktop:runtime:disconnect",
     "desktop:runtime:status",

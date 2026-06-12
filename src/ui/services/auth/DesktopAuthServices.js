@@ -2,6 +2,7 @@ import { SESSION_STATUS } from "../../stores/SessionStore.js";
 import { coerceRow } from "../../../records/domain/coerce.js";
 import { DesktopAccountListEntry } from "../../records/DesktopAccountListEntry.js";
 import { DesktopVaultStatus } from "../../records/DesktopVaultStatus.js";
+import { UserEnvironmentCapabilities } from "../../records/UserEnvironmentCapabilities.js";
 
 const DEFAULT_ACCOUNT_KEY = "desktop";
 
@@ -67,6 +68,7 @@ export class DesktopAuthBootstrapService {
 
   async init() {
     const status = new DesktopVaultStatus(await this._desktop.vault.status());
+    await this.#loadEnvironmentCapabilities(status);
     const listed = await this.listAccounts();
     this._sessionStore.setAccountList(listed);
     if (listed.length > 0) this._sessionStore.setSelectedAccountId(listed[0].id);
@@ -76,6 +78,38 @@ export class DesktopAuthBootstrapService {
     }
     this._sessionStore.setLocked({});
     return this._sessionStore.snapshot();
+  }
+
+  // Load the host machine-capabilities snapshot into the session store. The
+  // Tauri shell exposes a UserEnvironment surface (richer: os/arch/biometric);
+  // shells without it (Electron) fall back to the vault's osWrapAvailable so
+  // the device-unlock gate still reflects reality.
+  async #loadEnvironmentCapabilities(vaultStatus) {
+    let caps = null;
+    const env = this._desktop && this._desktop.environment;
+    if (env && typeof env.capabilities === "function") {
+      try {
+        caps = new UserEnvironmentCapabilities(await env.capabilities());
+      } catch (err) {
+        if (this._logger && typeof this._logger.warn === "function") {
+          this._logger.warn(
+            "[desktop-auth] environment capabilities probe failed:",
+            err && err.message ? err.message : err,
+          );
+        }
+        caps = null;
+      }
+    }
+    if (!caps) {
+      caps = new UserEnvironmentCapabilities({ keychainAvailable: vaultStatus.deviceUnlockAvailable });
+    }
+    this._sessionStore.setEnvironmentCapabilities({
+      os: caps.os,
+      arch: caps.arch,
+      keychainAvailable: caps.keychainAvailable,
+      biometricAvailable: caps.biometricAvailable,
+      notificationsAllowed: caps.notificationsAllowed,
+    });
   }
 
   async inspectBootstrap() {

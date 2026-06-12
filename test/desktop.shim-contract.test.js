@@ -24,11 +24,13 @@ const TOP_LEVEL_KEYS = [
   "dhDerive",
   "scrypt",
   "vault",
+  "environment",
   "backup",
   "runtime",
   "bus",
   "updates",
 ];
+const ENVIRONMENT_KEYS = ["capabilities"];
 const VAULT_KEYS = [
   "status",
   "createAccount",
@@ -93,6 +95,7 @@ test("tauri shim reproduces the preload rezDesktop surface exactly", async () =>
 
   assert.deepEqual(Object.keys(shim).sort(), [...TOP_LEVEL_KEYS].sort());
   assert.deepEqual(Object.keys(shim.vault).sort(), [...VAULT_KEYS].sort());
+  assert.deepEqual(Object.keys(shim.environment).sort(), [...ENVIRONMENT_KEYS].sort());
   assert.deepEqual(Object.keys(shim.backup).sort(), [...BACKUP_KEYS].sort());
   assert.deepEqual(Object.keys(shim.runtime).sort(), [...RUNTIME_KEYS].sort());
   assert.deepEqual(Object.keys(shim.bus).sort(), [...BUS_KEYS].sort());

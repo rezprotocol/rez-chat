@@ -20,6 +20,7 @@ export class DesktopSupervisor {
   #startRezChat;
   #rezChatOptions;
   #chatApp;
+  #userEnvironment;
   #busBridge;
   #logger;
   #started;
@@ -30,6 +31,7 @@ export class DesktopSupervisor {
     startRezChat = null,
     rezChatOptions = {},
     chatApp = null,
+    userEnvironment = null,
     logger = console,
   } = {}) {
     if (!vault) throw new Error("DesktopSupervisor requires vault");
@@ -37,6 +39,7 @@ export class DesktopSupervisor {
     this.#startRezChat = typeof startRezChat === "function" ? startRezChat : null;
     this.#rezChatOptions = rezChatOptions && typeof rezChatOptions === "object" ? rezChatOptions : {};
     this.#chatApp = chatApp || null;
+    this.#userEnvironment = userEnvironment || null;
     this.#busBridge = null;
     this.#logger = logger || console;
     this.#started = false;
@@ -119,6 +122,29 @@ export class DesktopSupervisor {
 
   vaultStatus() {
     return this.#vault.status();
+  }
+
+  /**
+   * Machine capabilities probed at boot (os/arch, keychain, biometric). The
+   * UI reads this to adapt its surface — e.g. hide the "remember on this
+   * device" option when no keychain is available.
+   *
+   * With a UserEnvironment (Tauri sidecar) the full probe is returned. Without
+   * one (Electron / legacy / tests), keychain availability is derived from the
+   * vault's safeStorage so the device-unlock gate stays correct on that shell.
+   */
+  environmentCapabilities() {
+    if (this.#userEnvironment && typeof this.#userEnvironment.capabilities === "function") {
+      return this.#userEnvironment.capabilities();
+    }
+    const vaultStatus = this.#vault.status();
+    return {
+      os: process.platform,
+      arch: process.arch,
+      keychainAvailable: !!(vaultStatus && vaultStatus.osWrapAvailable === true),
+      biometricAvailable: false,
+      notificationsAllowed: null,
+    };
   }
 
   async createAccount(params = {}) {

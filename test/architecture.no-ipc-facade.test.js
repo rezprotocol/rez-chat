@@ -44,6 +44,7 @@ test("guardrail: registerDesktopIpc registers only generic + lifecycle IPC handl
   const allowed = new Set([
     "bus:call",
     "desktop:vault:status",
+    "desktop:environment:capabilities",
     "desktop:vault:createAccount",
     "desktop:vault:unlock",
     "desktop:vault:unlockWithDevice",
@@ -136,6 +137,7 @@ test("guardrail: DesktopSupervisor does not enumerate bus directives as methods"
     "stop",
     "status",
     "vaultStatus",
+    "environmentCapabilities",
     "createAccount",
     "noteVaultActivity",
     "unlock",

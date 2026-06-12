@@ -75,7 +75,7 @@ test("desktop vault device-unlock round-trips via wrapped password", async () =>
   });
   assert.equal(vault.listAccounts()[0].deviceUnlockEnabled, false);
 
-  vault.enableDeviceUnlock({ accountId: created.accountId, password: "compile this" });
+  await vault.enableDeviceUnlock({ accountId: created.accountId, password: "compile this" });
   assert.equal(vault.listAccounts()[0].deviceUnlockEnabled, true);
 
   vault.lock();
@@ -133,7 +133,7 @@ test("desktop vault device-unlock requires safeStorage availability", async () =
     profileName: "Linus",
     password: "kernel panic",
   });
-  assert.throws(
+  await assert.rejects(
     () => vault.enableDeviceUnlock({ accountId: created.accountId, password: "kernel panic" }),
     /OS encryption not available/i,
   );

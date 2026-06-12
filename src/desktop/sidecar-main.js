@@ -6,6 +6,7 @@ import { NodeCryptoProvider } from "@rezprotocol/node";
 import { startRezChat } from "../index.js";
 import { DesktopVaultService } from "./runtime/DesktopVaultService.js";
 import { KeyringSafeStorage } from "./runtime/KeyringSafeStorage.js";
+import { UserEnvironment } from "./runtime/UserEnvironment.js";
 import { DesktopSupervisor, defaultDesktopPaths } from "./runtime/DesktopSupervisor.js";
 import { registerDesktopRuntimeIpc } from "./runtime/registerDesktopIpc.js";
 import { registerDesktopCryptoChannels } from "./runtime/registerDesktopCryptoChannels.js";
@@ -258,11 +259,23 @@ export async function startSidecar() {
     healthInfo: () => ({ sidecar: true, instanceId, pid: process.pid }),
   });
 
+  // Probe machine capabilities ONCE at boot (os/arch, keychain, biometric).
+  // This is the single source of truth the vault adapter and the UI both read
+  // from. The keychain probe does NOT touch the device key, so no OS prompt
+  // appears here — that's deferred to first device-unlock opt-in.
+  const userEnvironment = new UserEnvironment({ hostChannel, logger: console });
+  const capabilities = await userEnvironment.probe();
+
   // Device-unlock key storage: Rust keychain bridge over the HostChannel.
-  // When the host (or its keychain) is unavailable — tests, headless runs —
-  // this degrades to password-unlock-only, same as Electron without
-  // safeStorage support.
-  const safeStorage = await KeyringSafeStorage.create({ hostChannel, logger: console });
+  // Availability comes from the probe above; the 32-byte key is fetched lazily
+  // (KeyringSafeStorage.ensureDeviceKey) only when the user enables device
+  // unlock. When the keychain is unavailable — tests, headless runs, a Linux
+  // box with no Secret Service — this degrades to password-unlock-only, same
+  // as Electron without safeStorage support.
+  const safeStorage = await KeyringSafeStorage.create({
+    hostChannel,
+    available: capabilities.keychainAvailable,
+  });
   const vault = new DesktopVaultService({
     dbPath: desktopPaths.vaultDbPath,
     safeStorage,
@@ -270,6 +283,7 @@ export async function startSidecar() {
   supervisor = new DesktopSupervisor({
     vault,
     chatApp,
+    userEnvironment,
     logger: console,
   });
   await supervisor.start();

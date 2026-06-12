@@ -69,7 +69,7 @@ test("changePassword re-wraps keystore + appKey + mnemonic under new password an
   // Capture original mnemonic so we can verify it still decrypts after change.
   const before = await vault.revealMnemonic({ accountId: created.accountId, password: "old-pass-12345" });
 
-  vault.enableDeviceUnlock({ accountId: created.accountId, password: "old-pass-12345" });
+  await vault.enableDeviceUnlock({ accountId: created.accountId, password: "old-pass-12345" });
   assert.equal(vault.listAccounts()[0].deviceUnlockEnabled, true);
 
   await vault.changePassword({

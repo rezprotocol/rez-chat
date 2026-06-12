@@ -96,6 +96,12 @@ contextBridge.exposeInMainWorld("rezDesktop", {
     importBackup: (params) => unwrap(ipcRenderer.invoke("desktop:vault:importBackup", params || {})),
     purgeAccount: (params) => unwrap(ipcRenderer.invoke("desktop:vault:purgeAccount", params || {})),
   },
+  environment: {
+    // Host machine capabilities (os/arch, keychain, biometric). Shared surface
+    // with the Tauri shim; under Electron, keychain availability is derived
+    // from the vault's safeStorage in DesktopSupervisor.environmentCapabilities.
+    capabilities: () => unwrap(ipcRenderer.invoke("desktop:environment:capabilities")),
+  },
   backup: {
     saveToFile: (params) => unwrap(ipcRenderer.invoke("desktop:backup:saveToFile", params || {})),
     openFile: () => unwrap(ipcRenderer.invoke("desktop:backup:openFile")),

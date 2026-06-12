@@ -269,7 +269,7 @@ export class DesktopVaultService {
       const envelope = await keystoreStore.getKeystoreEnvelope();
       appDataKeyBytes = randomBytes(32, this.#cryptoProvider);
       const appKeyEnvelope = await this.#encryptAppDataKey({ password: pwd, appDataKeyBytes });
-      const safeWrappedAppKeyB64 = this.#safeWrapAppDataKey(appDataKeyBytes);
+      const safeWrappedAppKeyB64 = await this.#safeWrapAppDataKey(appDataKeyBytes);
       const mnemonicEnvelope = await this.#encryptMnemonic({ password: pwd, mnemonic: mnemonicText });
       const fingerprint = seedFingerprintB64(seed);
       const now = this.#clock();
@@ -321,7 +321,7 @@ export class DesktopVaultService {
       appKeyEnvelope,
       safeWrappedAppKeyB64: row.safeWrappedAppKeyB64,
     });
-    this.#healLegacyOsWrap({ row, appDataKeyBytes });
+    await this.#healLegacyOsWrap({ row, appDataKeyBytes });
     this.#clearActive();
     // profileNameHint is the authoritative current display name once the
     // user has set one via setProfileName. The keystore payload's
@@ -363,7 +363,18 @@ export class DesktopVaultService {
       `).run(seedName, this.#clock(), unlocked.accountId);
     }
     if (enableDeviceUnlock === true) {
-      this.#writeWrappedPassword({ accountId: unlocked.accountId, password: pwd });
+      try {
+        await this.#ensureSafeStorageKey();
+        this.#writeWrappedPassword({ accountId: unlocked.accountId, password: pwd });
+      } catch (err) {
+        // Best-effort: a denied or unavailable keychain must NOT fail an
+        // otherwise-successful password unlock. Device unlock just stays off
+        // (the user can retry from Settings).
+        console.warn(
+          "[desktop-vault] could not enable device unlock during unlock:",
+          err && err.message ? err.message : err,
+        );
+      }
     }
     this.#startAutoLockTimers();
     return this.getActiveIdentitySummary();
@@ -390,6 +401,10 @@ export class DesktopVaultService {
     if (!wrappedB64) {
       throw new Error("Device unlock not enabled for this account");
     }
+    // Materialize the device key now (lazily fetched from the OS keychain on
+    // first use). A keychain failure here surfaces as a device-unlock error;
+    // the user falls back to password unlock.
+    await this.#ensureSafeStorageKey();
     let recoveredPassword = null;
     try {
       recoveredPassword = this.#safeStorage.decryptString(base64ToBuffer(wrappedB64));
@@ -409,7 +424,7 @@ export class DesktopVaultService {
     return this.unlock({ accountId: row.accountId, password: recoveredPassword });
   }
 
-  enableDeviceUnlock({ accountId = null, password = "" } = {}) {
+  async enableDeviceUnlock({ accountId = null, password = "" } = {}) {
     if (!safeStorageAvailable(this.#safeStorage)) {
       throw new Error("Device unlock unavailable: OS encryption not available");
     }
@@ -417,6 +432,9 @@ export class DesktopVaultService {
     if (!pwd) throw new Error("enableDeviceUnlock requires password");
     const row = this.#loadAccountRow(accountId);
     if (!row) throw new Error("No vault account found");
+    // Fetch the OS keychain device key now — this is the opt-in moment, so a
+    // keychain prompt here is expected and intentional.
+    await this.#ensureSafeStorageKey();
     this.#writeWrappedPassword({ accountId: row.accountId, password: pwd });
     return { accountId: row.accountId, deviceUnlockEnabled: true };
   }
@@ -484,6 +502,34 @@ export class DesktopVaultService {
       accountId: row.accountId,
       avatarDataB64: typeof row.avatarDataB64 === "string" ? row.avatarDataB64 : "",
     };
+  }
+
+  // Materialize the safeStorage device key before a synchronous encrypt/
+  // decrypt. KeyringSafeStorage fetches its OS-keychain key lazily (so no
+  // boot-time prompt); Electron's safeStorage has no such method and is a
+  // no-op here. The duck-type guard keeps DesktopVaultService host-agnostic.
+  async #ensureSafeStorageKey() {
+    if (this.#safeStorage && typeof this.#safeStorage.ensureDeviceKey === "function") {
+      await this.#safeStorage.ensureDeviceKey();
+    }
+  }
+
+  // Best-effort variant for the always-on OS-wrap of the app-data key (the
+  // machine-binding layer). Returns true when the key is ready for synchronous
+  // encrypt/decrypt. A denied/unavailable keychain returns false so the caller
+  // degrades to password-only — it must NEVER block account creation/unlock.
+  async #tryEnsureSafeStorageKey() {
+    if (!safeStorageAvailable(this.#safeStorage)) return false;
+    try {
+      await this.#ensureSafeStorageKey();
+      return true;
+    } catch (err) {
+      console.warn(
+        "[desktop-vault] keychain key unavailable — OS key-wrap disabled this operation:",
+        err && err.message ? err.message : err,
+      );
+      return false;
+    }
   }
 
   #writeWrappedPassword({ accountId, password } = {}) {
@@ -650,7 +696,7 @@ export class DesktopVaultService {
       });
       const newKeystoreEnvelope = await keystoreStore.getKeystoreEnvelope();
       newAppKeyEnvelope = await this.#encryptAppDataKey({ password: newPwd, appDataKeyBytes });
-      newSafeWrappedAppKeyB64 = this.#safeWrapAppDataKey(appDataKeyBytes);
+      newSafeWrappedAppKeyB64 = await this.#safeWrapAppDataKey(appDataKeyBytes);
       newMnemonicEnvelope = await this.#encryptMnemonic({ password: newPwd, mnemonic: mnemonicText });
       const now = this.#clock();
       this.#requireDb().prepare(`
@@ -830,7 +876,7 @@ export class DesktopVaultService {
       // Re-wrap the RECOVERED random app-data key under the new password — the
       // whole point of the backup (recoverable without the OS keychain).
       const appKeyEnvelope = await this.#encryptAppDataKey({ password: newPwd, appDataKeyBytes });
-      const safeWrappedAppKeyB64 = this.#safeWrapAppDataKey(appDataKeyBytes);
+      const safeWrappedAppKeyB64 = await this.#safeWrapAppDataKey(appDataKeyBytes);
       const mnemonicEnvelope = await this.#encryptMnemonic({ password: newPwd, mnemonic: mnemonicText });
       const now = this.#clock();
       this.#requireDb().prepare(`
@@ -921,7 +967,7 @@ export class DesktopVaultService {
       });
       const newKeystoreEnvelope = await newKeystoreStore.getKeystoreEnvelope();
       const newAppKeyEnvelope = await this.#encryptAppDataKey({ password: newPwd, appDataKeyBytes });
-      const newSafeWrappedAppKeyB64 = this.#safeWrapAppDataKey(appDataKeyBytes);
+      const newSafeWrappedAppKeyB64 = await this.#safeWrapAppDataKey(appDataKeyBytes);
       const newMnemonicEnvelope = mnemonicText != null
         ? await this.#encryptMnemonic({ password: newPwd, mnemonic: mnemonicText })
         : null;
@@ -1035,6 +1081,9 @@ export class DesktopVaultService {
       if (!(keyBytes instanceof Uint8Array) || keyBytes.length !== 32) {
         throw new Error("Invalid app data key envelope");
       }
+      // Materialize the keychain key (best-effort) so the machine-binding
+      // verify below can run; a denied/unavailable keychain skips it.
+      await this.#tryEnsureSafeStorageKey();
       this.#verifySafeWrappedAppDataKey({ appDataKeyBytes: keyBytes, safeWrappedAppKeyB64 });
       return keyBytes;
     } finally {
@@ -1050,20 +1099,23 @@ export class DesktopVaultService {
    * device-unlock enrollment (its wrapped password is equally unreadable).
    * One-time per account; a no-op for rows already on the current scheme.
    */
-  #healLegacyOsWrap({ row, appDataKeyBytes } = {}) {
+  async #healLegacyOsWrap({ row, appDataKeyBytes } = {}) {
     if (!safeStorageAvailable(this.#safeStorage)) return;
     const wrappedB64 = typeof row.safeWrappedAppKeyB64 === "string" ? row.safeWrappedAppKeyB64 : "";
     if (!wrappedB64) return;
+    // The key is already materialized here (#decryptAppDataKey ran first); a
+    // missing key surfaces as DEVICE_KEY_UNAVAILABLE below and skips healing.
     try {
       this.#safeStorage.decryptString(base64ToBuffer(wrappedB64));
       return; // current-scheme wrap — nothing to heal
     } catch (err) {
       if (!err || err.code !== "DEVICE_UNLOCK_RESET_REQUIRED") {
-        // Mismatch/corruption is #verifySafeWrappedAppDataKey's concern.
+        // Mismatch/corruption is #verifySafeWrappedAppDataKey's concern;
+        // an unavailable key just means we can't heal right now.
         return;
       }
     }
-    const freshWrap = this.#safeWrapAppDataKey(appDataKeyBytes);
+    const freshWrap = await this.#safeWrapAppDataKey(appDataKeyBytes);
     this.#requireDb().prepare(`
       UPDATE vault_accounts SET safeWrappedAppKeyB64 = ?, safeWrappedPasswordB64 = NULL, updatedAtMs = ?
       WHERE accountId = ?
@@ -1072,10 +1124,21 @@ export class DesktopVaultService {
       + " — device unlock needs re-enabling in Settings");
   }
 
-  #safeWrapAppDataKey(appDataKeyBytes) {
-    if (!safeStorageAvailable(this.#safeStorage)) return null;
-    const wrapped = this.#safeStorage.encryptString(toBase64(appDataKeyBytes));
-    return bufferToBase64(wrapped);
+  async #safeWrapAppDataKey(appDataKeyBytes) {
+    // Lazily materialize the keychain key (no boot-time prompt). A denied or
+    // unavailable keychain degrades to no machine-binding wrap — the password
+    // envelope remains the source of truth — rather than failing the op.
+    if (!(await this.#tryEnsureSafeStorageKey())) return null;
+    try {
+      const wrapped = this.#safeStorage.encryptString(toBase64(appDataKeyBytes));
+      return bufferToBase64(wrapped);
+    } catch (err) {
+      if (err && err.code === "DEVICE_KEY_UNAVAILABLE") {
+        console.warn("[desktop-vault] OS key-wrap skipped — keychain key unavailable");
+        return null;
+      }
+      throw err;
+    }
   }
 
   #verifySafeWrappedAppDataKey({ appDataKeyBytes, safeWrappedAppKeyB64 } = {}) {
@@ -1093,6 +1156,14 @@ export class DesktopVaultService {
         // (re-wrap + device-unlock re-enrollment). MUST NOT fail unlock —
         // that would lock migrated users out.
         console.warn("[desktop-vault] legacy OS-wrapped key detected — verification skipped, healing on unlock");
+        return;
+      }
+      if (err && err.code === "DEVICE_KEY_UNAVAILABLE") {
+        // Keychain present but its key couldn't be materialized (denied or
+        // locked). Skip the machine-binding check rather than lock the user
+        // out — the app-data key was already authenticated by the password
+        // envelope's AEAD decryption.
+        console.warn("[desktop-vault] keychain key unavailable — machine-binding check skipped");
         return;
       }
       throw err;

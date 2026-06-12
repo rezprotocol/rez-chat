@@ -16,6 +16,11 @@ export class DesktopVaultStatus extends RRecord {
       ? raw.vault
       : (raw && typeof raw === "object" ? raw : {});
     this.hasAccounts = status.hasAccounts === true;
+    // Whether the OS can wrap the device-unlock password (a usable keychain /
+    // safeStorage). Drives the "remember on this device" offer on shells with
+    // no UserEnvironment surface (e.g. Electron); the Tauri shell reads the
+    // richer UserEnvironmentCapabilities instead.
+    this.deviceUnlockAvailable = status.osWrapAvailable === true;
     this._seal();
   }
 

@@ -38,6 +38,10 @@ export class LoginUnlockView extends BusComponent {
     if (this.#autoPromptAttempted) return;
     const sessionStore = this._sessionStore;
     if (sessionStore.status() !== SESSION_STATUS.LOCKED) return;
+    // No usable keychain on this machine — never attempt device unlock (it
+    // would fail at the vault). The account can't have been enrolled here
+    // anyway, but guard explicitly for machines that lost their keychain.
+    if (!sessionStore.deviceUnlockAvailable()) return;
     const selectedAccountId = sessionStore.selectedAccountIdRaw();
     if (!selectedAccountId) return;
     const selected = sessionStore.accountEntry(selectedAccountId);
@@ -63,6 +67,9 @@ export class LoginUnlockView extends BusComponent {
     const accountList = sessionStore.accountList();
     const selectedAccount = sessionStore.selectedAccountEntry();
     const selectedDeviceUnlockEnabled = !!(selectedAccount && selectedAccount.deviceUnlockEnabled === true);
+    // Only offer "remember on this device" when the host actually has a usable
+    // keychain — hidden entirely on machines with no secret storage.
+    const deviceUnlockAvailable = sessionStore.deviceUnlockAvailable();
     // Pre-BIP39 account selected: no recovery phrase, no backup, no unlock path
     // that survives connect(). Refuse the unlock form and route to re-create.
     const selectedIsLegacy = !!(selectedAccount && selectedAccount.recoveryEnabled === false);
@@ -199,7 +206,7 @@ export class LoginUnlockView extends BusComponent {
       identityPill,
       switchList,
       passcodeField,
-      rememberDeviceLabel,
+      deviceUnlockAvailable ? rememberDeviceLabel : null,
       decryptButton,
       footerLinks,
     ]);

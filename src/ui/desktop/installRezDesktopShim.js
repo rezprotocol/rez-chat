@@ -313,6 +313,12 @@ export function installRezDesktopShim() {
       importBackup: (params) => callVault("desktop:vault:importBackup", params),
       purgeAccount: (params) => callVault("desktop:vault:purgeAccount", params),
     },
+    environment: {
+      // Machine capabilities probed by the sidecar at boot (os/arch, keychain,
+      // biometric). Lets the UI adapt — e.g. hide device unlock when there's
+      // no keychain. Generic snapshot, not a per-directive facade.
+      capabilities: () => callVault("desktop:environment:capabilities"),
+    },
     backup: {
       saveToFile: (params) => {
         const args = params && typeof params === "object" ? params : {};

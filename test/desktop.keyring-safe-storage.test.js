@@ -49,9 +49,11 @@ test("keyring safe storage round-trips strings and rejects tampering", async () 
   const key = randomBytes(32);
   const storage = await KeyringSafeStorage.create({
     hostChannel: fakeHostChannel(key),
-    logger: { warn() {} },
+    available: true,
   });
   assert.equal(storage.isEncryptionAvailable(), true);
+  // No keychain access until opt-in: the key is fetched only on ensureDeviceKey.
+  await storage.ensureDeviceKey();
 
   const wrapped = storage.encryptString("hunter2 — with unicode ✓");
   assert.ok(Buffer.isBuffer(wrapped));
@@ -70,8 +72,9 @@ test("keyring safe storage round-trips strings and rejects tampering", async () 
 test("keyring safe storage flags legacy Electron blobs with a typed error", async () => {
   const storage = await KeyringSafeStorage.create({
     hostChannel: fakeHostChannel(randomBytes(32)),
-    logger: { warn() {} },
+    available: true,
   });
+  await storage.ensureDeviceKey();
   const legacyBlob = legacyElectronSafeStorage().encryptString("old secret");
   assert.throws(
     () => storage.decryptString(legacyBlob),
@@ -80,23 +83,38 @@ test("keyring safe storage flags legacy Electron blobs with a typed error", asyn
   );
 });
 
-test("keyring safe storage degrades to unavailable when the host keychain fails", async () => {
+test("keyring safe storage is unavailable when the boot probe reports no backend", async () => {
+  // available:false models UserEnvironment's keychain.probe finding no usable
+  // backend (e.g. a Linux box with no Secret Service).
+  const storage = await KeyringSafeStorage.create({
+    hostChannel: fakeHostChannel(randomBytes(32)),
+    available: false,
+  });
+  assert.equal(storage.isEncryptionAvailable(), false);
+  assert.throws(() => storage.encryptString("x"), /unavailable/);
+  await assert.rejects(() => storage.ensureDeviceKey(), /keychain unavailable/);
+});
+
+test("keyring safe storage surfaces a key-fetch failure only on opt-in", async () => {
+  // Probe said available, but the deferred getOrCreateDeviceKey fails (e.g.
+  // the user denied the keychain prompt). isEncryptionAvailable stays true;
+  // the failure surfaces lazily, never at boot.
   const storage = await KeyringSafeStorage.create({
     hostChannel: {
       async request() {
         throw new Error("keychain locked");
       },
     },
-    logger: { warn() {} },
+    available: true,
   });
-  assert.equal(storage.isEncryptionAvailable(), false);
-  assert.throws(() => storage.encryptString("x"), /unavailable/);
+  assert.equal(storage.isEncryptionAvailable(), true);
+  await assert.rejects(() => storage.ensureDeviceKey(), /keychain locked/);
 });
 
 test("vault device unlock works end-to-end on keyring safe storage", async () => {
   const storage = await KeyringSafeStorage.create({
     hostChannel: fakeHostChannel(randomBytes(32)),
-    logger: { warn() {} },
+    available: true,
   });
   const vault = new DesktopVaultService({
     dbPath: tmpPath("vault.sqlite"),
@@ -107,7 +125,7 @@ test("vault device unlock works end-to-end on keyring safe storage", async () =>
     profileName: "Keyring Kate",
     password: "correct horse battery staple",
   });
-  vault.enableDeviceUnlock({ accountId: created.accountId, password: "correct horse battery staple" });
+  await vault.enableDeviceUnlock({ accountId: created.accountId, password: "correct horse battery staple" });
   assert.equal(vault.listAccounts()[0].deviceUnlockEnabled, true);
   vault.lock();
 
@@ -130,14 +148,14 @@ test("electron-era vault heals on first password unlock and clears dead device u
     profileName: "Migrating Mia",
     password,
   });
-  electronVault.enableDeviceUnlock({ accountId: created.accountId, password });
+  await electronVault.enableDeviceUnlock({ accountId: created.accountId, password });
   assert.equal(electronVault.listAccounts()[0].deviceUnlockEnabled, true);
   electronVault.close();
 
   // 2. Same vault.db opened under Tauri (KeyringSafeStorage, fresh key).
   const storage = await KeyringSafeStorage.create({
     hostChannel: fakeHostChannel(randomBytes(32)),
-    logger: { warn() {} },
+    available: true,
   });
   const tauriVault = new DesktopVaultService({ dbPath, safeStorage: storage }).open();
 
@@ -156,7 +174,7 @@ test("electron-era vault heals on first password unlock and clears dead device u
 
   // 3. Healed row: re-enabling device unlock under the new scheme works.
   await tauriVault.unlock({ accountId: created.accountId, password });
-  tauriVault.enableDeviceUnlock({ accountId: created.accountId, password });
+  await tauriVault.enableDeviceUnlock({ accountId: created.accountId, password });
   tauriVault.lock();
   const reUnlocked = await tauriVault.unlockWithDevice({ accountId: created.accountId });
   assert.equal(reUnlocked.accountId, created.accountId);

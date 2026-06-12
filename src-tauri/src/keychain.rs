@@ -11,6 +11,10 @@ use rand::RngCore;
 
 const SERVICE: &str = "com.rezprotocol.chat";
 const ACCOUNT: &str = "rez-device-unlock-key";
+// A name we deliberately never store under. probe() reads it expecting "no
+// entry" — that round-trip proves the backend is reachable WITHOUT creating
+// the device key or surfacing the OS "allow access" prompt.
+const PROBE_ACCOUNT: &str = "rez-keychain-probe";
 
 fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -39,6 +43,30 @@ fn encode_base64(bytes: &[u8]) -> String {
 fn looks_like_key(value: &str) -> bool {
     // 32 bytes -> 44 base64 chars with one '=' pad.
     value.len() == 44 && value.ends_with('=')
+}
+
+/// Probe whether the OS keychain/secret-service backend is usable, WITHOUT
+/// creating the device key or triggering a permission prompt.
+///
+/// Reading a never-written probe entry is a non-mutating round-trip: macOS
+/// Keychain and Windows Credential Manager return "not found" for a missing
+/// item with no ACL prompt (the prompt is only for reading an existing
+/// protected item's data). On Linux with no Secret Service / D-Bus available
+/// — the case some users deliberately choose — `Entry::new` or `get_password`
+/// errors out, and we report unavailable so the UI hides device unlock.
+///
+/// A pre-existing probe value (unexpected) still proves the backend works, so
+/// it counts as available too.
+pub fn probe() -> bool {
+    let entry = match keyring::Entry::new(SERVICE, PROBE_ACCOUNT) {
+        Ok(entry) => entry,
+        Err(_) => return false,
+    };
+    match entry.get_password() {
+        Ok(_) => true,
+        Err(keyring::Error::NoEntry) => true,
+        Err(_) => false,
+    }
 }
 
 /// Fetch the device key, creating it on first run. Returns base64.

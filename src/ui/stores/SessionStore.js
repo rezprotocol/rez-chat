@@ -25,6 +25,10 @@ export class SessionStore {
       accountList: [],
       selectedAccountId: null,
       canAddAccount: true,
+      // Machine capabilities (UserEnvironment): set once at bootstrap and held
+      // for the session — they don't change on lock/unlock transitions.
+      deviceUnlockAvailable: false,
+      environmentCapabilities: null,
     };
     this._handlers = new Set();
   }
@@ -107,6 +111,21 @@ export class SessionStore {
   initStep() {
     const v = this._state.initStep;
     return typeof v === "string" && v.length > 0 ? v : null;
+  }
+
+  // True when the host has a usable OS keychain / safeStorage, so the UI may
+  // offer "remember on this device". False on e.g. a Linux box with no Secret
+  // Service — the device-unlock affordance is hidden entirely.
+  deviceUnlockAvailable() {
+    return this._state.deviceUnlockAvailable === true;
+  }
+
+  // The full machine-capabilities snapshot (os/arch, keychain, biometric, …)
+  // probed at bootstrap, or null if not yet loaded. For views that need more
+  // than the device-unlock gate.
+  environmentCapabilities() {
+    const caps = this._state.environmentCapabilities;
+    return caps && typeof caps === "object" ? { ...caps } : null;
   }
 
   // Snapshot copy of the account-picker list. Returns [] if none.
@@ -287,5 +306,14 @@ export class SessionStore {
   setCanAddAccount(canAddAccount) {
     this._state.canAddAccount = !!canAddAccount;
     this._emit("session.canAddAccountChanged");
+  }
+
+  // Store the machine-capabilities snapshot and derive the device-unlock gate
+  // from it (keychain present). Called once during auth bootstrap.
+  setEnvironmentCapabilities(capabilities) {
+    const caps = capabilities && typeof capabilities === "object" ? { ...capabilities } : null;
+    this._state.environmentCapabilities = caps;
+    this._state.deviceUnlockAvailable = !!(caps && caps.keychainAvailable === true);
+    this._emit("session.environmentChanged");
   }
 }
