@@ -4,6 +4,19 @@ import { BridgeClient } from "./BridgeClient.js";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
+const CLOSE_NOT_AUTHENTICATED = 4401;
+
+// See DesktopControlUplink: cap inbound frames so a local process can't make us
+// buffer+parse an oversized frame before authentication. `ws` rejects larger
+// frames (close 1009) before they reach #handleMessage. 64 MiB clears the
+// largest legitimate inbound (a file.send's 14 MB fileDataB64 + envelope) while
+// bounding the 100 MiB `ws` default.
+const MAX_WS_PAYLOAD_BYTES = 64 * 1024 * 1024;
+
+// Drop a connection that never authenticates within this window so unauthenticated
+// sockets can't accumulate (FD/memory exhaustion). Mirrors the control uplink.
+const DEFAULT_HELLO_TIMEOUT_MS = 10000;
+
 export class ChatWebsocketUplink {
   #server;
   #chatBridge;
@@ -19,6 +32,7 @@ export class ChatWebsocketUplink {
   #bridgeReady;
   #wss;
   #upgradeHandler;
+  #helloTimeoutMs;
 
   constructor({
     server,
@@ -28,6 +42,7 @@ export class ChatWebsocketUplink {
     bridgeToken = "",
     allowedOrigins = [],
     reservedUpgradePaths = [],
+    helloTimeoutMs = DEFAULT_HELLO_TIMEOUT_MS,
     logger = console,
   } = {}) {
     if (!server || typeof server.on !== "function") {
@@ -69,7 +84,10 @@ export class ChatWebsocketUplink {
     this.#clients = new Map();
     this.#serverEventUnsubs = [];
     this.#bridgeReady = false;
-    this.#wss = new WebSocketServer({ noServer: true });
+    this.#helloTimeoutMs = Number.isFinite(helloTimeoutMs) && helloTimeoutMs > 0
+      ? helloTimeoutMs
+      : DEFAULT_HELLO_TIMEOUT_MS;
+    this.#wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
     this.#upgradeHandler = (req, socket, head) => this.#handleUpgrade(req, socket, head);
   }
 
@@ -239,13 +257,36 @@ export class ChatWebsocketUplink {
   #handleConnection(ws) {
     const client = new BridgeClient({ ws });
     this.#clients.set(client.id, client);
+    // Close the socket if it never authenticates (session.hello) in time. The
+    // callback re-checks authentication, so a slow-but-valid handshake that
+    // lands just before the deadline is not severed. unref() keeps the timer
+    // from holding the event loop open.
+    let helloTimer = setTimeout(() => {
+      helloTimer = null;
+      if (client.authenticated !== true) {
+        try {
+          ws.close(CLOSE_NOT_AUTHENTICATED, "hello timeout");
+        } catch (err) {
+          this.#logger.warn("[ChatWebsocketUplink] hello-timeout close failed", err);
+        }
+      }
+    }, this.#helloTimeoutMs);
+    if (helloTimer && typeof helloTimer.unref === "function") helloTimer.unref();
+    const clearHelloTimer = () => {
+      if (helloTimer) {
+        clearTimeout(helloTimer);
+        helloTimer = null;
+      }
+    };
     ws.on("message", async (data) => {
       await this.#handleMessage(client, ws, data);
     });
     ws.on("close", () => {
+      clearHelloTimer();
       this.#clients.delete(client.id);
     });
     ws.on("error", () => {
+      clearHelloTimer();
       this.#clients.delete(client.id);
     });
   }

@@ -122,6 +122,13 @@ export class GroupOpPayloadV1 extends WirePayloadRecord {
           "GroupOpPayloadV1.member.contact: each contact requires accountId");
         this.assert(typeof contact.inboxId === "string" && contact.inboxId.length > 0,
           "GroupOpPayloadV1.member.contact: each contact requires inboxId");
+        // Cap the per-entry displayName like member.join's top-level field —
+        // otherwise a member could sign a multi-MB self-name that persists onto
+        // every receiver's membership row (storage amplification across the group).
+        this.assert(
+          typeof contact.displayName !== "string"
+            || contact.displayName.length <= MAX_DISPLAY_NAME_LENGTH,
+          `GroupOpPayloadV1.member.contact: displayName exceeds ${MAX_DISPLAY_NAME_LENGTH}`);
       }
     }
   }

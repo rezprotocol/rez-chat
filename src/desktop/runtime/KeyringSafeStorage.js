@@ -45,8 +45,10 @@ export class KeyringSafeStorage {
   #key;
   #available;
   #hostChannel;
+  #keyPromise;
 
   constructor({ deviceKey = null, available = null, hostChannel = null } = {}) {
+    this.#keyPromise = null;
     if (deviceKey !== null) {
       if (!(deviceKey instanceof Uint8Array) || deviceKey.length !== 32) {
         throw new Error("KeyringSafeStorage requires a 32-byte deviceKey (or null)");
@@ -102,6 +104,24 @@ export class KeyringSafeStorage {
     if (!this.#hostChannel) {
       throw new Error("KeyringSafeStorage: no host channel to fetch device key");
     }
+    // Dedup concurrent first-materializations: two simultaneous encrypt/decrypt
+    // calls both observe #key === null and would otherwise issue separate
+    // keychain.getOrCreateDeviceKey round-trips. If the host ever dispatches
+    // those concurrently, the second get-or-create can mint a SECOND key that
+    // overwrites the first, leaving anything encrypted in the window permanently
+    // undecryptable. Share ONE in-flight request; clear it on settle so a failed
+    // fetch can be retried.
+    if (this.#keyPromise === null) {
+      this.#keyPromise = this.#fetchDeviceKey();
+    }
+    try {
+      await this.#keyPromise;
+    } finally {
+      this.#keyPromise = null;
+    }
+  }
+
+  async #fetchDeviceKey() {
     const result = await this.#hostChannel.request("keychain.getOrCreateDeviceKey", {});
     const keyB64 = result && typeof result.keyB64 === "string" ? result.keyB64 : "";
     const key = Buffer.from(keyB64, "base64");

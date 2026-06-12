@@ -389,6 +389,14 @@ export class ServerContactsService extends BaseServerService {
       await this.#autoReconnectActiveRequester(requester, inviteCode);
       return true;
     }
+    if (existingContact && existingContact.relationshipState === "blocked") {
+      // We BLOCKED this peer. A blocked contact who still shares a group with us
+      // would otherwise satisfy the co-member gate below and re-surface
+      // approve/deny prompts on demand — blocking would not actually stop them.
+      // Consume (don't retry) without storing the request or emitting an event.
+      this.logger.warn("[ServerContactsService] connect request from blocked contact " + requester + "; dropping");
+      return true;
+    }
     // REZ-8: a connect request legitimately comes from a CO-MEMBER (see docstring).
     // deleteContact intentionally keeps the underlying peer-link alive, so without
     // this gate any peer we ONCE linked (e.g. a since-deleted contact) could spam

@@ -6,6 +6,15 @@ const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 const CLOSE_NOT_AUTHENTICATED = 4401;
 const CLOSE_PROTOCOL_ERROR = 4400;
 
+// Cap inbound frames so an unauthenticated local process can't make the sidecar
+// buffer+JSON.parse an arbitrarily large frame before the token check. `ws`
+// rejects oversized frames at the protocol layer (close 1009) BEFORE delivering
+// them to #handleMessage. The floor is the largest legitimate inbound call: a
+// `file.send` carries fileDataB64 capped at 14 MB (FileSendParams) plus the
+// bus:call envelope, so 64 MiB leaves ample headroom while still bounding the
+// `ws` 100 MiB default.
+const MAX_CONTROL_PAYLOAD_BYTES = 64 * 1024 * 1024;
+
 /**
  * WebSocket transport for the desktop control surface (Tauri sidecar).
  *
@@ -75,7 +84,7 @@ export class DesktopControlUplink {
     this.#helloTimeoutMs = helloTimeoutMs;
     this.#logger = logger || console;
     this.#handlers = new Map();
-    this.#wss = new WebSocketServer({ noServer: true });
+    this.#wss = new WebSocketServer({ noServer: true, maxPayload: MAX_CONTROL_PAYLOAD_BYTES });
     this.#upgradeHandler = (req, socket, head) => this.#handleUpgrade(req, socket, head);
     this.#sessions = new Map();
   }
