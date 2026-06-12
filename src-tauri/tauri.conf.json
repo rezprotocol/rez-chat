@@ -15,7 +15,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "nsis", "appimage", "deb"],
+    "targets": ["app", "dmg", "nsis", "appimage", "deb"],
     "icon": ["../build/icon.icns", "../build/icon.ico", "../build/icon.png"],
     "createUpdaterArtifacts": true,
     "externalBin": ["binaries/node"],
