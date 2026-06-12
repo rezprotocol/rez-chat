@@ -128,6 +128,49 @@ jobs:
         run: node scripts/fetch-sidecar-node.mjs ${{ matrix.target }}
         working-directory: rez-chat
 
+      - name: Deep-sign bundled native modules (macOS)
+        # Tauri signs the .app and the bundled `node` externalBin, but treats
+        # node_modules as plain resources — so the better-sqlite3 native addon
+        # ships unsigned and Apple's notary rejects the archive ("not signed
+        # with a valid Developer ID certificate" / "no secure timestamp").
+        # electron-builder deep-signed nested binaries automatically; replicate
+        # that here: import the Developer ID cert into a throwaway keychain and
+        # codesign every .node under better-sqlite3 with hardened runtime + a
+        # secure timestamp BEFORE the bundler copies it into the app. The
+        # bundler seals (does not re-sign) already-signed nested code, so these
+        # signatures survive into the notarized bundle.
+        if: runner.os == 'macOS'
+        working-directory: rez-chat
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/rez-deepsign.keychain-db"
+          KEYCHAIN_PW="rez-ci-deepsign"
+          CERT="$RUNNER_TEMP/devid.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$CERT" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          # Prepend our keychain to the search list so codesign can find the key.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          rm -f "$CERT"
+          found=0
+          while IFS= read -r -d '' f; do
+            found=1
+            echo "Signing $f"
+            codesign --force --options runtime --timestamp \
+              --keychain "$KEYCHAIN" --sign "$APPLE_SIGNING_IDENTITY" "$f"
+            codesign --verify --strict --verbose=2 "$f"
+          done < <(find node_modules/better-sqlite3 -name '*.node' -print0)
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No better-sqlite3 .node binary found to sign"; exit 1
+          fi
+
       - name: Build desktop (${{ matrix.target }})
         uses: tauri-apps/tauri-action@v0
         env:
