@@ -379,7 +379,14 @@ export class ServerContactsService extends BaseServerService {
     }
     const existingContact = await this.#contactStore.get({ ownerAccountId: this.ownerAccountId, accountId: requester });
     if (existingContact && existingContact.relationshipState === "active") {
-      // Already direct contacts — nothing to approve. Consume silently.
+      // We still hold an ACTIVE contact for the requester, but THEY re-invited us
+      // — so their side lost the relationship (they deleted us, or recovered from
+      // a wipe) while ours survived. Silently consuming here used to strand them
+      // in `invited` forever (they never hear back). We already consented to this
+      // contact once, so DON'T prompt: auto-reconnect. Re-accept their fresh
+      // invite to recover the link, then signal acceptance back so their side
+      // activates the contact and re-materializes the thread.
+      await this.#autoReconnectActiveRequester(requester, inviteCode);
       return true;
     }
     // REZ-8: a connect request legitimately comes from a CO-MEMBER (see docstring).
@@ -420,6 +427,43 @@ export class ServerContactsService extends BaseServerService {
     await this.#upsertInvitedContact(requester, displayName);
     this.#emitConnectRequestUpdated(requester);
     return true;
+  }
+
+  /**
+   * Auto-reconnect a requester we ALREADY hold as an active contact (their side
+   * lost us and re-invited). Mirrors approveConnectRequest minus the prompt and
+   * the request bookkeeping (there is no incoming request to store/clear — we
+   * never surfaced one). `forceReestablish` re-keys our still-healthy link so a
+   * handshake actually reaches them; a plain accept would be idempotent and send
+   * nothing. The SAME peerLinkId is reused, so our DM thread + history survive,
+   * and the connect-accepted signal is what resolves THEIR side (the reused-link
+   * snapshot can't — it carries a stale activeInviteId).
+   */
+  async #autoReconnectActiveRequester(requester, inviteCode) {
+    const invitesService = this.bus.services && this.bus.services.invites;
+    if (!invitesService || typeof invitesService.acceptInvite !== "function") {
+      this.logger.warn("[ServerContactsService] auto-reconnect: invites service unavailable for " + requester);
+      return;
+    }
+    const acceptorDisplayName = this.#ownDisplayName();
+    await invitesService.acceptInvite({ inviteCode, acceptorDisplayName, forceReestablish: true });
+    await this.#announceConnectAccepted(requester, acceptorDisplayName);
+  }
+
+  /**
+   * Our own display name, for the connect-accepted signal we ship to a peer. The
+   * peer may already know our name (e.g. a shared group), so an empty string is
+   * tolerable — it simply won't backfill — but we send it when we have it.
+   */
+  #ownDisplayName() {
+    const profile = this.bus.services && this.bus.services.profile;
+    if (profile && typeof profile.getOwn === "function") {
+      const own = profile.getOwn();
+      if (own && typeof own.displayName === "string" && own.displayName.trim()) {
+        return own.displayName.trim();
+      }
+    }
+    return "";
   }
 
   /**

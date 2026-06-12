@@ -201,6 +201,42 @@ test("handleIncomingConnectRequest drops a request from a non-co-member (REZ-8)"
   assert.equal(contact, null, "no invited placeholder created for a non-co-member");
 });
 
+test("handleIncomingConnectRequest AUTO-RECONNECTS a requester we already hold active", async () => {
+  // Asymmetric reconnect (live, 2026-06-12): WE kept them as an active contact,
+  // but THEY lost us (deleted us / wiped) and re-invited. Silently consuming the
+  // request stranded them in `invited` forever — they never heard back. Now we
+  // auto-accept their fresh invite with forceReestablish (re-key our still-healthy
+  // link so a handshake actually reaches them) and signal acceptance back. No
+  // prompt, no incoming-request bookkeeping — we already consented once.
+  const h = makeHarness({ storedDirectThreads: { [PEER]: ["th_peerlink1"] } });
+  await h.contactStore.upsert({ ownerAccountId: OWNER, accountId: PEER, patch: { relationshipState: "active", displayName: "Peer" } });
+
+  const payload = new ConnectRequestPayloadV1({
+    requestId: "cr1", requesterAccountId: PEER, inviteCode: "INV-peer-fresh", createdAtMs: 1000,
+  });
+  const consumed = await h.service.handleIncomingConnectRequest(payload, { senderAccountId: PEER });
+  assert.equal(consumed, true);
+
+  // Auto-accepted their fresh invite, FORCING a re-key of the existing link
+  // (a plain accept on a healthy link would be idempotent and send nothing).
+  assert.equal(h.acceptCalls.length, 1, "auto-accepted the requester's invite");
+  assert.equal(h.acceptCalls[0].inviteCode, "INV-peer-fresh");
+  assert.equal(h.acceptCalls[0].forceReestablish, true, "forced re-key so a handshake actually reaches them");
+
+  // Signalled acceptance back so THEIR side activates + re-materializes the thread
+  // (the reused-link snapshot can't — stale activeInviteId).
+  const signal = h.sealCalls.find((c) => c.body && c.body.kind === "rez.chat.connect-accepted.v1");
+  assert.ok(signal, "connect-accepted signal sent back to the requester");
+  assert.equal(signal.peerAccountId, PEER);
+
+  // No prompt bookkeeping: no incoming request stored, our own contact untouched.
+  assert.equal(await h.connectRequestStore.get({ ownerAccountId: OWNER, peerAccountId: PEER }), null,
+    "no incoming connect-request stored (we did not prompt)");
+  const contact = await h.contactStore.get({ ownerAccountId: OWNER, accountId: PEER });
+  assert.equal(contact.relationshipState, "active", "our active contact is preserved");
+  assert.equal(contact.displayName, "Peer", "their name on our side is preserved");
+});
+
 test("approveConnectRequest accepts the peer invite and clears the request", async () => {
   const h = makeHarness({ coMembers: [PEER] });
   const payload = new ConnectRequestPayloadV1({

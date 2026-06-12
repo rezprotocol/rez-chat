@@ -235,12 +235,16 @@ export class ServerInvitesService extends BaseServerService {
     const acceptorDisplayName = typeof params.acceptorDisplayName === "string" && params.acceptorDisplayName.trim()
       ? params.acceptorDisplayName.trim() : null;
 
-    // 2. Run X3DH initiator + send handshake to creator's inbox.
+    // 2. Run X3DH initiator + send handshake to creator's inbox. forceReestablish
+    // re-keys an already-established link (link recovery / auto-reconnect); on a
+    // fresh link it is a no-op (the reattempt branch only triggers for existing
+    // links). The SAME peerLinkId is reused, so the DM thread + history survive.
     const result = await peerLinks.acceptInvite({
       envelope: envelopeData.envelope,
       signatureB64: envelopeData.signatureB64,
       acceptorAccountId: ownerAccountId,
       acceptorDisplayName,
+      forceReestablish: params.forceReestablish === true,
       senderInboxId: this._ownInboxId(),
       sendHandshake: async ({ deliverInboxId, handshakePacket }) => {
         const target = String(deliverInboxId || "").trim();
