@@ -97,6 +97,15 @@ jobs:
         with:
           workspaces: rez-chat/src-tauri
 
+      - name: Add Rust target for the pinned toolchain
+        # dtolnay/rust-toolchain adds `targets` to `stable`, but
+        # rez-chat/rust-toolchain.toml pins channel 1.89.0 — the toolchain the
+        # build actually uses. Add the matrix target from rez-chat/ so the
+        # toolchain-file override applies (otherwise cross-arch macOS legs fail
+        # with "Target ... is not installed").
+        run: rustup target add ${{ matrix.target }}
+        working-directory: rez-chat
+
       - name: Install Linux webview dependencies
         if: runner.os == 'Linux'
         run: |
@@ -125,15 +134,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Reuse the Developer ID material already stored under the
-          # electron-builder secret names (CSC_LINK = base64 .p12,
-          # CSC_KEY_PASSWORD = its password) — identical format to tauri-action's
-          # APPLE_CERTIFICATE/_PASSWORD. Switch to canonical APPLE_* secret names
-          # during the Phase 6 Electron removal. APPLE_SIGNING_IDENTITY has no
-          # CSC_ equivalent (electron-builder derives it from the cert), so it is
-          # supplied as its own secret.
-          APPLE_CERTIFICATE: ${{ secrets.CSC_LINK }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          # Developer ID Application cert (base64 .p12) + its password +
+          # matching identity string. Distinct from the electron-builder
+          # CSC_LINK secret, which holds an "Apple Development" cert that cannot
+          # be notarized for outside-the-store distribution.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
