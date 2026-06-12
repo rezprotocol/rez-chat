@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupOpPayloadV1 } from "../src/records/payloads/GroupOpPayloadV1.js";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
+import { permissiveAccountAuthority } from "./support/memberConsentDouble.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -170,4 +171,29 @@ test("the founder is surfaced as 'creator' in the member list", async () => {
   assert.ok(aliceRow, "creator present in member list");
   assert.equal(String(aliceRow.role).toLowerCase(), "creator",
     "founder is shown as the creator");
+});
+
+test("createGroup names the founder's own row at creation + emits (no reliance on first invite)", async () => {
+  // Regression: createGroup left the creator membership nameless, relying on a
+  // LATER createInvite -> ensureSelfMembershipProof to fill the name (which also
+  // didn't emit). The founder saw their own bare account id until they invited
+  // someone. Make the name explicit + verifiable + emitted at creation.
+  const app = makeServer(ALICE);
+  app.bus.runtime.accountAuthority = permissiveAccountAuthority();
+  const emitted = [];
+  app.bus.on("group.members.updated", (e) => emitted.push(e));
+
+  const { groupId } = await app.bus.services.groups.createGroup({ title: "G", creatorDisplayName: "Alice" });
+
+  const alice = await app.bus.stores.groupStore.getMembership({ ownerAccountId: ALICE, groupId, accountId: ALICE });
+  assert.equal(alice.displayName, "Alice", "founder named on their membership row at creation");
+  assert.ok(alice.joinerSigB64, "founder self consent-proof signed at creation (verifiable name)");
+  assert.ok(emitted.some((e) => e.groupId === groupId), "members.updated emitted so the founder's roster refreshes");
+});
+
+test("createGroup without a creatorDisplayName still succeeds (graceful degrade, no proof, no throw)", async () => {
+  const app = makeServer(ALICE);
+  const { groupId } = await app.bus.services.groups.createGroup({ title: "G" });
+  const alice = await app.bus.stores.groupStore.getMembership({ ownerAccountId: ALICE, groupId, accountId: ALICE });
+  assert.equal(String(alice.role).toLowerCase(), "creator", "creator row created even without a name");
 });

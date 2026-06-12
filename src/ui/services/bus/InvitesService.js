@@ -42,7 +42,10 @@ export class InvitesService extends BaseBusService {
     const client = this._getClient();
     if (!client) return null;
     const name = this._getSelfLabel();
-    const createdGroup = await client.call("group.create", { title });
+    // Pass our display name so the server names the creator's membership row at
+    // creation — the founder is named in their own roster immediately instead of
+    // appearing as a bare account id until the first invite's self-proof lands.
+    const createdGroup = await client.call("group.create", { title, creatorDisplayName: name });
     const groupId = createdGroup && createdGroup.groupId ? String(createdGroup.groupId) : "";
     const invite = await client.call("invite.create", {
       kind: "group", groupId, maxUses, creatorDisplayName: name, title,

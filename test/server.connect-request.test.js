@@ -280,6 +280,56 @@ test("deleteContact does not emit contact.removed when there was no contact to d
   );
 });
 
+test("deleteContact DEMOTES a shared-group co-member to a name-only `known` row (keeps the name)", async () => {
+  // SSOT: the contact row is the SINGLE source of a co-member's display name.
+  // Removing the DM must NOT erase the name — the shared group roster resolves
+  // it by accountId. So a co-member is demoted to `known`, not hard-deleted;
+  // otherwise the member shows as a bare id in the group (live bug, 2026-06-12:
+  // "Carol deletes Alice, Alice's name vanishes in the group too").
+  const h = makeHarness({ coMembers: [PEER], storedDirectThreads: { [PEER]: ["th_peerlink1"] } });
+  await h.contactStore.upsert({ ownerAccountId: OWNER, accountId: PEER, patch: { relationshipState: "active", displayName: "Alice" } });
+
+  const res = await h.service.deleteContact({ accountId: PEER });
+  assert.equal(res.deleted, true);
+
+  // Row survives as a name-only `known` entry with the name intact.
+  const row = await h.contactStore.get({ ownerAccountId: OWNER, accountId: PEER });
+  assert.ok(row, "co-member row is NOT hard-deleted");
+  assert.equal(row.relationshipState, "known", "demoted to a name-only known row");
+  assert.equal(row.displayName, "Alice", "name retained for the shared group roster");
+  assert.equal(await h.service.isActiveContact(PEER), false, "no longer an active contact / DM");
+
+  // The DM thread is still torn down — the 1:1 relationship genuinely ended.
+  assert.deepEqual(h.deletedThreadIds, ["th_peerlink1"]);
+
+  // contact.updated (NOT contact.removed): clients keep the name-only row but
+  // drop it from the active contact list (activeContacts filters `known`).
+  assert.ok(
+    h.emitted.some((e) => e.name === "contact.updated" && e.payload && e.payload.contact && e.payload.contact.accountId === PEER),
+    "emits contact.updated to refresh the demoted row",
+  );
+  assert.ok(
+    !h.emitted.some((e) => e.name === "contact.removed"),
+    "does NOT emit contact.removed for a co-member (the name must survive)",
+  );
+});
+
+test("deleteContact still HARD-DELETES a contact who shares no group", async () => {
+  // No co-membership → nothing else holds the name → fully remove the row, as
+  // before. Guards against the demote path leaking stranded `known` rows.
+  const h = makeHarness({ coMembers: [], storedDirectThreads: { [PEER]: ["th_peerlink1"] } });
+  await h.contactStore.upsert({ ownerAccountId: OWNER, accountId: PEER, patch: { relationshipState: "active", displayName: "Alice" } });
+
+  const res = await h.service.deleteContact({ accountId: PEER });
+  assert.equal(res.deleted, true);
+  assert.equal(await h.contactStore.get({ ownerAccountId: OWNER, accountId: PEER }), null, "row physically removed");
+  assert.deepEqual(h.deletedThreadIds, ["th_peerlink1"], "DM thread torn down");
+  assert.ok(
+    h.emitted.some((e) => e.name === "contact.removed" && e.payload && e.payload.accountId === PEER),
+    "emits contact.removed (no name source to preserve)",
+  );
+});
+
 // --- strict materialize predicate: only an ACTIVE contact surfaces a DM ---
 
 test("isActiveContact reflects only the active relationship state", async () => {
@@ -374,6 +424,57 @@ test("handleIncomingConnectAccepted persists the requester-side system row", asy
   assert.equal(h.systemMessages[0].acceptorAccountId, PEER);
   assert.equal(h.systemMessages[0].acceptorDisplayName, "Peer");
   assert.equal(h.systemMessages[0].actedAtMs, 7000);
+});
+
+test("handleIncomingConnectAccepted NAMES + activates the requester's contact from a pending outgoing request", async () => {
+  // Regression (live dev:three, 2026-06-10): when both sides were already group
+  // co-members, accepting our direct invite reuses the co-member peer-link, so NO
+  // peer-link "established" snapshot fires on our side — the path that normally
+  // carries remoteDisplayName is skipped and the contact would activate nameless.
+  // The authenticated connect-accepted signal carries the approver's name; apply it.
+  const h = makeHarness();
+  await h.connectRequestStore.upsert({
+    ownerAccountId: OWNER, peerAccountId: PEER, direction: "outgoing", requestId: "cr1", inviteCode: "INV-abc",
+  });
+  await h.contactStore.upsert({ ownerAccountId: OWNER, accountId: PEER, patch: { relationshipState: "invited" } });
+
+  await h.service.handleIncomingConnectAccepted(
+    { acceptorDisplayName: "Bob", actedAtMs: 7000 },
+    { senderAccountId: PEER, threadId: "th_mine" },
+  );
+
+  const contact = await h.contactStore.get({ ownerAccountId: OWNER, accountId: PEER });
+  assert.equal(contact.relationshipState, "active", "contact activated by the accepted signal");
+  assert.equal(contact.displayName, "Bob", "approver's display name applied (was nameless before)");
+  // Pending outgoing request consumed.
+  assert.equal(await h.connectRequestStore.get({ ownerAccountId: OWNER, peerAccountId: PEER }), null);
+});
+
+test("handleIncomingConnectAccepted names an ALREADY-active contact (direct content won the race)", async () => {
+  // The first authenticated DM may activate the contact (nameless) before the
+  // connect-accepted signal lands; the signal must still backfill the name.
+  const h = makeHarness();
+  await h.contactStore.upsert({ ownerAccountId: OWNER, accountId: PEER, patch: { relationshipState: "active" } });
+
+  await h.service.handleIncomingConnectAccepted(
+    { acceptorDisplayName: "Bob", actedAtMs: 7000 },
+    { senderAccountId: PEER, threadId: "th_mine" },
+  );
+
+  const contact = await h.contactStore.get({ ownerAccountId: OWNER, accountId: PEER });
+  assert.equal(contact.displayName, "Bob", "name backfilled onto the already-active contact");
+});
+
+test("handleIncomingConnectAccepted does NOT mint a contact for an unsolicited signal", async () => {
+  // Security: a co-member could craft a connect-accepted we never requested. With
+  // no pending outgoing request and no existing contact, naming must NOT create one.
+  const h = makeHarness();
+  await h.service.handleIncomingConnectAccepted(
+    { acceptorDisplayName: "Mallory", actedAtMs: 7000 },
+    { senderAccountId: PEER, threadId: "th_mine" },
+  );
+  assert.equal(await h.contactStore.get({ ownerAccountId: OWNER, accountId: PEER }), null,
+    "no contact minted from an unsolicited connect-accepted");
 });
 
 test("handleIncomingConnectAccepted falls back to a stored thread when ctx has none", async () => {

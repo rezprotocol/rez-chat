@@ -118,9 +118,13 @@ export class GroupStore {
           joinerSigB64: proofSig,
         });
         await this.memberships.set(upgraded, owner, gid, member);
-        return { membership: upgraded, created: false };
+        // `upgraded: true` signals the row's name/proof CHANGED even though no new
+        // member was created — callers emit members.updated on it so a roster
+        // that first learned a member nameless (the proofless inviter/creator row
+        // added at accept) refreshes when the verified name later arrives.
+        return { membership: upgraded, created: false, upgraded: true };
       }
-      return { membership: existing, created: false };
+      return { membership: existing, created: false, upgraded: false };
     }
     const now = asInt(this.clock(), Date.now());
     const name = typeof displayName === "string" && displayName.trim() ? displayName.trim() : null;
@@ -141,7 +145,7 @@ export class GroupStore {
     });
     if (!created) throw new Error("ChatGroupStore.ensureMembership produced invalid row");
     await this.memberships.set(created, owner, gid, member);
-    return { membership: created, created: true };
+    return { membership: created, created: true, upgraded: false };
   }
 
   /**

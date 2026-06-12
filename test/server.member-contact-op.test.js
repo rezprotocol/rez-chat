@@ -125,6 +125,89 @@ test("applying member.contact adds the co-member (add-only) and fires an introdu
   assert.equal(calls[0].peerInboxId, "inbox:newbie");
 });
 
+test("member.contact UPGRADES a nameless existing row (name+proof) and EMITS group.members.updated", async () => {
+  // Regression: ensureGroupThread adds the inviter/creator row nameless+proofless
+  // at accept; the verified member.contact is the first time we learn their
+  // signed name. ensureMembership upgrades the row (created:false), so the applier
+  // must emit on `upgraded` — otherwise the name lands in the store but the roster
+  // UI shows the bare account id forever (live dev:three bug, 2026-06-10).
+  const storage = new TestStorageProvider();
+  const groupStore = await seedGroup(storage);
+  // NEWBIE pre-exists as an active member with NO displayName and NO proof
+  // (exactly the shape ensureGroupThread leaves the inviter row in).
+  await groupStore.ensureMembership({ ownerAccountId: OWNER, groupId: GROUP_ID, accountId: NEWBIE, role: "member" });
+  const server = createServer(storage);
+  server.bus.services.peerLinkProtocol.bootstrapCoMemberLink = () => {};
+
+  const emitted = [];
+  server.bus.on("group.members.updated", (payload) => emitted.push(payload));
+
+  await server.bus.services.groups.handleIncomingGroupOp(
+    contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie", displayName: "Newbie", joinProof: testConsentProof() }]),
+    { senderAccountId: SENDER },
+  );
+
+  const membership = await server.bus.stores.groupStore.getMembership({
+    ownerAccountId: OWNER, groupId: GROUP_ID, accountId: NEWBIE,
+  });
+  assert.equal(membership.displayName, "Newbie", "nameless row upgraded with the verified name");
+  assert.equal(emitted.length, 1, "members.updated emitted on name upgrade (not only on create)");
+  assert.equal(emitted[0].groupId, GROUP_ID);
+});
+
+test("member.contact records the co-member as a `known` account (name in the ONE table, NOT an active contact)", async () => {
+  // SSOT: a verified co-member's name lands in the account table (the single
+  // place a name lives, keyed by accountId) as a `known` row — so the roster
+  // resolves the name by one lookup, without duplicating it onto the membership
+  // row and without violating strict contacts/groups separation (no DM thread).
+  const storage = new TestStorageProvider();
+  await seedGroup(storage);
+  const server = createServer(storage);
+  server.bus.services.peerLinkProtocol.bootstrapCoMemberLink = () => {};
+
+  await server.bus.services.groups.handleIncomingGroupOp(
+    contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie", displayName: "Newbie", joinProof: testConsentProof() }]),
+    { senderAccountId: SENDER },
+  );
+
+  const listed = await server.bus.services.contacts.listContacts({});
+  const row = (listed.items || []).find((c) => c.accountId === NEWBIE);
+  assert.ok(row, "co-member recorded in the account table");
+  assert.equal(row.relationshipState, "known", "recorded as a name-only `known` row");
+  assert.equal(row.displayName, "Newbie", "with the cryptographically-verified name");
+  assert.equal(await server.bus.services.contacts.isActiveContact(NEWBIE), false,
+    "a `known` co-member is NOT an active contact (no DM thread, hidden from the active list)");
+});
+
+test("member.contact with an UNVERIFIABLE name does not write a known account row", async () => {
+  // joinProof is the cryptographic guarantee the name is real; without it (here,
+  // a non-member sender whose op is dropped) nothing is recorded.
+  const storage = new TestStorageProvider();
+  await seedGroup(storage);
+  const server = createServer(storage);
+  server.bus.services.peerLinkProtocol.bootstrapCoMemberLink = () => {};
+
+  await server.bus.services.groups.handleIncomingGroupOp(
+    contactOp([{ accountId: NEWBIE, inboxId: "inbox:newbie", displayName: "Spoofed" }]),
+    { senderAccountId: "rez:acct:stranger" },
+  );
+
+  const listed = await server.bus.services.contacts.listContacts({});
+  assert.ok(!(listed.items || []).some((c) => c.accountId === NEWBIE),
+    "no account row from an unverifiable member.contact");
+});
+
+test("ensureKnownAccount never downgrades an existing active contact (name + relationship preserved)", async () => {
+  const storage = new TestStorageProvider();
+  await seedGroup(storage);
+  const server = createServer(storage);
+  await server.bus.services.contacts.ensureActiveContact({ accountId: NEWBIE, displayName: "Real Newbie" });
+
+  const result = await server.bus.services.contacts.ensureKnownAccount({ accountId: NEWBIE, displayName: "Newbie" });
+  assert.equal(result.relationshipState, "active", "active relationship is NOT downgraded to known");
+  assert.equal(result.displayName, "Real Newbie", "active contact's own name is preserved");
+});
+
 test("member.contact never resurrects a removed member, and fires no introduction for it", async () => {
   const storage = new TestStorageProvider();
   await seedGroup(storage, { newbieState: "removed" });

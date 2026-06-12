@@ -501,15 +501,33 @@ export class ServerGroupOpApplier {
       }).catch(() => ({ revived: false }));
       changed = revived;
     } else {
-      const { created } = await this.#groupStore.ensureMembership({
+      const { created, upgraded } = await this.#groupStore.ensureMembership({
         ownerAccountId: this.#ownerAccountId,
         groupId: op.groupId,
         accountId: joiner,
         role: "member",
         displayName: joinerDisplayName,
         joinProof,
-      }).catch(() => ({ created: false }));
-      changed = created;
+      }).catch(() => ({ created: false, upgraded: false }));
+      // Emit on upgrade too: a member.join can be the first NAMED+proofed write
+      // over a row we already held nameless (e.g. learned via routing), and the
+      // roster must refresh to show the name.
+      changed = created || upgraded;
+    }
+
+    // SSOT: record the joiner's VERIFIED name (consent-checked above via
+    // #verifyConsent) in the one account table as a `known` row, so every roster
+    // resolves their name by accountId from a SINGLE place — not the membership
+    // row. Never downgrades an existing real contact; never creates a thread.
+    // Runs regardless of `changed`: a known row may be absent even when the
+    // membership row already existed.
+    const contactsService = this.#bus.services && this.#bus.services.contacts;
+    if (contactsService && typeof contactsService.ensureKnownAccount === "function") {
+      await contactsService.ensureKnownAccount({ accountId: joiner, displayName: joinerDisplayName })
+        .catch((err) => {
+          this.#logger.warn("[ServerGroupsService] known-account record (member.join) failed",
+            err && err.message ? err.message : err);
+        });
     }
 
     if (changed) {
@@ -639,15 +657,34 @@ export class ServerGroupOpApplier {
           + acct + " (group " + op.groupId + ")");
         continue;
       }
-      const { membership, created } = await this.#groupStore.ensureMembership({
+      const { membership, created, upgraded } = await this.#groupStore.ensureMembership({
         ownerAccountId: this.#ownerAccountId,
         groupId: op.groupId,
         accountId: acct,
         role: "member",
         displayName,
         joinProof,
-      }).catch(() => ({ membership: null, created: false }));
-      if (created) rosterChanged = true;
+      }).catch(() => ({ membership: null, created: false, upgraded: false }));
+      // `upgraded` covers the common heal case: the creator/inviter row was added
+      // nameless+proofless at accept (ensureGroupThread), and this verified
+      // member.contact is the first time we learn their signed name. Without
+      // emitting on upgrade the name lands in the store but the roster UI never
+      // refreshes (it shows the bare account id forever).
+      if (created || upgraded) rosterChanged = true;
+      // SSOT: record this co-member's VERIFIED name in the one account table as a
+      // `known` row. joinProof is set ⟺ #verifyConsent passed over THIS exact
+      // displayName, so it is the cryptographic guarantee that the name is real.
+      // Resolves the roster name by accountId from a single place; never
+      // downgrades a real contact; never creates a thread.
+      const contactsService = this.#bus.services && this.#bus.services.contacts;
+      if (joinProof && displayName && contactsService
+          && typeof contactsService.ensureKnownAccount === "function") {
+        await contactsService.ensureKnownAccount({ accountId: acct, displayName })
+          .catch((err) => {
+            this.#logger.warn("[ServerGroupsService] known-account record (member.contact) failed",
+              err && err.message ? err.message : err);
+          });
+      }
       const isActive = membership && String(membership.state || "").toLowerCase() === "active";
       // Never mesh with a member we hold as removed/left (don't undo a kick).
       // REZ-2: bound the outbound-handshake fan-out a single op may trigger.

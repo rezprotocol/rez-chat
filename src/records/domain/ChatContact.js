@@ -1,13 +1,20 @@
 import { RRecord } from "@rezprotocol/sdk/client";
 import { nonEmptyString, toFiniteNumber } from "./coerce.js";
 
-export const RELATIONSHIP_STATES = Object.freeze(["invited", "active", "blocked"]);
+// `known` is a name-bearing, relationship-less row: we know what this account
+// is CALLED (e.g. a verified group co-member) but hold no 1:1 relationship with
+// them. It is excluded from the active contact list and never gets a DM thread
+// (isActiveContact gates on "active"). It exists so a peer's display name lives
+// in ONE place keyed by accountId — the account table — resolved by one lookup,
+// instead of being duplicated onto group membership rows. See
+// feedback_explicit_over_clever_no_data_suppression.
+export const RELATIONSHIP_STATES = Object.freeze(["known", "invited", "active", "blocked"]);
 const VALID_RELATIONSHIP_STATES = new Set(RELATIONSHIP_STATES);
 
 export function coerceRelationshipState(value, fallback = "active") {
   const text = nonEmptyString(value) || fallback;
   if (!VALID_RELATIONSHIP_STATES.has(text)) {
-    throw new Error("relationshipState must be invited|active|blocked");
+    throw new Error("relationshipState must be known|invited|active|blocked");
   }
   return text;
 }

@@ -57,6 +57,47 @@ export class ServerContactsService extends BaseServerService {
   }
 
   /**
+   * Record a co-member's VERIFIED display name in the one account table as a
+   * `known` row — the single source of truth for "what is account X called".
+   *
+   * A `known` row carries a name but is NOT a relationship: it is excluded from
+   * the active contact list (ContactQueries.activeContacts) and never gets a DM
+   * thread (isActiveContact gates on "active"). This is how a group roster
+   * resolves a member's name by accountId without duplicating the name onto the
+   * membership row AND without violating strict contacts/groups separation.
+   *
+   * Fail-closed for relationship integrity: writes only when there is NO row, or
+   * the existing row is already `known` (refresh the name). NEVER downgrades an
+   * invited/active/blocked relationship, and never creates a thread. Caller MUST
+   * pass a cryptographically-verified name (member.join / member.contact consent
+   * proof) — we are about to display it as that account's name.
+   */
+  async ensureKnownAccount({ accountId, displayName } = {}) {
+    const id = typeof accountId === "string" ? accountId.trim() : "";
+    const name = typeof displayName === "string" ? displayName.trim() : "";
+    if (!id || id === this.ownerAccountId || !name) return null;
+    const existing = await this.#contactStore.get({
+      ownerAccountId: this.ownerAccountId, accountId: id,
+    }).catch(() => null);
+    if (existing) {
+      const state = String(existing.relationshipState || "").toLowerCase();
+      // An invited/active/blocked relationship already owns this account row —
+      // its name is maintained by that relationship's own flow. Don't downgrade.
+      if (state !== "known") return existing;
+      // Already a known row with this exact name — nothing to write/emit.
+      if (existing.displayName === name) return existing;
+    }
+    const result = await this.#contactStore.upsert({
+      ownerAccountId: this.ownerAccountId,
+      accountId: id,
+      patch: { relationshipState: "known", displayName: name },
+    });
+    const contact = result && result.contact ? result.contact : null;
+    this.#emitContactUpdated(contact);
+    return contact;
+  }
+
+  /**
    * True when we hold an `active` (approved) contact for this account. The
    * peer-link-established path (inviter/requester side) uses this to decide
    * whether to materialize a DM thread + conversation-list row: only an already-
@@ -115,16 +156,14 @@ export class ServerContactsService extends BaseServerService {
 
   async deleteContact(payload = {}) {
     const params = this._coerceParams(payload, ContactsDeleteParams);
-    const result = await this.#contactStore.delete({
-      ownerAccountId: this.ownerAccountId,
-      accountId: params.accountId,
-    });
-    // Hard-delete cascade: a contact and its 1:1 DM thread are one relationship.
-    // Removing only the contact row strands the conversation — the threadIndex
-    // row and stored messages live on, the orphaned thread shows in the list,
-    // and a later re-invite collides with it (the "busted thread on re-invite"
-    // live-test bug). Tear down every direct thread keyed to this peer; that one
-    // call also drops its messages + conversation-list row and notifies the UI.
+
+    // Tear down the 1:1 DM regardless of how we dispose of the contact row
+    // below: a contact and its DM thread are one relationship, and removing the
+    // contact ends the conversation. Leaving only the contact row strands the
+    // conversation — the threadIndex row and stored messages live on, the
+    // orphaned thread shows in the list, and a later re-invite collides with it
+    // (the "busted thread on re-invite" live-test bug). This one call drops the
+    // thread's messages + conversation-list row and notifies the UI.
     //
     // We deliberately do NOT tear down the peer-link transport itself: under
     // strict contacts/groups separation a link with no contact and no thread is
@@ -133,6 +172,38 @@ export class ServerContactsService extends BaseServerService {
     // link to re-establish on a later re-invite. Removing it would break the
     // very re-invite this cleanup exists to unblock.
     await this.#deleteDirectThreadsForPeer(params.accountId);
+
+    // A contact who is ALSO a verified group co-member is the SINGLE source of
+    // that account's display name (the one account table, keyed by accountId).
+    // Hard-deleting the row would erase the name from every shared group roster
+    // too. So when the peer is still an active member of a group we share,
+    // DEMOTE the row to a name-only `known` state instead of deleting it: the
+    // 1:1 contact and its DM thread are gone (above), but the name survives for
+    // the group. The upsert keeps the existing displayName. A peer in no shared
+    // group is deleted outright, as before.
+    const existing = await this.#contactStore.get({
+      ownerAccountId: this.ownerAccountId,
+      accountId: params.accountId,
+    }).catch(() => null);
+    if (existing && await this.#isCoMember(params.accountId)) {
+      const demoted = await this.#contactStore.upsert({
+        ownerAccountId: this.ownerAccountId,
+        accountId: params.accountId,
+        patch: { relationshipState: "known" },
+      });
+      // contact.updated (NOT contact.removed): the row survives as a name-only
+      // `known` entry. Clients drop it from the active contact list
+      // (activeContacts filters `known`) yet keep resolving the name by id for
+      // the shared group roster — one source of truth, preserved.
+      const contact = demoted && demoted.contact ? demoted.contact : null;
+      this.#emitContactUpdated(contact);
+      return new ContactsDeleteResult({ deleted: true });
+    }
+
+    const result = await this.#contactStore.delete({
+      ownerAccountId: this.ownerAccountId,
+      accountId: params.accountId,
+    });
     // Authoritative removal event so every client store/view drops the contact
     // (and its no-longer-resolvable name) without the call site hand-patching
     // its local store. The thread teardown above fires its own thread.removed.
@@ -140,6 +211,27 @@ export class ServerContactsService extends BaseServerService {
       this.#emitContactRemoved(params.accountId);
     }
     return new ContactsDeleteResult({ deleted: result && result.deleted === true });
+  }
+
+  /**
+   * True when this peer is an active member of a group we are also in. A
+   * co-member is the single source of that account's display name for the
+   * shared roster, so deleting the contact must preserve the name (demote to
+   * `known`) rather than erase it. Fail-closed to "not a co-member" when the
+   * group store is unavailable or the check errors — that keeps the prior
+   * hard-delete behavior and the failure is logged, not silently swallowed.
+   */
+  async #isCoMember(accountId) {
+    const groupStore = this.bus && this.bus.stores ? this.bus.stores.groupStore : null;
+    if (!groupStore || typeof groupStore.isCoMember !== "function") return false;
+    return groupStore.isCoMember({ ownerAccountId: this.ownerAccountId, accountId })
+      .catch((err) => {
+        this.logger.warn(
+          "[ServerContactsService] co-member check failed during deleteContact",
+          err && err.message ? err.message : err,
+        );
+        return false;
+      });
   }
 
   /**
@@ -426,6 +518,28 @@ export class ServerContactsService extends BaseServerService {
     }
     const acceptorDisplayName = record && typeof record.acceptorDisplayName === "string" ? record.acceptorDisplayName : "";
     const actedAtMs = record && Number.isFinite(record.actedAtMs) ? record.actedAtMs : this.#clock();
+    // Apply the approver's display name to OUR contact for them. When we were
+    // already group co-members, accepting our direct invite REUSES the existing
+    // co-member peer-link, so no peer-link "established" snapshot fires on our
+    // side — the path that normally carries remoteDisplayName is skipped, and the
+    // contact would activate nameless. This authenticated signal is the only
+    // carrier of the approver's name. Gate on an existing relationship (a pending
+    // outgoing request, or an already-active contact) so an unsolicited
+    // connect-accepted cannot mint a contact.
+    if (acceptorDisplayName && acceptorDisplayName.trim()) {
+      const named = await this.acceptOutgoingConnectRequest(acceptor, { displayName: acceptorDisplayName })
+        .catch(() => false);
+      if (!named) {
+        const existing = await this.#contactStore.get({ ownerAccountId: this.ownerAccountId, accountId: acceptor })
+          .catch(() => null);
+        if (existing && String(existing.relationshipState || "").toLowerCase() === "active") {
+          await this.ensureActiveContact({ accountId: acceptor, displayName: acceptorDisplayName }).catch((err) => {
+            this.logger.warn("[ServerContactsService] connect-accepted name apply failed",
+              err && err.message ? err.message : err);
+          });
+        }
+      }
+    }
     await threadsService.persistConnectAcceptedSystemMessage({
       threadId: resolvedThreadId,
       acceptorAccountId: acceptor,
@@ -508,8 +622,12 @@ export class ServerContactsService extends BaseServerService {
   async #upsertInvitedContact(accountId, displayName) {
     const trimmedName = typeof displayName === "string" ? displayName.trim().slice(0, 64) : "";
     const existing = await this.#contactStore.get({ ownerAccountId: this.ownerAccountId, accountId });
-    // Never downgrade an active/blocked relationship to invited.
-    if (existing && existing.relationshipState !== "invited") return;
+    // Never downgrade an active/blocked relationship to invited. A `known` row is
+    // name-only (a verified co-member, no relationship), so connect-requesting
+    // them is a relationship FORMING — known → invited is an upgrade, not a
+    // downgrade. (displayName: trimmedName || undefined below preserves the
+    // verified known name when the request carries none.)
+    if (existing && (existing.relationshipState === "active" || existing.relationshipState === "blocked")) return;
     const result = await this.#contactStore.upsert({
       ownerAccountId: this.ownerAccountId,
       accountId,

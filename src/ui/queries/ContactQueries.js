@@ -36,7 +36,10 @@ export class ContactQueries {
     if (!contacts || typeof contacts.getContacts !== "function") return [];
     const out = [];
     for (const c of contacts.getContacts()) {
-      if (c && c.relationshipState !== "blocked") out.push(c);
+      // `known` rows are name-only (verified group co-members we hold no 1:1
+      // relationship with) — they resolve names via displayName() but must NOT
+      // appear in the contact list. `blocked` is hidden too.
+      if (c && c.relationshipState !== "blocked" && c.relationshipState !== "known") out.push(c);
     }
     return out;
   }

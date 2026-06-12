@@ -69,9 +69,12 @@ export class GroupMemberRowView extends BusComponent {
       return;
     }
 
-    const memberDisplayName = typeof member.displayName === "string" ? member.displayName.trim() : "";
+    // Name resolves from the ONE account table (the contact/known row) keyed by
+    // accountId — NOT from member.displayName. The membership row keeps its
+    // crypto-bound name for consent re-verification, never for display, so the
+    // roster and the DM/contact view always agree on a single source of truth.
     const contactName = queries.contacts.displayName(memberId);
-    const name = memberDisplayName || contactName || memberId;
+    const name = contactName || memberId;
 
     const isAdmin = groupStore.isAdmin(this.#groupId, memberId);
     const canManage = queries.groups.canSelfSetRole(this.#groupId, memberId);

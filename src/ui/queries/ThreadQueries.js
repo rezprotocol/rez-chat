@@ -56,11 +56,13 @@ export class ThreadQueries {
       if (nonEmptyString(thread.title)) return thread.title;
       return null;
     }
+    // Direct thread: the title IS the peer's name, resolved from the ONE account
+    // table by accountId — no per-thread title copy. Returns null (→ short-id in
+    // the view) until the contact/known row is known, never a stale cached name.
     if (thread.peerAccountId) {
       const name = this.#contacts.displayName(thread.peerAccountId);
       if (name) return name;
     }
-    if (nonEmptyString(thread.title)) return thread.title;
     return null;
   }
 

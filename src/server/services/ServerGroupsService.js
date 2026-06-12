@@ -132,6 +132,7 @@ export class ServerGroupsService extends BaseServerService {
   async createGroup(payload = {}) {
     const params = this._coerceParams(payload, GroupCreateParams);
     const title = typeof params.title === "string" ? params.title.trim() : "";
+    const creatorDisplayName = typeof params.creatorDisplayName === "string" ? params.creatorDisplayName.trim() : "";
     const now = this.#clock();
     // Salt that binds this group to its creator: groupId = hash(createdBy +
     // ":" + creatorSalt). Carried (signed) in invites so acceptors can verify
@@ -151,7 +152,17 @@ export class ServerGroupsService extends BaseServerService {
       groupId,
       accountId: this.ownerAccountId,
       role: "creator",
+      // Name the founder explicitly at creation (no reliance on a later invite).
+      displayName: creatorDisplayName || null,
     });
+    // Sign the founder's self consent-proof now if we have a name, so they are
+    // fully named AND verifiable from creation — co-members can confirm the
+    // founder's display name via #broadcastKnownContacts without trusting a
+    // forwarder (TRUST-3). No-op when no name was supplied (degrades to the
+    // first-invite path). ensureSelfMembershipProof emits members.updated itself.
+    if (creatorDisplayName) {
+      await this.ensureSelfMembershipProof({ groupId, displayName: creatorDisplayName });
+    }
     await this.#threadStore.ensureThread({
       threadId,
       groupId,
@@ -513,13 +524,17 @@ export class ServerGroupsService extends BaseServerService {
         err && err.message ? err.message : err);
       return;
     }
-    await this.#groupStore.ensureMembership({
+    const { created, upgraded } = await this.#groupStore.ensureMembership({
       ownerAccountId: this.ownerAccountId, groupId: gid, accountId: this.ownerAccountId,
       displayName: name, joinProof: proof,
     }).catch((err) => {
       this.logger.warn("[ServerGroupsService] failed to persist founder self-proof",
         err && err.message ? err.message : err);
+      return { created: false, upgraded: false };
     });
+    // Refresh our own roster: this upgrades a nameless creator row with our name,
+    // so the UI must re-render or the founder sees their own bare account id.
+    if (created || upgraded) await this.#emitMembersUpdated(gid);
   }
 
   async #getMembership(groupId, accountId) {
