@@ -1,5 +1,10 @@
-import { launchDesktopProfile } from "./desktop-dev-profile.mjs";
+import { launchDesktopProfile, resolveShellKind } from "./desktop-dev-profile.mjs";
 import { prepareElectronNativeModules, restoreNodeNativeModules } from "./desktop-native-modules.mjs";
+
+// The Electron-ABI better-sqlite3 swap is poison for the Tauri path: the
+// sidecar is plain Node and needs the plain-Node prebuild. Mirror the guard
+// in desktop-dev-profile.mjs's main() so `tauri:dev:three` never clobbers it.
+const tauriShell = resolveShellKind({}) === "tauri";
 
 const children = [];
 let shuttingDown = false;
@@ -55,6 +60,10 @@ function allExited() {
 function finishWhenDone() {
   if (!allExited() || finishing) return;
   finishing = true;
+  if (tauriShell) {
+    process.exit(process.exitCode == null ? 0 : process.exitCode);
+    return;
+  }
   restoreNodeNativeModules()
     .catch((err) => {
       console.error("[desktop:native] restore failed:", err && err.message ? err.message : err);
@@ -71,7 +80,9 @@ async function main() {
     return;
   }
 
-  await prepareElectronNativeModules();
+  if (!tauriShell) {
+    await prepareElectronNativeModules();
+  }
   start("alice");
   start("bob");
   start("carol");

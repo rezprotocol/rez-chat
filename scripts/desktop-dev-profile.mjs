@@ -102,7 +102,7 @@ export function resolveDesktopProfile(profileName, env = process.env) {
  * options.shell="tauri") launches the Tauri debug binary instead of
  * Electron. Electron stays the default until the Electron path is retired.
  */
-function resolveShellKind(options) {
+export function resolveShellKind(options) {
   const fromOptions = String(options.shell || "").trim().toLowerCase();
   if (fromOptions) return fromOptions;
   return String(process.env.REZ_CHAT_SHELL || "electron").trim().toLowerCase();
