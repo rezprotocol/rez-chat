@@ -16,13 +16,23 @@
 - Owns application state machine and intent handling.
 - Owns auth/unlock/connect/logout orchestration.
 - Owns thread/message/inbox app workflow decisions.
-- Calls `rez-sdk` for keystore and network-facing actions.
+- Owns the wallet + paid-services workflow: credit balance, receipts, service pricing, and `@handle` claim/renew/release.
+- Calls `rez-sdk` for keystore and network-facing actions, including `WalletCapability` and `HandlesCapability`.
 
 ### `rez-ui` (framework)
 
 - Owns rendering primitives, components, host wiring, and style assets.
 - Does not talk to `rez-sdk` or `rez-core`.
 - Does not own app workflows or protocol semantics.
+
+### Wallet + paid services (REZ economy)
+
+Rez is **postage, not equity**: core messaging is free; paid services — `@handles`, persistent storage, large files — are charged against an account credit balance.
+
+- During beta, paid services settle on **off-chain Service Credits** via the SDK's `LocalSettlementProvider`. Credits come in two classes: `convertible` and `promotional`. The same workflow later anchors to chain settlement with no UI change.
+- **Wallet account SSOT** is the session-authenticated account identity key (`accountIdentityPublicKeyB64`), displayed/stored under the derived `rez:acct:*` form. There is exactly one wallet per account.
+- An `@handle` is a paid, renewable, releasable name resolvable to its owner. `@handles` are also a contact-discovery target: resolve → owner `keyId` → owner-published contact-inbox record → connect request.
+- When a paid request is underfunded, the relay returns `PAYMENT_REQUIRED`; the app maps this centrally to a "not enough credits" gate with a "View wallet" action (see Section 12).
 
 ## 3. Integration Boundary
 
@@ -78,6 +88,13 @@ All thread, contact, and invite state is accessed through `rez-sdk`.
 - Settings scene:
   - Manages app/session preferences and explicit logout action.
   - Logout always transitions to locked state and tears down active transport.
+  - Hosts the Wallet panel: credit balance, receipt history, and the current service price list. Reflects live `wallet.updated` state; does not poll.
+- Handle claim/renew flow:
+  - Reachable from Settings; surfaces availability check, claim/renew/release, and the displayed price for the requested term.
+  - Claim/renew are paid actions and are gated on sufficient credits (see Section 13 and the `PAYMENT_REQUIRED` mapping in Section 12).
+- New Chat/Invite scene also accepts an `@handle` as a target:
+  - The `@handle` input resolves to an owner and issues a connect request through SDK-owned contact actions, exactly like a code/QR invite, and returns to Main on success.
+  - Resolution failures stay fail-closed and do not silently connect.
 
 ## 7. Thread Model
 
@@ -124,6 +141,12 @@ Expected event categories from runtime/SDK:
 - `message` (inbound or reconciled timeline item)
 - `receipt` (delivery/read progression)
 - `error` (request or transport failure)
+- `wallet` (`wallet.updated` — credit balance / receipt projection changed after a settlement)
+- `handle` (`handle.updated` — `@handle` claimed/renewed/released or ownership changed)
+
+Underlying rez-node WS message families consumed for paid services: `settlement.balance`, `settlement.receipts`, `pricing.list`, `catalog.list`, `handle.renew` (and later `storage.persist`, `file.large`).
+
+`PAYMENT_REQUIRED` is a distinct `error` disposition: a relay returns it for an underfunded paid request. `rez-chat` maps it **centrally** (not per-call) to a "Not enough credits (need N, have M)" toast/banner with a "View wallet" action; all paid services inherit this mapping.
 
 `rez-chat` interprets these events into app state transitions; `rez-ui` only renders resulting state.
 

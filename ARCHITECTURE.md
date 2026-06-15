@@ -103,6 +103,8 @@ All chat-domain truth lives in stores at `src/ui/stores/`. Each extends `StoreBa
 | `GroupStore`       | `GroupStore.js`     | groups + per-group members                                           |
 | `InviteStore`      | `InviteStore.js`    | invite records + `lastCreatedInviteCode`                             |
 | `ConnectionStore`  | `ConnectionStore.js`| WS uplink + mesh status                                              |
+| `WalletStore`      | `WalletStore.js`    | account credit balance, receipt projection, service price list      |
+| `HandleStore`      | `HandleStore.js`    | claimed/owned `@handles`, availability/resolve lookups, renewal expiry |
 
 ### 2.2 Store event contract (`StoreBase._emit`)
 
@@ -151,6 +153,16 @@ When upserting a message that has a `clientMsgId`, drop any existing row whose `
 
 `MessagesService.send` only writes the post-response "sent" status if no row with the server `messageId` exists yet — preventing a race where the deposit event already wrote `queued | delivered` and we'd downgrade it to `sent`.
 
+### 3.3 Wallet + paid services (the REZ economy — Tier 1)
+
+Core messaging is free. Paid services — `@handles`, persistent storage, large files — settle against the account's credit balance. During beta this is **off-chain Service Credits** (the SDK's `LocalSettlementProvider`); the same flow later anchors to chain settlement with no UI change. The thesis is **postage, not equity** — credits are a consumable you spend, not a balance you hold to appreciate.
+
+- **`WalletService`** (`bus/WalletService.js`, extends `BaseBusService`) depends on `WalletStore`. Registers `wallet.balance | wallet.receipts | wallet.pricing`, mutates `WalletStore`, and listens for `runtime.event.wallet.updated` to patch the balance/receipt projection. No force-refetch: the server pushes `wallet.updated` after every settlement.
+- **`HandlesService`** (`bus/HandlesService.js`, extends `BaseBusService`) depends on `HandleStore` (and reads `ContactStore` for the resolve→connect path). Registers `handles.claim | handles.resolve | handles.renew | handles.release`, mutates `HandleStore`, and listens for `runtime.event.handle.updated`.
+- **Handle → contact discovery.** `handles.resolve(@name)` returns the owner `keyId`; the service reads the owner-published contact-inbox record and issues `contacts.requestConnect`, so an `@handle` is a first-class invite target. Used by the `@handle` input in the invite/connect flow.
+- **Server side.** `ServerWalletService` and `ServerHandlesService` (`src/server/...`, extend `BaseServerService`) are thin facades over `sdk.wallet` (`WalletCapability`) and `sdk.handles` (`HandlesCapability`). They consume the rez-node WS message families `settlement.balance`, `settlement.receipts`, `pricing.list`, `catalog.list`, `handle.renew` (and later `storage.persist`, `file.large`), and emit the `wallet.updated` / `handle.updated` domain events.
+- **`PAYMENT_REQUIRED` mapping (single source).** When the relay returns `PAYMENT_REQUIRED` on an underfunded paid request, it is mapped **centrally in the bus-service layer** to a `"Not enough credits (need N, have M)"` toast/banner with a **"View wallet"** action — never per-call. Every future paid service inherits this mapping for free.
+
 ---
 
 ## 4) Connection state + desktop event envelope
@@ -184,6 +196,13 @@ Events flowing from the in-process chat-server through the supervisor to the ren
 ```
 
 `electron/runtime/DesktopSupervisor.mjs#emit` stamps `meta`. The renderer-side preload routes by `event.name`. `DesktopRuntimeClient.onEvent(name, handler)` exposes per-name subscription. `RuntimeService._bindClient` re-emits each event onto the bus as `runtime.event.<name>` for typed services to consume.
+
+### 4.4 Transport SSOT (`CHAT_BRIDGE_SPEC`)
+
+Transports stay generic over the bus protocol — directives are declared once and forwarded, never enumerated in transport/preload/runtime-client code. The wallet/handle additions live in the spec at `src/server/transport/ChatBridge.js`:
+
+- **Methods** (`CHAT_BRIDGE_SPEC.methods` / `CHAT_BRIDGE_METHOD_BINDINGS`): `wallet.balance`, `wallet.receipts`, `wallet.pricing`, `handles.claim`, `handles.resolve`, `handles.renew`, `handles.release`.
+- **Events** (`CHAT_BRIDGE_SPEC.events`): `wallet.updated`, `handle.updated` — subscribed by iterating the spec, the same way every other bridged event is.
 
 ### 4.3 Connection flow at boot
 
@@ -224,10 +243,11 @@ rez-chat/src/
       bus/            BaseBusService, RuntimeService, ThreadsService, MessagesService,
                       ContactsService, GroupsService, InvitesService, ConnectionService,
                       SessionService, AuthScreenService, NotificationService,
-                      UiNavigationService
-    stores/           StoreBase + the 9 stores listed in §2.1
+                      UiNavigationService, WalletService, HandlesService
+    stores/           StoreBase + the 11 stores listed in §2.1
     views/            mounted Components: AppShellView, ChatTabView, ContactsTabView,
                       SettingsTabView, ProfileTabView, ThreadListView, ThreadPanelView,
+                      WalletPanelView (in SettingsTabView), HandleClaimView,
                       and all leaf rows / pieces
   client/             runtime adapters: DesktopRuntimeClient, ChatRuntimeClient, transport bridge
   records/            domain/, events/, params/, results/ — RRecord subclasses

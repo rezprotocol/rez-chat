@@ -11,7 +11,8 @@ This repository contains the desktop application — Electron-based, cross-platf
 ## What's in here
 
 - **Electron application shell** — main process, preload bridge, native module wiring for SQLite + WebSockets.
-- **Chat server** — local Node service that owns threads, messages, contacts, groups, channels, file transfer, and link previews. Talks to the SDK; owns its own SQLite persistence.
+- **Chat server** — local Node service that owns threads, messages, contacts, groups, channels, file transfer, and link previews. It also owns the wallet and handle services (`ServerWalletService`, `ServerHandlesService`, backed by `WalletStore` / `HandleStore`). Talks to the SDK; owns its own SQLite persistence.
+- **Wallet + paid services** — core messaging stays free forever; paid services (claimed `@handles`, persistent storage, large media) settle against Service Credits. The wallet (`WalletPanelView`) and handle claim flow (`HandleClaimView`) surface balances and receipts; an underfunded request returns `PAYMENT_REQUIRED`, shown as a "not enough credits" toast. Beta runs on off-chain credits; the REZ token economy is documented in [`rez-contracts`](https://github.com/rezprotocol/rez-contracts).
 - **UI** — bus-driven view layer built on [`rez-ui`](https://github.com/rezprotocol/rez-ui). Components are autonomous and reactive; the UI does not know about the protocol layer.
 - **Auto-update** — `electron-updater` integration with GitHub Releases; signed and notarized macOS builds.
 
@@ -104,6 +105,7 @@ Cross-package references:
 - [**rez-sdk**](https://github.com/rezprotocol/rez-sdk) — client SDK; rez-chat consumes the SDK
 - [**rez-node**](https://github.com/rezprotocol/rez-node) — relay node; the desktop app bundles one and runs it locally
 - [**rez-ui**](https://github.com/rezprotocol/rez-ui) — UI framework
+- [**rez-contracts**](https://github.com/rezprotocol/rez-contracts) — Solidity contract suite for the REZ token economy
 
 ---
 
