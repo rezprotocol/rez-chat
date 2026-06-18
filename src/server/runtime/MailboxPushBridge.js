@@ -1,3 +1,5 @@
+import { nodeAdvertisesDurableInbox } from "../inbox/durableMode.js";
+
 /**
  * Single owner of `sdk.subscriptions.onMailboxDeposited(...)` on the
  * chat-server. Feeds each live push frame `{ mailboxId, eventId,
@@ -33,6 +35,11 @@ export class MailboxPushBridge {
     if (!pipeline || typeof pipeline.submit !== "function") {
       throw new Error("MailboxPushBridge.attach requires bus.services.inboundPipeline");
     }
+    // Durable mode (S2): the catch-up service owns cursor advancement. The push
+    // bridge never cursorAcks directly — on a consumed push it nudges the (coalesced)
+    // drain, which re-lists the just-consumed seqs as dedup-hits and advances the
+    // server-held cursor. Legacy mode is unchanged (ack-delete the buffer copy).
+    const catchup = bus.services && bus.services.inboxCatchup ? bus.services.inboxCatchup : null;
     const off = sdk.subscriptions.onMailboxDeposited((frame) => {
       // Enqueue into the ORDERED queue, then ack the buffer copy once the deposit
       // resolves successfully. submit() logs + swallows handler errors internally
@@ -60,6 +67,20 @@ export class MailboxPushBridge {
             );
           }
           if (!ok) return null;
+          if (nodeAdvertisesDurableInbox(sdk)) {
+            // Durable node: NEVER ack-delete (the home log is the system of record
+            // and the device cursor is the only mutation). The deposit is already
+            // decrypted/applied + seq-dedup-marked by the pipeline; trigger the
+            // coalesced drain to advance the cursor (it re-lists the just-consumed
+            // seqs as dedup-hits and cursorAcks them — no re-decrypt, no list spam).
+            if (catchup && typeof catchup.requestDrain === "function") {
+              catchup.requestDrain().catch((err) => {
+                const m = err && err.message ? err.message : String(err);
+                logger.error("[MailboxPushBridge] durable cursor-drain trigger failed: " + m);
+              });
+            }
+            return null;
+          }
           if (!ids.mailboxId || !ids.eventId) return null;
           return sdk.mailbox.ack({ mailboxId: ids.mailboxId, eventId: ids.eventId });
         })

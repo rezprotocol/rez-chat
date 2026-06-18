@@ -1,4 +1,6 @@
 import { BaseServerService } from "../base/BaseServerService.js";
+import { MailboxDepositQuarantinedEvent } from "../../records/index.js";
+import { nodeAdvertisesDurableInbox } from "../inbox/durableMode.js";
 
 const DEFAULT_PAGE_LIMIT = 50;
 // D1: after this many failed decrypts across drains, a deposit is treated as
@@ -145,12 +147,25 @@ export class InboxCatchupService extends BaseServerService {
 
   async #drainOnce() {
     const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
-    if (!sdk || !sdk.mailbox || typeof sdk.mailbox.list !== "function" || typeof sdk.mailbox.fetch !== "function" || typeof sdk.mailbox.ack !== "function") {
-      throw new Error("InboxCatchupService requires sdk.mailbox.list/fetch/ack");
+    if (!sdk || !sdk.mailbox) {
+      throw new Error("InboxCatchupService requires sdk.mailbox");
     }
     const mailboxId = this.#inboxClaimant.inboxId;
     if (typeof mailboxId !== "string" || mailboxId.length === 0) {
       throw new Error("InboxCatchupService: inboxClaimant.inboxId is not set");
+    }
+
+    // D2 dual-mode gate: a durable-capable node (S2) uses the server-held cursor
+    // model (inline { seq, ciphertextB64 } + mailbox.cursorAck); a legacy/fs node
+    // keeps the list/fetch/ack delete model untouched. This single check is what
+    // protects the shipped desktop + DO-relay path from any S2 behavior change.
+    if (nodeAdvertisesDurableInbox(sdk)) {
+      await this.#drainDurable(sdk, mailboxId);
+      return;
+    }
+
+    if (typeof sdk.mailbox.list !== "function" || typeof sdk.mailbox.fetch !== "function" || typeof sdk.mailbox.ack !== "function") {
+      throw new Error("InboxCatchupService requires sdk.mailbox.list/fetch/ack");
     }
 
     // In-memory page cursor for THIS pass only — never persisted. It walks the
@@ -212,6 +227,192 @@ export class InboxCatchupService extends BaseServerService {
       const nextCursor = page && typeof page.nextCursor === "string" ? page.nextCursor : null;
       if (!nextCursor) return;
       pageCursor = nextCursor;
+    }
+  }
+
+  // Durable-node catch-up (S2). mailbox.list returns inline { seq, ciphertextB64 }
+  // items strictly AFTER the server-held device cursor; feed each through the
+  // serialized pipeline and advance the cursor through the highest CONTIGUOUS
+  // consumed seq via mailbox.cursorAck. cursorAck is a contiguous watermark (the
+  // node may prune <= it), so a seq that won't decrypt yet STOPS the advance there
+  // and the next drain re-lists from it. No fetch (bodies are inline), no ack-delete
+  // (the home log is durable; the device cursor is the only mutation). A genuinely
+  // poison seq is quarantined by cursor-skipping past it — never silently (it emits
+  // a user-visible "couldn't be delivered" notice first).
+  async #drainDurable(sdk, mailboxId) {
+    if (typeof sdk.mailbox.list !== "function" || typeof sdk.mailbox.cursorAck !== "function") {
+      throw new Error("InboxCatchupService (durable) requires sdk.mailbox.list/cursorAck");
+    }
+    while (true) {
+      const page = await sdk.mailbox.list({ mailboxId, cursor: null, limit: this.#pageLimit });
+      const items = page && Array.isArray(page.items) ? page.items : [];
+      if (process.env.REZ_INBOX_CATCHUP_DEBUG === "1") {
+        this.logger.log("[InboxCatchupService] durable list mailboxId=" + mailboxId + " items=" + items.length);
+      }
+      if (items.length === 0) return;
+      let throughSeq = 0;          // highest contiguous consumed seq this batch
+      const consumedSeqs = [];     // seqs whose dedup marker we may forget post-ack
+      let blocked = false;
+      for (const item of items) {
+        const seq = this.#itemSeq(item);
+        if (seq == null) {
+          // A durable node always stamps an integer seq; a missing one means we
+          // cannot safely cursor past this item, so HALT the pass (a stuck cursor
+          // is debuggable; a silent skip would drop mail). Retries next drain.
+          this.logger.error("[InboxCatchupService] durable list item missing a usable seq; halting drain pass");
+          blocked = true;
+          break;
+        }
+        // Poison backoff: a seq that recently failed is held briefly so rapid
+        // reconnects don't re-decrypt the whole floor. It is a GAP — stop the
+        // contiguous advance here and retry it on the next drain.
+        const backoffUntil = this.#decryptBackoffUntilMsByEvent.get("seq:" + seq);
+        if (typeof backoffUntil === "number" && this.#clock() < backoffUntil) {
+          blocked = true;
+          break;
+        }
+        const frame = { t: "evt.mailbox.deposited", body: { mailboxId, seq, ciphertextB64: this.#itemCiphertext(item) } };
+        let result = null;
+        try {
+          result = await this.#pipeline.submit(frame);
+        } catch (err) {
+          this.logger.error("[InboxCatchupService] durable pipeline submit threw for seq=" + seq + ": " + (err && err.message ? err.message : err));
+        }
+        const ok = Boolean(result && (result.consumed || result.alreadyProcessed));
+        if (ok) {
+          throughSeq = seq;
+          consumedSeqs.push(seq);
+          continue;
+        }
+        // Gap: a seq we cannot consume yet. Count it; once a bound (D1) fires,
+        // QUARANTINE by cursor-skipping past it (after surfacing a notice). Else
+        // leave the cursor below it and retry next drain (a failed decrypt did not
+        // commit the ratchet, so an ordering race can still resolve it).
+        const skip = await this.#handleDurableFailure(mailboxId, seq);
+        if (skip) {
+          throughSeq = seq;        // accept the loss; advance past the poison seq
+          continue;
+        }
+        blocked = true;
+        break;
+      }
+      if (throughSeq > 0) {
+        try {
+          await sdk.mailbox.cursorAck({ mailboxId, throughSeq });
+        } catch (err) {
+          // The cursor did not advance; the next drain re-lists from the same point
+          // (cursorAck is monotonic + idempotent, so the retry is safe). Keep markers.
+          this.logger.error("[InboxCatchupService] cursorAck failed mailboxId=" + mailboxId + " throughSeq=" + throughSeq + ": " + (err && err.message ? err.message : err));
+          return;
+        }
+        // The acked seqs are now behind the server cursor and can never be re-listed,
+        // so their dedup markers are dead weight — forget them to keep the log bounded.
+        await this.#forgetConsumedSeqs(mailboxId, consumedSeqs);
+      }
+      if (blocked) return;          // leave the rest for the next drain
+      // else: a full batch advanced the cursor — loop and list the next window.
+    }
+  }
+
+  #itemSeq(item) {
+    if (!item || typeof item !== "object") return null;
+    if (Number.isInteger(item.seq) && item.seq > 0) return item.seq;
+    const n = Number(item.seq);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  }
+
+  #itemCiphertext(item) {
+    return item && typeof item.ciphertextB64 === "string" ? item.ciphertextB64 : "";
+  }
+
+  async #forgetConsumedSeqs(mailboxId, consumedSeqs) {
+    if (!this.#processedLog || typeof this.#processedLog.forget !== "function") return;
+    for (const seq of consumedSeqs) {
+      this.#decryptBackoffUntilMsByEvent.delete("seq:" + seq);
+      await this.#processedLog.forget(mailboxId, "seq:" + seq).catch((err) => {
+        this.logger.error("[InboxCatchupService] durable forget seq:" + seq + " failed: " + (err && err.message ? err.message : err));
+      });
+    }
+  }
+
+  // Seq-keyed mirror of #handleDecryptFailure for durable mode. Returns true when
+  // the seq should be QUARANTINED (the caller cursor-skips past it), false to leave
+  // the cursor below it and retry on the next drain.
+  async #handleDurableFailure(mailboxId, seq) {
+    const seqKey = "seq:" + seq;
+    if (!this.#processedLog || typeof this.#processedLog.recordAttempt !== "function") {
+      this.logger.warn("[InboxCatchupService] durable deposit seq=" + seq + " left buffered (no attempt store to bound retries)");
+      return false;
+    }
+    const nowMs = this.#clock();
+    let attempts = 0;
+    try {
+      attempts = await this.#processedLog.recordAttempt(mailboxId, seqKey, { nowMs });
+    } catch (err) {
+      this.logger.error("[InboxCatchupService] durable attempt-counter record failed for seq=" + seq + ": " + (err && err.message ? err.message : err));
+      return false;
+    }
+    let firstSeenAtMs = 0;
+    if (typeof this.#processedLog.firstSeenAtMs === "function") {
+      try {
+        firstSeenAtMs = await this.#processedLog.firstSeenAtMs(mailboxId, seqKey);
+      } catch (err) {
+        this.logger.error("[InboxCatchupService] durable firstSeen lookup failed for seq=" + seq + ": " + (err && err.message ? err.message : err));
+        firstSeenAtMs = 0;
+      }
+    }
+    const ageMs = firstSeenAtMs > 0 ? (nowMs - firstSeenAtMs) : 0;
+    const tooManyAttempts = attempts >= this.#maxDecryptAttempts;
+    const tooOld = firstSeenAtMs > 0 && ageMs >= this.#maxQuarantineAgeMs;
+    if (tooManyAttempts || tooOld) {
+      const reason = tooManyAttempts ? "attempts" : "age";
+      this.logger.error(
+        "[InboxCatchupService] quarantining (cursor-skip) undecryptable durable deposit mailboxId=" + mailboxId
+        + " seq=" + seq + " after " + attempts + " attempts, ageMs=" + ageMs + " (" + reason + " bound)",
+      );
+      // Surface it BEFORE skipping — a dropped message must never vanish silently.
+      this.#emitQuarantined({ mailboxId, seq, attempts, ageMs, reason });
+      if (typeof this.#processedLog.clearAttempts === "function") {
+        await this.#processedLog.clearAttempts(mailboxId, seqKey).catch((err) => {
+          this.logger.error("[InboxCatchupService] durable attempt-counter clear failed: " + (err && err.message ? err.message : err));
+        });
+      }
+      if (typeof this.#processedLog.forget === "function") {
+        await this.#processedLog.forget(mailboxId, seqKey).catch((err) => {
+          this.logger.error("[InboxCatchupService] durable forget failed: " + (err && err.message ? err.message : err));
+        });
+      }
+      this.#decryptBackoffUntilMsByEvent.delete(seqKey);
+      return true;
+    }
+    if (attempts >= DECRYPT_BACKOFF_AFTER_ATTEMPTS) {
+      this.#decryptBackoffUntilMsByEvent.set(seqKey, nowMs + DECRYPT_RETRY_BACKOFF_MS);
+      if (this.#decryptBackoffUntilMsByEvent.size > 16384) {
+        for (const [k, until] of this.#decryptBackoffUntilMsByEvent) {
+          if (nowMs >= until) this.#decryptBackoffUntilMsByEvent.delete(k);
+        }
+      }
+    }
+    return false;
+  }
+
+  // Surface a quarantined (dropped) deposit to the user — NEVER swallow it silently
+  // (feedback_explicit_over_clever_no_data_suppression). We know only the mailbox,
+  // the deposit identity (durable seq or legacy eventId), and how hard we tried; the
+  // thread/sender/content are unknowable (the ciphertext never decrypted). The UI
+  // renders it as a "couldn't be delivered" failed-message notice (System thread).
+  #emitQuarantined({ mailboxId, seq = null, eventId = "", attempts = 0, ageMs = 0, reason = "attempts" }) {
+    try {
+      this._emit("mailbox.deposit.quarantined", new MailboxDepositQuarantinedEvent({
+        mailboxId,
+        seq: Number.isInteger(seq) ? seq : null,
+        eventId: typeof eventId === "string" ? eventId : "",
+        attempts: Number.isInteger(attempts) ? attempts : 0,
+        ageMs: Number.isFinite(ageMs) ? Math.round(ageMs) : 0,
+        reason: reason === "age" ? "age" : "attempts",
+      }));
+    } catch (err) {
+      this.logger.error("[InboxCatchupService] failed to emit quarantine notice: " + (err && err.message ? err.message : err));
     }
   }
 
@@ -283,6 +484,8 @@ export class InboxCatchupService extends BaseServerService {
         + " eventId=" + eventId + " after " + attempts + " attempts, ageMs=" + ageMs
         + " (" + (tooManyAttempts ? "attempt" : "age") + " bound)",
       );
+      // Surface it BEFORE dropping — a quarantined deposit must never vanish silently.
+      this.#emitQuarantined({ mailboxId, eventId, attempts, ageMs, reason: tooManyAttempts ? "attempts" : "age" });
       await this.#ackAndForget(sdk, mailboxId, eventId);
       return;
     }

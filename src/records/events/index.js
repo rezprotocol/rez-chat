@@ -10,6 +10,7 @@ export { ContactUpdatedEvent } from "./ContactUpdatedEvent.js";
 export { ContactRemovedEvent } from "./ContactRemovedEvent.js";
 export { ConnectionStateEvent } from "./ConnectionStateEvent.js";
 export { InboxCaughtUpEvent } from "./InboxCaughtUpEvent.js";
+export { MailboxDepositQuarantinedEvent } from "./MailboxDepositQuarantinedEvent.js";
 export { MeshStatusUpdatedEvent } from "./MeshStatusUpdatedEvent.js";
 export { GroupUpdatedEvent } from "./GroupUpdatedEvent.js";
 export { GroupRemovedEvent } from "./GroupRemovedEvent.js";

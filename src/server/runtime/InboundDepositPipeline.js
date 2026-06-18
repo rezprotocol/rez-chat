@@ -94,7 +94,7 @@ export class InboundDepositPipeline {
    * are caught internally so one bad deposit never wedges the queue or rejects a
    * caller.
    *
-   * @param {{ body?: object, mailboxId?: string, eventId?: string, ciphertextB64?: string }} frame
+   * @param {{ body?: object, mailboxId?: string, eventId?: string, seq?: number, ciphertextB64?: string }} frame
    * @returns {Promise<{ consumed: boolean, decryptOk: boolean, alreadyProcessed: boolean, applied: boolean }>}
    */
   submit(frame) {
@@ -122,7 +122,16 @@ export class InboundDepositPipeline {
     const body = frame && frame.body && typeof frame.body === "object" ? frame.body : (frame || {});
     const mailboxId = typeof body.mailboxId === "string" ? body.mailboxId : "";
     const eventId = typeof body.eventId === "string" ? body.eventId : "";
-    return { mailboxId, eventId };
+    // Durable nodes (S2) stamp a per-inbox monotonic `seq` on every deposit,
+    // carried on the live EVT and on each catch-up list item. When present it is
+    // the home-stable dedup identity: the relay `eventId` is home-local AND absent
+    // on durable catch-up items (which carry only { seq, ciphertextB64 }), so the
+    // one non-idempotent step (re-decrypt) must be guarded on `seq` instead. dedupId
+    // selects seq in durable mode, eventId otherwise — identical guarding on both the
+    // live-push and reconnect-drain paths, with zero change for legacy/fs frames.
+    const seq = Number.isInteger(body.seq) && body.seq >= 0 ? body.seq : null;
+    const dedupId = seq != null ? "seq:" + seq : eventId;
+    return { mailboxId, eventId, seq, dedupId };
   }
 
   #frameCiphertext(frame) {
@@ -134,9 +143,9 @@ export class InboundDepositPipeline {
   // Only deposits carrying ciphertext (re-feedable on a later drain) are
   // retained; a consumed/dedup deposit is dropped. Bounded by #maxPending.
   #updatePending(frame, result) {
-    const { mailboxId, eventId } = this.#frameIds(frame);
-    if (!eventId) return;
-    const key = mailboxId + ":" + eventId;
+    const { mailboxId, dedupId } = this.#frameIds(frame);
+    if (!dedupId) return;
+    const key = mailboxId + ":" + dedupId;
     if (result && (result.consumed || result.alreadyProcessed)) {
       this.#pending.delete(key);
       return;
@@ -146,7 +155,7 @@ export class InboundDepositPipeline {
     const existing = this.#pending.get(key);
     if (existing) return; // already retained; attempts advance only via re-drain
     if (process.env.REZ_PEERLINK_TRACE === "1") {
-      this.#logger.log("[PLTRACE] pipeline RETAIN evt=" + eventId + " (pending=" + (this.#pending.size + 1) + ")");
+      this.#logger.log("[PLTRACE] pipeline RETAIN evt=" + dedupId + " (pending=" + (this.#pending.size + 1) + ")");
     }
     if (this.#pending.size >= this.#maxPending) {
       // Bound the buffer — drop the oldest retained deposit (insertion order).
@@ -195,16 +204,16 @@ export class InboundDepositPipeline {
   }
 
   async #processOne(frame) {
-    const { mailboxId, eventId } = this.#frameIds(frame);
+    const { mailboxId, dedupId } = this.#frameIds(frame);
     // Skip a deposit already decrypted + consumed earlier (typically via the
     // live push path) and now re-fetched by the catch-up drain. Re-decrypting it
     // would fail the (already-advanced) double ratchet and could swallow the
     // genuinely-new deposit that follows. Downstream applies are canonical-key
     // idempotent; the decrypt is the one non-idempotent step, so dedup here.
-    if (this.#processedLog && eventId) {
+    if (this.#processedLog && dedupId) {
       let already = false;
       try {
-        already = await this.#processedLog.has(mailboxId, eventId);
+        already = await this.#processedLog.has(mailboxId, dedupId);
       } catch (err) {
         this.#logger.error("[InboundDepositPipeline] processed-log lookup failed: "
           + (err && err.message ? err.message : err));
@@ -232,9 +241,9 @@ export class InboundDepositPipeline {
     const decryptOk = Boolean(status && status.decryptOk);
     // Mark processed only after a real (non-idempotent) decrypt, so a re-fetch
     // never re-runs the advanced ratchet. A deposit left for retry stays unmarked.
-    if (this.#processedLog && eventId && decryptOk) {
+    if (this.#processedLog && dedupId && decryptOk) {
       try {
-        await this.#processedLog.mark(mailboxId, eventId);
+        await this.#processedLog.mark(mailboxId, dedupId);
       } catch (err) {
         this.#logger.error("[InboundDepositPipeline] processed-log mark failed: "
           + (err && err.message ? err.message : err));

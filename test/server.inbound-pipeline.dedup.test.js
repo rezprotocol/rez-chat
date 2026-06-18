@@ -63,6 +63,37 @@ test("pipeline skips re-decrypt of an already-processed (mailbox,event)", async 
   assert.deepEqual(appliedMessages, ["E1", "E2"], "only the first E1 and E2 are applied");
 });
 
+test("durable frames dedup on seq (no eventId) — S2 durable-mode catch-up re-list", async () => {
+  // A durable node (S2) stamps a per-inbox monotonic `seq` and its catch-up
+  // list items carry ONLY { seq, ciphertextB64 } — no relay eventId. The pipeline
+  // must guard the non-idempotent re-decrypt on seq so a live-pushed-then-re-listed
+  // deposit is not re-decrypted (which would fail the advanced ratchet).
+  const decryptCalls = [];
+  const peerLinkProtocol = {
+    async processDeposit(f) {
+      const seq = f && f.body ? f.body.seq : null;
+      decryptCalls.push(seq);
+      return { consumed: true, decryptOk: true, userMessage: { seq, mailboxId: f.body.mailboxId } };
+    },
+  };
+  const applied = [];
+  const events = { async applyUserMessage(m) { applied.push(m.seq); }, async processDeposit() {} };
+  const processedLog = new ProcessedDepositLog({ kvStore: new MemKv() });
+  const pipeline = new InboundDepositPipeline({ peerLinkProtocol, events, processedLog, logger: silent });
+  const durable = (seq) => ({ t: "evt.mailbox.deposited", body: { mailboxId: "mbx_self", seq, ciphertextB64: "ct" + seq } });
+
+  const r1 = await pipeline.submit(durable(1));            // live push of seq 1
+  assert.deepEqual({ decryptOk: r1.decryptOk, alreadyProcessed: r1.alreadyProcessed }, { decryptOk: true, alreadyProcessed: false });
+  const r1again = await pipeline.submit(durable(1));        // reconnect re-list of seq 1
+  assert.deepEqual({ decryptOk: r1again.decryptOk, alreadyProcessed: r1again.alreadyProcessed }, { decryptOk: false, alreadyProcessed: true },
+    "seq 1 re-list is a dedup hit, not a re-decrypt");
+  await pipeline.submit(durable(2));                        // genuinely-new seq 2
+  assert.deepEqual(decryptCalls, [1, 2], "seq 1 decrypted once; the re-list skipped; seq 2 decrypted");
+  assert.deepEqual(applied, [1, 2]);
+  assert.equal(await processedLog.has("mbx_self", "seq:1"), true, "dedup marker is keyed seq:1");
+  assert.equal(await processedLog.has("mbx_self", "1"), false, "NOT keyed on the bare seq (no collision with a legacy eventId='1')");
+});
+
 test("a decrypt failure is NOT marked processed (so it can be retried)", async () => {
   let attempts = 0;
   const peerLinkProtocol = {
