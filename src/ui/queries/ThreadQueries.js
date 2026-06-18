@@ -62,7 +62,12 @@ export class ThreadQueries {
     if (thread.peerAccountId) {
       const name = this.#contacts.displayName(thread.peerAccountId);
       if (name) return name;
+      return null;
     }
+    // A direct thread with no peer can only be a synthetic UI thread (e.g. the
+    // System notices thread): there is no peer to resolve, so its own title is
+    // authoritative — never a stale cached peer name.
+    if (nonEmptyString(thread.title)) return thread.title;
     return null;
   }
 

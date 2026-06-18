@@ -3,7 +3,9 @@ import { BusComponent } from "../base/BusComponent.js";
 import { materialIcon } from "../base/icon.js";
 import { MessageBubbleView } from "./MessageBubbleView.js";
 import { SystemEventRowView } from "./SystemEventRowView.js";
+import { SystemNoticeRowView } from "./SystemNoticeRowView.js";
 import { SYSTEM_EVENT_KIND } from "../../records/payloads/ChatSystemEventPayloadV1.js";
+import { isSystemNoticesThreadId } from "../system/systemNoticesThread.js";
 
 const STATE_NONE = "none";
 const STATE_EMPTY = "empty";
@@ -68,6 +70,13 @@ export class MessageTimelineView extends BusComponent {
         }
       });
     }
+    // The synthetic System thread renders from NoticesStore, not MessageStore.
+    if (stores.notices) {
+      this._subscribe(stores.notices, () => {
+        if (!isSystemNoticesThreadId(this.#currentThreadId)) return;
+        this.#reconcileMembership();
+      });
+    }
     this._listen("runtime.connected", () => this.#syncAfterReconnect());
     this.#handleSelectedThreadChange();
   }
@@ -89,7 +98,8 @@ export class MessageTimelineView extends BusComponent {
     this.#lastSeenLastMessageId = "";
     this.#followBottom = true;
     this.#reconcileMembership();
-    if (nextThreadId) {
+    // The System thread is UI-only — there is no server thread to load.
+    if (nextThreadId && !isSystemNoticesThreadId(nextThreadId)) {
       this.#loadSelectedThreadData(nextThreadId);
     }
   }
@@ -126,6 +136,10 @@ export class MessageTimelineView extends BusComponent {
   }
 
   #getOrderedMessageIds() {
+    if (isSystemNoticesThreadId(this.#currentThreadId)) {
+      const notices = this.bus.stores ? this.bus.stores.notices : null;
+      return notices ? notices.getNotices().map((n) => n.id) : [];
+    }
     // MessageStore.getMessagesFor already handles the system-event passthrough
     // (system events render in every channel of the group thread).
     const messages = this.bus.stores.messages.getMessagesFor(
@@ -253,6 +267,9 @@ export class MessageTimelineView extends BusComponent {
 
   #buildRowView({ messageId, message }) {
     const threadId = this.#currentThreadId;
+    if (isSystemNoticesThreadId(threadId)) {
+      return new SystemNoticeRowView({ bus: this.bus, noticeId: messageId });
+    }
     if (isSystemMessage(message)) {
       return new SystemEventRowView({ bus: this.bus, threadId, messageId });
     }

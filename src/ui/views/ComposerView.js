@@ -2,6 +2,7 @@ import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { materialIcon } from "../base/icon.js";
 import { EmojiPickerView } from "./EmojiPickerView.js";
+import { isSystemNoticesThreadId } from "../system/systemNoticesThread.js";
 
 const TEXTAREA_MAX_HEIGHT_PX = 200;
 
@@ -192,6 +193,13 @@ export class ComposerView extends BusComponent {
       this.#emojiPicker = null;
     }
 
+    // The System notices thread is read-only — a reply has nowhere to go, so
+    // there is no composer at all (just a muted hint where it would be).
+    if (isSystemNoticesThreadId(this.#threadId)) {
+      this.#renderReadOnlyNotice();
+      return;
+    }
+
     const input = h("textarea", {
       className: "flex-1 bg-transparent border-none focus:ring-0 focus:outline-none text-body-base font-body-base text-on-surface py-3 resize-none custom-scrollbar placeholder:text-outline-variant",
       placeholder: "Type a secure message...",
@@ -291,6 +299,24 @@ export class ComposerView extends BusComponent {
     this.#applyThreadState(this.#getThread(threadId));
     this.#renderReplyChip();
     this.#wireActions(threadId);
+  }
+
+  #renderReadOnlyNotice() {
+    this.#disabled = true;
+    this.#inputEl = null;
+    this.#sendBtnEl = null;
+    this.#stateEl = null;
+    this.#errorEl = null;
+    this.#formEl = null;
+    this.#attachBtnEl = null;
+    this.#moodBtnEl = null;
+    this.#previewRowEl = null;
+    this.#replyChipEl = null;
+    const note = h("div", {
+      className: "max-w-4xl mx-auto text-center text-label-micro font-label-technical text-outline-variant uppercase tracking-widest opacity-60 py-2",
+      "data-testid": "composer.readOnly",
+    }, "Read-only · system notices");
+    this._rootEl.replaceChildren(note);
   }
 
   #refreshDisabledState() {

@@ -5,6 +5,7 @@ import { ContactAvatarView } from "./ContactAvatarView.js";
 import { ConfirmModalView } from "./ConfirmModalView.js";
 import { InviteCodeModalView } from "./InviteCodeModalView.js";
 import { shortId } from "../presenters/labels.js";
+import { isSystemNoticesThreadId } from "../system/systemNoticesThread.js";
 
 export class ChatHeaderView extends BusComponent {
   #avatarView;
@@ -300,22 +301,27 @@ export class ChatHeaderView extends BusComponent {
     // menu — the only group-wide action is "Leave group" via Group Info.
     // For direct (1:1) threads, "Delete" still deletes the thread.
     const isGroup = !!groupId;
+    const isSystem = isSystemNoticesThreadId(threadId);
     const channelKey = typeof activeChannelId === "string" ? activeChannelId.trim() : "";
     let deleteItem = null;
-    if (!isGroup) {
+    if (isSystem) {
+      // The System notices thread is non-deletable — it is a UI status surface,
+      // not user data. Archive (a local UI status) is the only mutation offered.
+      deleteItem = null;
+    } else if (!isGroup) {
       deleteItem = item("delete", "Delete", "thread.delete", true);
     } else if (channelKey && isGroupAdmin) {
       deleteItem = item("delete", "Delete channel", "channel.delete", true);
     }
     // Lock/archive on a group thread mutate state every member sees, so they
     // are admin-only. For DMs they remain available — the user owns their
-    // own 1:1 view.
+    // own 1:1 view. Locking is meaningless for the read-only System thread.
     const canMutateThreadState = !isGroup || isGroupAdmin;
     return h("div", {
       className: "absolute right-2 top-[calc(100%+4px)] z-30 w-56 rounded-xl border border-outline-variant/30 bg-surface-container/95 backdrop-blur-md shadow-xl p-1.5",
       "data-role": "header-overflow",
     }, [
-      canMutateThreadState ? item(locked ? "lock_open" : "lock", locked ? "Unlock thread" : "Lock thread", "thread.lock.toggle") : null,
+      (canMutateThreadState && !isSystem) ? item(locked ? "lock_open" : "lock", locked ? "Unlock thread" : "Lock thread", "thread.lock.toggle") : null,
       canMutateThreadState ? item(archived ? "unarchive" : "archive", archived ? "Unarchive" : "Archive", "thread.archive.toggle") : null,
       groupId ? item("person_add", "Generate invite", "thread.invite.create") : null,
       groupId ? item("info", "Group info", "thread.info") : null,
@@ -388,6 +394,15 @@ export class ChatHeaderView extends BusComponent {
     if (archiveButton) {
       archiveButton.addEventListener("click", () => {
         this.#overflowOpen = false;
+        // The System notices thread has no server counterpart, so its archive
+        // state is a local UI status owned by SystemNoticesService.
+        if (isSystemNoticesThreadId(threadId)) {
+          this.bus.call("systemNotices", "setArchived", { archived: !archived }).catch((err) => {
+            console.error("[ChatHeaderView] system notices archive toggle failed", err);
+            this.bus.emit("app.error", { source: "ChatHeaderView", message: "system notices archive toggle failed", severity: "warn", err });
+          });
+          return;
+        }
         this.bus.call("threads", "setState", {
           threadId,
           visibilityState: archived ? "visible" : "hidden",

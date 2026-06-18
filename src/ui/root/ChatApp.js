@@ -11,6 +11,7 @@ import { GroupStore } from "../stores/GroupStore.js";
 import { ChannelStore } from "../stores/ChannelStore.js";
 import { InviteStore } from "../stores/InviteStore.js";
 import { ConnectionStore } from "../stores/ConnectionStore.js";
+import { NoticesStore } from "../stores/NoticesStore.js";
 import { GroupQueries } from "../queries/GroupQueries.js";
 import { ThreadQueries } from "../queries/ThreadQueries.js";
 import { ChannelQueries } from "../queries/ChannelQueries.js";
@@ -43,6 +44,7 @@ import { ConnectionService } from "../services/bus/ConnectionService.js";
 import { NotificationService } from "../services/bus/NotificationService.js";
 import { UiNavigationService } from "../services/bus/UiNavigationService.js";
 import { LinksService } from "../services/bus/LinksService.js";
+import { SystemNoticesService } from "../services/bus/SystemNoticesService.js";
 import { UpdateAvailableBannerView } from "../views/UpdateAvailableBannerView.js";
 
 export class ChatApp {
@@ -86,6 +88,7 @@ export class ChatApp {
     this.bus.stores.channels = new ChannelStore({ bus: this.bus });
     this.bus.stores.invites = new InviteStore({ bus: this.bus });
     this.bus.stores.connection = new ConnectionStore({ bus: this.bus });
+    this.bus.stores.notices = new NoticesStore({ bus: this.bus });
   }
 
   _createQueries() {
@@ -195,6 +198,12 @@ export class ChatApp {
       }),
       links: new LinksService({
         bus: this.bus,
+      }),
+      systemNotices: new SystemNoticesService({
+        bus: this.bus,
+        noticesStore: this.bus.stores.notices,
+        threadStore: this.bus.stores.threads,
+        uiStateStore: this.bus.stores.uiState,
       }),
     };
     Object.assign(this.bus.services, services);
