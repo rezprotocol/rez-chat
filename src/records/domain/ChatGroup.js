@@ -9,6 +9,10 @@ export class ChatGroup extends RRecord {
     this.groupId = nonEmptyString(raw.groupId);
     this.ownerAccountId = nonEmptyString(raw.ownerAccountId);
     this.title = nonEmptyString(raw.title);
+    // SHA-256 hex of the group's avatar image (content-addressed in the file
+    // store), or empty string for no photo. Mirrors ChatContact.avatarFileHash;
+    // propagated to members via GroupOpPayloadV1 op:"setAvatar" (LWW like rename).
+    this.avatarFileHash = nonEmptyString(raw.avatarFileHash);
     this.threadId = nonEmptyString(raw.threadId);
     this.createdBy = nonEmptyString(raw.createdBy);
     // The invite this membership was joined via (acceptor side only). Lets a

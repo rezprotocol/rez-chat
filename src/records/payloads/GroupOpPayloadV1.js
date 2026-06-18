@@ -53,12 +53,18 @@ export const GROUP_OP_KIND = "rez.group-op.v1";
 export const GROUP_OPS = Object.freeze([
   "rename", "kick", "setRole", "leave", "channel.create", "channel.delete",
   "channels.sync_request", "group.state", "member.join", "member.contact",
+  "setAvatar",
 ]);
 const MAX_CONTACTS_PER_OP = 256;
 export const GROUP_OP_ROLES = Object.freeze(["admin", "member"]);
 const VALID_ROLES = new Set(GROUP_OP_ROLES);
 const MAX_TITLE_LENGTH = 128;
 const MAX_DISPLAY_NAME_LENGTH = 128;
+// Avatar hash + inline bytes (same shape/limits as ChatAvatarPayloadV1). The
+// bytes ride inline so the photo propagates atomically with the op — no
+// separate file handshake and no ordering race against the hash.
+const HEX_HASH_RE = /^[0-9a-f]{64}$/;
+const MAX_AVATAR_B64_LENGTH = 4 * 1024 * 1024; // 4 MB base64 ~ 3 MB binary
 
 export class GroupOpPayloadV1 extends WirePayloadRecord {
   static KIND = GROUP_OP_KIND;
@@ -89,6 +95,11 @@ export class GroupOpPayloadV1 extends WirePayloadRecord {
     // requires + verifies it before conferring membership (drops otherwise).
     joinerSignerPublicKeyB64: { type: "string", trim: true },
     joinerSigB64: { type: "string", trim: true },
+    // setAvatar (and group.state catch-up): content hash of the photo plus the
+    // image bytes inline. Empty avatarFileHash on a setAvatar op clears the
+    // photo. Both validated in validate() below.
+    avatarFileHash: { type: "string", trim: true, lowercase: true },
+    avatarDataB64: { type: "string", trim: false, maxLength: MAX_AVATAR_B64_LENGTH },
   };
 
   validate() {
@@ -97,6 +108,21 @@ export class GroupOpPayloadV1 extends WirePayloadRecord {
       this.assert(this.title.length > 0, `GroupOpPayloadV1.${this.op}: title required`);
       this.assert(this.title.length <= MAX_TITLE_LENGTH,
         `GroupOpPayloadV1.${this.op}: title exceeds ${MAX_TITLE_LENGTH} chars`);
+      // group.state may piggyback the current avatar for late-joiner catch-up.
+      // It is optional here (fill-if-empty on the receiver); validate only when
+      // present, and require the bytes alongside a non-empty hash.
+      if (this.avatarFileHash.length > 0) {
+        assertAvatarPresent(this);
+      }
+    } else if (this.op === "setAvatar") {
+      // Empty hash = clear the photo. A non-empty hash must be a real 64-char
+      // SHA-256 with the matching image bytes inline.
+      if (this.avatarFileHash.length > 0) {
+        assertAvatarPresent(this);
+      } else {
+        this.assert(this.avatarDataB64.length === 0,
+          "GroupOpPayloadV1.setAvatar: avatarDataB64 must be empty when clearing the photo");
+      }
     } else if (this.op === "kick" || this.op === "leave") {
       this.assert(this.accountId.length > 0, `GroupOpPayloadV1.${this.op}: accountId required`);
     } else if (this.op === "setRole") {
@@ -132,6 +158,16 @@ export class GroupOpPayloadV1 extends WirePayloadRecord {
       }
     }
   }
+}
+
+// Module-level helper (NOT a private method): validate() runs from the base
+// SchemaRecord constructor, before this subclass's private brand is installed,
+// so a `this.#method()` call there throws "Receiver must be an instance".
+function assertAvatarPresent(record) {
+  record.assert(HEX_HASH_RE.test(record.avatarFileHash),
+    `GroupOpPayloadV1.${record.op}: avatarFileHash must be 64-char hex SHA-256`);
+  record.assert(record.avatarDataB64.length > 0,
+    `GroupOpPayloadV1.${record.op}: avatarDataB64 required with a non-empty avatarFileHash`);
 }
 
 export function groupOpPayloadToBytes(payload) {

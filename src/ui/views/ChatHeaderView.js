@@ -156,7 +156,14 @@ export class ChatHeaderView extends BusComponent {
       });
     }
 
-    const contactAvatarHash = contact && typeof contact.avatarFileHash === "string" ? contact.avatarFileHash : "";
+    // Group threads draw the group's photo; DM threads draw the peer contact's.
+    let contactAvatarHash = "";
+    if (thread.threadType === "group" && thread.groupId && groupStore) {
+      const group = groupStore.getGroup(thread.groupId);
+      contactAvatarHash = group && typeof group.avatarFileHash === "string" ? group.avatarFileHash : "";
+    } else if (contact && typeof contact.avatarFileHash === "string") {
+      contactAvatarHash = contact.avatarFileHash;
+    }
     const avatarSlot = h("div", { className: "w-10 h-10 rounded-full overflow-hidden" });
 
     if (this.#avatarView) {

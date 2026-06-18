@@ -191,9 +191,27 @@ fn create_main_window(app: &tauri::AppHandle, init_script: &str) -> Result<(), S
         builder = builder.title_bar_style(tauri::TitleBarStyle::Overlay);
     }
 
-    builder
+    let main_window = builder
         .build()
         .map_err(|err| format!("failed to create main window: {}", err))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        // With TitleBarStyle::Overlay the window title text ("Rez Chat") is
+        // still drawn in the titlebar and overlaps the in-app chat header on
+        // narrow windows. Hide the title text (NSWindowTitleVisibilityHidden)
+        // while keeping the title string set, so the OS Window menu / Mission
+        // Control still label the window correctly.
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        if let Ok(ns_window_ptr) = main_window.ns_window() {
+            let ns_window = ns_window_ptr as *mut AnyObject;
+            unsafe {
+                let _: () = msg_send![ns_window, setTitleVisibility: 1isize];
+            }
+        }
+    }
+
     Ok(())
 }
 

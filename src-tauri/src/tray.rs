@@ -171,8 +171,13 @@ pub fn set_unread_count(app: &tauri::AppHandle, count: i64) {
         let _ = tray.set_tooltip(Some(tooltip));
         #[cfg(target_os = "macos")]
         {
-            let title = if count > 0 { Some(label) } else { None };
-            let _ = tray.set_title(title);
+            // Tauri/macOS quirk: set_title(None) does NOT remove a
+            // previously-set title — the count stays stuck on the menu bar
+            // even after unread drops to 0 (the menu line correctly reads
+            // "No unread messages" while the icon still shows the old number).
+            // Clear by writing an explicit empty string instead of None.
+            let title = if count > 0 { label } else { String::new() };
+            let _ = tray.set_title(Some(title));
         }
         match build_menu(app, count) {
             Ok(menu) => {

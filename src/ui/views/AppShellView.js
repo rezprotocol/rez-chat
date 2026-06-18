@@ -31,7 +31,7 @@ export class AppShellView extends BusComponent {
       className: "shrink-0 hidden lg:flex z-20",
     }, []);
 
-    const mainArea = h("main", { className: "flex flex-1 min-w-0 min-h-0 overflow-hidden" }, []);
+    const mainArea = h("main", { className: "mac-narrow-titlebar-inset flex flex-1 min-w-0 min-h-0 overflow-hidden" }, []);
     const tabContent = h("div", { className: "flex flex-1 min-w-0 min-h-0" }, []);
     mainArea.appendChild(tabContent);
 

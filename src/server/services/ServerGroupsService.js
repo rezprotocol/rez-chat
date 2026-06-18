@@ -10,6 +10,8 @@ import {
   GroupsListResult,
   GroupRenameParams,
   GroupRenameResult,
+  GroupSetAvatarParams,
+  GroupSetAvatarResult,
   GroupKickParams,
   GroupKickResult,
   GroupSetRoleParams,
@@ -18,6 +20,8 @@ import {
   GroupRemovedEvent,
   GroupMembersUpdatedEvent,
 } from "../../records/index.js";
+import { base64ToBytes, bytesToBase64 } from "@rezprotocol/sdk/client";
+import { Hash } from "@rezprotocol/sdk/hash";
 import { ChatGroupMember } from "../../records/domain/ChatGroupMember.js";
 import { GroupOpPayloadV1 } from "../../records/payloads/GroupOpPayloadV1.js";
 import { signMemberJoinProof } from "../../records/payloads/memberJoinProof.js";
@@ -82,6 +86,7 @@ export class ServerGroupsService extends BaseServerService {
     this._register("group", "create", (payload) => this.createGroup(payload));
     this._register("group", "leave", (payload) => this.leaveGroup(payload));
     this._register("group", "rename", (payload) => this.renameGroup(payload));
+    this._register("group", "setAvatar", (payload) => this.setAvatarGroup(payload));
     this._register("group", "kick", (payload) => this.kickMember(payload));
     this._register("group", "setRole", (payload) => this.setMemberRole(payload));
     this._register("groups", "list", () => this.listGroups());
@@ -282,6 +287,52 @@ export class ServerGroupsService extends BaseServerService {
       });
     }
     return new GroupRenameResult({ group });
+  }
+
+  async setAvatarGroup(payload = {}) {
+    const params = this._coerceParams(payload, GroupSetAvatarParams);
+    params.validate();
+    await this.requireSelfAdmin(params.groupId, "group.setAvatar");
+
+    // Resolve the photo: a non-empty data blob is stored content-addressed and
+    // its hash becomes the group's avatar; an empty/absent blob clears it.
+    const ftService = this.#getFileTransferService();
+    const dataB64 = typeof params.avatarDataB64 === "string" ? params.avatarDataB64 : "";
+    let avatarFileHash = "";
+    if (dataB64.length > 0) {
+      if (!ftService) throw new Error("group.setAvatar: file transfer service unavailable");
+      const bytes = base64ToBytes(dataB64);
+      avatarFileHash = Hash.sha256Hex(bytes);
+      await ftService.storeFile(avatarFileHash, bytesToBase64(bytes));
+    }
+
+    const { group } = await this.#groupStore.setGroupAvatar({
+      ownerAccountId: this.ownerAccountId,
+      groupId: params.groupId,
+      avatarFileHash,
+    });
+    if (group) {
+      this._emit("group.updated", new GroupUpdatedEvent({ group }));
+      const peers = await this.#listOtherActiveMembers(params.groupId);
+      await this.#broadcaster.fanOut({
+        targets: peers,
+        payload: new GroupOpPayloadV1({
+          op: "setAvatar",
+          groupId: params.groupId,
+          avatarFileHash,
+          // Bytes ride inline so the photo lands atomically with the hash.
+          avatarDataB64: avatarFileHash ? dataB64 : "",
+          actedAtMs: this.#clock(),
+          groupOpId: nowOpId(),
+        }),
+      });
+    }
+    return new GroupSetAvatarResult({ group });
+  }
+
+  #getFileTransferService() {
+    const ft = this.bus.services ? this.bus.services.fileTransfer : null;
+    return ft && typeof ft.storeFile === "function" ? ft : null;
   }
 
   async kickMember(payload = {}) {

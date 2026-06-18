@@ -30,6 +30,7 @@ export { GroupsListResult } from "./GroupsListResult.js";
 export { GroupMembersListResult } from "./GroupMembersListResult.js";
 export { GroupLeaveResult } from "./GroupLeaveResult.js";
 export { GroupRenameResult } from "./GroupRenameResult.js";
+export { GroupSetAvatarResult } from "./GroupSetAvatarResult.js";
 export { GroupKickResult } from "./GroupKickResult.js";
 export { GroupSetRoleResult } from "./GroupSetRoleResult.js";
 export { ChannelsListResult } from "./ChannelsListResult.js";

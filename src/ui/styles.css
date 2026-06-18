@@ -294,6 +294,35 @@ body {
   padding-top: 2.5rem;
 }
 
+/* macOS narrow (no-sidebar) layout: the main pane sits at the window's
+ * top-left, directly under the traffic lights. Reserve a top band so the
+ * chat/contacts header and its buttons drop below the lights. The strip is
+ * draggable so the window can still be moved from that band. At >=lg the
+ * sidebar occupies the top-left corner instead (it carries its own inset), so
+ * the pane is no longer under the lights and the inset is removed. */
+.desktop-mac .mac-narrow-titlebar-inset {
+  position: relative;
+  padding-top: 2.25rem;
+}
+.desktop-mac .mac-narrow-titlebar-inset::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2.25rem;
+  z-index: 50;
+  -webkit-app-region: drag;
+}
+@media (min-width: 1024px) {
+  .desktop-mac .mac-narrow-titlebar-inset {
+    padding-top: 0;
+  }
+  .desktop-mac .mac-narrow-titlebar-inset::before {
+    display: none;
+  }
+}
+
 /* Visible bottom-right resize affordance. The OS handles the actual resize
  * cursor in a ~5px band at the window edge — this draws diagonal lines so
  * users can find that corner. pointer-events:none lets clicks/drags fall

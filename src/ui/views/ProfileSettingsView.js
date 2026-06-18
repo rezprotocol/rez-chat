@@ -1,13 +1,11 @@
 import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { shortId, avatarInitials } from "../presenters/labels.js";
+import { resizeImageFileToJpegB64 } from "../presenters/avatarImage.js";
 import { RecoveryPhraseDisplayModal } from "./RecoveryPhraseDisplayModal.js";
 import { ChangePasswordModal } from "./ChangePasswordModal.js";
 import { ExportBackupModal } from "./ExportBackupModal.js";
 import { TypedConfirmModalView } from "./TypedConfirmModalView.js";
-
-const MAX_AVATAR_SIZE = 256;
-const JPEG_QUALITY = 0.85;
 
 export class ProfileSettingsView extends BusComponent {
   #nameInputEl;
@@ -229,38 +227,17 @@ export class ProfileSettingsView extends BusComponent {
 
   #processImageFile(file) {
     const mountVersion = this._captureMountVersion();
-    const reader = new FileReader();
-    reader.onload = () => {
+    resizeImageFileToJpegB64(file).then((b64) => {
       if (!this._isMountVersionCurrent(mountVersion)) return;
-      const img = new Image();
-      img.onload = () => {
-        if (!this._isMountVersionCurrent(mountVersion)) return;
-        const dataUrl = this.#resizeToJpeg(img);
-        const b64Marker = ";base64,";
-        const idx = dataUrl.indexOf(b64Marker);
-        if (idx < 0) return;
-        this.#avatarDataB64 = dataUrl.slice(idx + b64Marker.length);
-        this.#avatarChanged = true;
-        this.#showAvatarImage(dataUrl);
-        if (this.#removeAvatarBtnEl) {
-          this.#removeAvatarBtnEl.classList.remove("hidden");
-        }
-      };
-      img.src = reader.result;
-    };
-    reader.readAsDataURL(file);
-  }
-
-  #resizeToJpeg(img) {
-    const canvas = document.createElement("canvas");
-    canvas.width = MAX_AVATAR_SIZE;
-    canvas.height = MAX_AVATAR_SIZE;
-    const ctx = canvas.getContext("2d");
-    const srcSize = Math.min(img.naturalWidth, img.naturalHeight);
-    const sx = (img.naturalWidth - srcSize) / 2;
-    const sy = (img.naturalHeight - srcSize) / 2;
-    ctx.drawImage(img, sx, sy, srcSize, srcSize, 0, 0, MAX_AVATAR_SIZE, MAX_AVATAR_SIZE);
-    return canvas.toDataURL("image/jpeg", JPEG_QUALITY);
+      this.#avatarDataB64 = b64;
+      this.#avatarChanged = true;
+      this.#showAvatarImage("data:image/jpeg;base64," + b64);
+      if (this.#removeAvatarBtnEl) {
+        this.#removeAvatarBtnEl.classList.remove("hidden");
+      }
+    }).catch((err) => {
+      this.bus.emit("app.error", { source: "ProfileSettingsView", message: "process avatar image failed", severity: "warn", err });
+    });
   }
 
   #showAvatarImage(dataUrl) {

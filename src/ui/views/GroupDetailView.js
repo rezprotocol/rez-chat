@@ -1,7 +1,9 @@
 import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { materialIcon } from "../base/icon.js";
-import { ellipsisId, avatarInitials, avatarHue } from "../presenters/labels.js";
+import { ellipsisId } from "../presenters/labels.js";
+import { resizeImageFileToJpegB64 } from "../presenters/avatarImage.js";
+import { ContactAvatarView } from "./ContactAvatarView.js";
 import { GroupMemberRowView } from "./GroupMemberRowView.js";
 import { ConfirmModalView } from "./ConfirmModalView.js";
 import { InviteCodeModalView } from "./InviteCodeModalView.js";
@@ -27,6 +29,10 @@ export class GroupDetailView extends BusComponent {
   #containerEl;
   #renameBtn;
   #channelsCreateRow;
+  #avatarView;
+  #avatarFileInput;
+  #avatarControlsEl;
+  #removeAvatarBtn;
 
   constructor({ bus, groupId, onBack } = {}) {
     super({ bus });
@@ -42,6 +48,10 @@ export class GroupDetailView extends BusComponent {
     this.#containerEl = null;
     this.#renameBtn = null;
     this.#channelsCreateRow = null;
+    this.#avatarView = null;
+    this.#avatarFileInput = null;
+    this.#avatarControlsEl = null;
+    this.#removeAvatarBtn = null;
   }
 
   #syncAdminControls() {
@@ -50,6 +60,10 @@ export class GroupDetailView extends BusComponent {
     const canCreateChannel = queries && queries.groups ? queries.groups.canSelfCreateChannel(this.#groupId) : false;
     if (this.#renameBtn) {
       this.#renameBtn.style.display = canRename ? "" : "none";
+    }
+    // Group-photo controls follow the same admin gate as rename.
+    if (this.#avatarControlsEl) {
+      this.#avatarControlsEl.style.display = canRename ? "" : "none";
     }
     if (this.#channelsCreateRow) {
       this.#channelsCreateRow.style.display = canCreateChannel ? "" : "none";
@@ -111,14 +125,24 @@ export class GroupDetailView extends BusComponent {
     }, [materialIcon("edit", { size: 16 })]);
     renameBtn.addEventListener("click", (evt) => { evt.stopPropagation(); this.#startInlineRename(); });
     this.#renameBtn = renameBtn;
+    const avatarHash = typeof group.avatarFileHash === "string" ? group.avatarFileHash : "";
+    const avatarSlot = h("div", { className: "w-14 h-14 shrink-0" });
+    if (this.#avatarView) this.#avatarView.unmount();
+    this.#avatarView = new ContactAvatarView({
+      bus: this.bus,
+      label: title,
+      fileHashHex: avatarHash,
+      sizeClass: "w-14 h-14",
+      roundedClass: "rounded-lg",
+    });
+    this.#avatarView.mount(avatarSlot);
+
     content.appendChild(h("div", { className: "flex items-center gap-space-md" }, [
-      h("div", {
-        className: "w-14 h-14 rounded-lg flex items-center justify-center text-on-surface text-body-sm font-body-sm font-bold shrink-0",
-        style: { background: "hsla(" + avatarHue(groupId) + ",55%,30%,0.9)" },
-      }, avatarInitials(title)),
+      avatarSlot,
       h("div", { className: "flex flex-col gap-1 flex-1 min-w-0" }, [
         h("div", { className: "flex items-center gap-space-sm" }, [this.#titleEl, renameBtn]),
         h("p", { className: "text-label-micro font-label-technical text-on-surface-variant/60" }, ellipsisId(groupId, 32)),
+        this.#buildAvatarControls(avatarHash),
       ]),
     ]));
 
@@ -154,8 +178,16 @@ export class GroupDetailView extends BusComponent {
     const stores = this.bus.stores || {};
     const group = stores.groups ? stores.groups.getGroup(this.#groupId) : null;
     if (!group) { this.#onBack(); return; }
+    const title = String(group.title || this.#groupId || "").trim() || "Unnamed group";
     if (this.#titleEl) {
-      this.#titleEl.textContent = String(group.title || this.#groupId || "").trim() || "Unnamed group";
+      this.#titleEl.textContent = title;
+    }
+    const avatarHash = typeof group.avatarFileHash === "string" ? group.avatarFileHash : "";
+    if (this.#avatarView) {
+      this.#avatarView.update({ label: title, fileHashHex: avatarHash });
+    }
+    if (this.#removeAvatarBtn) {
+      this.#removeAvatarBtn.classList.toggle("hidden", !avatarHash);
     }
   }
 
@@ -243,6 +275,45 @@ export class GroupDetailView extends BusComponent {
   #teardownMemberRows() {
     for (const view of this.#memberRowViews.values()) view.unmount();
     this.#memberRowViews.clear();
+  }
+
+  #buildAvatarControls(avatarHash) {
+    const groupId = this.#groupId;
+    const fileInput = h("input", { type: "file", accept: "image/*", className: "hidden" });
+    this.#avatarFileInput = fileInput;
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+      fileInput.value = "";
+      if (!file) return;
+      resizeImageFileToJpegB64(file).then((b64) => {
+        return this.bus.call("groups", "setAvatar", { groupId, avatarDataB64: b64 });
+      }).catch((err) => {
+        console.error("[GroupDetailView] set avatar failed", err);
+        this.bus.emit("app.error", { source: "GroupDetailView", message: "set group photo failed", severity: "warn", err });
+      });
+    });
+
+    const changeBtn = h("button", {
+      type: "button",
+      className: "text-label-technical font-label-technical text-primary hover:text-primary/80 transition-colors cursor-pointer",
+    }, "Change photo");
+    changeBtn.addEventListener("click", () => { if (this.#avatarFileInput) this.#avatarFileInput.click(); });
+
+    const removeBtn = h("button", {
+      type: "button",
+      className: (avatarHash ? "" : "hidden ") + "text-label-technical font-label-technical text-error hover:text-error/80 transition-colors cursor-pointer",
+    }, "Remove photo");
+    removeBtn.addEventListener("click", () => {
+      this.bus.call("groups", "setAvatar", { groupId, avatarDataB64: "" }).catch((err) => {
+        console.error("[GroupDetailView] remove avatar failed", err);
+        this.bus.emit("app.error", { source: "GroupDetailView", message: "remove group photo failed", severity: "warn", err });
+      });
+    });
+    this.#removeAvatarBtn = removeBtn;
+
+    const controls = h("div", { className: "flex items-center gap-space-md mt-1" }, [changeBtn, removeBtn, fileInput]);
+    this.#avatarControlsEl = controls;
+    return controls;
   }
 
   #startInlineRename() {
@@ -503,12 +574,19 @@ export class GroupDetailView extends BusComponent {
       this._channelsOff();
       this._channelsOff = null;
     }
+    if (this.#avatarView) {
+      this.#avatarView.unmount();
+      this.#avatarView = null;
+    }
     this.#membersListEl = null;
     this.#membersHeaderEl = null;
     this.#titleEl = null;
     this.#containerEl = null;
     this.#renameBtn = null;
     this.#channelsCreateRow = null;
+    this.#avatarFileInput = null;
+    this.#avatarControlsEl = null;
+    this.#removeAvatarBtn = null;
     this.#membersState = STATE_NONE;
     super.unmount();
   }

@@ -30,6 +30,7 @@ export { GroupsListParams } from "./GroupsListParams.js";
 export { GroupMembersListParams } from "./GroupMembersListParams.js";
 export { GroupLeaveParams } from "./GroupLeaveParams.js";
 export { GroupRenameParams } from "./GroupRenameParams.js";
+export { GroupSetAvatarParams } from "./GroupSetAvatarParams.js";
 export { GroupKickParams } from "./GroupKickParams.js";
 export { GroupSetRoleParams } from "./GroupSetRoleParams.js";
 export { ChannelsListParams } from "./ChannelsListParams.js";

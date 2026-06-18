@@ -230,6 +230,19 @@ export class GroupStore {
     return { group: updated, renamed: true };
   }
 
+  async setGroupAvatar({ ownerAccountId, groupId, avatarFileHash } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const id = requireId(groupId, "groupId");
+    const existing = await this.groups.get(owner, id);
+    if (!existing) return { group: null, updated: false };
+    // Empty string clears the photo; a non-empty value is the content hash.
+    const hash = typeof avatarFileHash === "string" ? avatarFileHash.trim() : "";
+    const now = asInt(this.clock(), Date.now());
+    const updated = this.groups.coerce({ ...existing.toJSON(), avatarFileHash: hash, updatedAtMs: now });
+    await this.groups.set(updated, owner, id);
+    return { group: updated, updated: true };
+  }
+
   async setMemberRole({ ownerAccountId, groupId, accountId, role } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const gid = requireId(groupId, "groupId");

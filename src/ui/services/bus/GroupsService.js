@@ -12,6 +12,7 @@ export class GroupsService extends BaseBusService {
     this._register("groups", "getMembers", (payload) => this.getMembers(payload));
     this._register("groups", "leave", (payload) => this.leaveGroup(payload));
     this._register("groups", "rename", (payload) => this.rename(payload));
+    this._register("groups", "setAvatar", (payload) => this.setAvatar(payload));
     this._register("groups", "kick", (payload) => this.kick(payload));
     this._register("groups", "setRole", (payload) => this.setRole(payload));
     this._listen("runtime.event.group.updated", (record) => this._handleGroupUpdated(record));
@@ -62,6 +63,18 @@ export class GroupsService extends BaseBusService {
     const client = this._getClient();
     if (!client) throw new Error("GroupsService: not connected");
     const result = await client.call("group.rename", { groupId, title });
+    const group = result && result.group ? result.group : null;
+    if (group) {
+      this._groupStore.upsertGroup(group);
+      this.bus.emit("groups.updated", { groupId });
+    }
+    return result;
+  }
+
+  async setAvatar({ groupId, avatarDataB64 } = {}) {
+    const client = this._getClient();
+    if (!client) throw new Error("GroupsService: not connected");
+    const result = await client.call("group.setAvatar", { groupId, avatarDataB64 });
     const group = result && result.group ? result.group : null;
     if (group) {
       this._groupStore.upsertGroup(group);

@@ -107,7 +107,14 @@ export class ThreadListItemView extends BusComponent {
     const unread = unreadCount > 0;
     const isLocked = String(thread.accessState || "open").trim().toLowerCase() === "locked";
     const isArchived = String(thread.visibilityState || "visible").trim().toLowerCase() === "hidden";
-    const avatarHash = stores.contacts.getAvatarHash(thread.peerAccountId);
+    // Group rows draw the group's photo; DM rows draw the peer contact's.
+    let avatarHash;
+    if (isGroup) {
+      const group = stores.groups ? stores.groups.getGroup(thread.groupId) : null;
+      avatarHash = group && typeof group.avatarFileHash === "string" ? group.avatarFileHash : "";
+    } else {
+      avatarHash = stores.contacts.getAvatarHash(thread.peerAccountId);
+    }
 
     const avatarSlot = h("div", { className: "w-12 h-12" });
     if (this.#avatarView) {

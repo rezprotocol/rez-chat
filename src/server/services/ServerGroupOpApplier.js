@@ -129,6 +129,13 @@ export class ServerGroupOpApplier {
       await this.#applyIncomingRename(op);
       return true;
     }
+    if (op.op === "setAvatar") {
+      // Authorization mirrors rename: accepted from any active member, applied
+      // last-writer-wins. The send side (ServerGroupsService.setAvatarGroup)
+      // enforces admin-only.
+      await this.#applyIncomingSetAvatar(op);
+      return true;
+    }
     if (op.op === "kick") {
       if (!isAdmin) {
         this.#logger.warn("[ServerGroupsService] ignoring kick from non-admin " + sender);
@@ -231,11 +238,59 @@ export class ServerGroupOpApplier {
     }
   }
 
+  async #applyIncomingSetAvatar(op) {
+    // REZ-9: clamp the attacker-controlled actedAtMs before using it for LWW,
+    // identical to #applyIncomingRename.
+    const actedAtMs = Math.min(Number(op.actedAtMs) || 0, this.#clock() + MAX_CLOCK_SKEW_MS);
+    const existingGroup = await this.#groupStore.getGroup({
+      ownerAccountId: this.#ownerAccountId,
+      groupId: op.groupId,
+    }).catch(() => null);
+    if (existingGroup
+        && Number.isFinite(Number(existingGroup.updatedAtMs))
+        && Number(existingGroup.updatedAtMs) >= actedAtMs) {
+      return;
+    }
+    const avatarFileHash = typeof op.avatarFileHash === "string" ? op.avatarFileHash : "";
+    if (avatarFileHash.length > 0) {
+      // TRUST-2: storeFile re-verifies the bytes hash to avatarFileHash and
+      // rejects on mismatch. A tampered op is DROPPED (logged, not applied, not
+      // re-thrown) so it can't poison the file store nor wedge the inbox drain
+      // with a perpetually-retried poison deposit.
+      const ft = this.#getFileTransferService();
+      if (!ft) {
+        this.#logger.warn("[ServerGroupsService] setAvatar received but file transfer service unavailable");
+        return;
+      }
+      const dataB64 = typeof op.avatarDataB64 === "string" ? op.avatarDataB64 : "";
+      try {
+        await ft.storeFile(avatarFileHash, dataB64);
+      } catch (err) {
+        this.#logger.warn("[ServerGroupsService] setAvatar dropped — avatar bytes failed to store",
+          err && err.message ? err.message : err);
+        return;
+      }
+    }
+    const { group } = await this.#groupStore.setGroupAvatar({
+      ownerAccountId: this.#ownerAccountId,
+      groupId: op.groupId,
+      avatarFileHash,
+    });
+    if (group) {
+      this.#emit("group.updated", new GroupUpdatedEvent({ group }));
+    }
+  }
+
+  #getFileTransferService() {
+    const ft = this.#bus.services ? this.#bus.services.fileTransfer : null;
+    return ft && typeof ft.storeFile === "function" ? ft : null;
+  }
+
   /**
    * Catch-up advertisement of current group state to a peer requesting a
    * sync. Sends an explicit `group.state` op (NOT a rename). The receiver
-   * fills its title only if currently empty — never overwrites. This is
-   * distinct from rename, which is a user-initiated LWW mutation.
+   * fills its title (and avatar) only if currently empty — never overwrites.
+   * This is distinct from rename, which is a user-initiated LWW mutation.
    */
   async #advertiseGroupStateToPeer({ groupId, peerAccountId } = {}) {
     if (!groupId || !peerAccountId || peerAccountId === this.#ownerAccountId) return;
@@ -249,6 +304,19 @@ export class ServerGroupOpApplier {
     const actedAtMs = Number.isFinite(Number(group.updatedAtMs))
       ? Number(group.updatedAtMs)
       : Number(group.createdAtMs) || this.#clock();
+    // Piggyback the current avatar (hash + bytes) so a late joiner gets the
+    // photo through the same catch-up the title rides. Best-effort: if the
+    // bytes are missing locally, advertise title only.
+    const avatarFields = {};
+    const avatarFileHash = typeof group.avatarFileHash === "string" ? group.avatarFileHash.trim() : "";
+    if (avatarFileHash.length > 0) {
+      const ft = this.#getFileTransferService();
+      const dataB64 = ft ? await ft.retrieveFileB64(avatarFileHash).catch(() => null) : null;
+      if (dataB64 && dataB64.length > 0) {
+        avatarFields.avatarFileHash = avatarFileHash;
+        avatarFields.avatarDataB64 = dataB64;
+      }
+    }
     await this.#broadcaster.fanOut({
       targets: [peerAccountId],
       payload: new GroupOpPayloadV1({
@@ -257,6 +325,7 @@ export class ServerGroupOpApplier {
         title,
         actedAtMs,
         groupOpId: nowOpId(),
+        ...avatarFields,
       }),
     });
   }
@@ -267,27 +336,68 @@ export class ServerGroupOpApplier {
       groupId: op.groupId,
     }).catch(() => null);
     if (!existingGroup) return;
+
+    // Title and avatar are filled independently — each only when the local
+    // value is empty (fill-if-empty; never overwrites a live value).
+    let changed = false;
+
     const hasTitle = typeof existingGroup.title === "string"
       && existingGroup.title.trim().length > 0;
-    if (hasTitle) return;
     const newTitle = typeof op.title === "string" ? op.title.trim() : "";
-    if (!newTitle) return;
-    const { group } = await this.#groupStore.renameGroup({
-      ownerAccountId: this.#ownerAccountId,
-      groupId: op.groupId,
-      title: newTitle,
-    });
-    if (group) {
-      const threadId = this.#bus.services.threads.groupThreadId(op.groupId);
-      await this.#threadStore.ensureThread({
-        threadId,
+    if (!hasTitle && newTitle) {
+      const { group } = await this.#groupStore.renameGroup({
+        ownerAccountId: this.#ownerAccountId,
         groupId: op.groupId,
-        threadType: "group",
         title: newTitle,
-      }).catch((err) => {
-        this.#logger.warn("[ServerGroupsService] thread title sync failed (group.state)", err);
       });
-      this.#emit("group.updated", new GroupUpdatedEvent({ group }));
+      if (group) {
+        const threadId = this.#bus.services.threads.groupThreadId(op.groupId);
+        await this.#threadStore.ensureThread({
+          threadId,
+          groupId: op.groupId,
+          threadType: "group",
+          title: newTitle,
+        }).catch((err) => {
+          this.#logger.warn("[ServerGroupsService] thread title sync failed (group.state)", err);
+        });
+        changed = true;
+      }
+    }
+
+    const hasAvatar = typeof existingGroup.avatarFileHash === "string"
+      && existingGroup.avatarFileHash.trim().length > 0;
+    const newAvatarHash = typeof op.avatarFileHash === "string" ? op.avatarFileHash.trim() : "";
+    const newAvatarB64 = typeof op.avatarDataB64 === "string" ? op.avatarDataB64 : "";
+    if (!hasAvatar && newAvatarHash && newAvatarB64) {
+      const ft = this.#getFileTransferService();
+      if (ft) {
+        // TRUST-2: storeFile rejects on hash mismatch; drop (don't fill) on
+        // failure rather than re-throwing into the catch-up path.
+        let stored = false;
+        try {
+          await ft.storeFile(newAvatarHash, newAvatarB64);
+          stored = true;
+        } catch (err) {
+          this.#logger.warn("[ServerGroupsService] group.state avatar dropped — bytes failed to store",
+            err && err.message ? err.message : err);
+        }
+        if (stored) {
+          const { group } = await this.#groupStore.setGroupAvatar({
+            ownerAccountId: this.#ownerAccountId,
+            groupId: op.groupId,
+            avatarFileHash: newAvatarHash,
+          });
+          if (group) changed = true;
+        }
+      }
+    }
+
+    if (changed) {
+      const group = await this.#groupStore.getGroup({
+        ownerAccountId: this.#ownerAccountId,
+        groupId: op.groupId,
+      }).catch(() => null);
+      if (group) this.#emit("group.updated", new GroupUpdatedEvent({ group }));
     }
   }
 
