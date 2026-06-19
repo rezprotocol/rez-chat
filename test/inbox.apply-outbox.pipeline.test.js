@@ -92,3 +92,40 @@ test("normal success applies and clears the outbox", async () => {
   assert.deepEqual(applied, ["e9"]);
   assert.equal((await outbox.listPending(MBOX)).length, 0, "applied → outbox empty");
 });
+
+// Audit P2 (staged-OR-applied): if STAGING fails but the apply SUCCEEDS, the
+// message is durable (it's in the message store) and ack-safe — it must NOT be
+// reported non-durable (which would stick the cursor, then doom a re-decrypt and
+// wrongly surface a delivered message as poison).
+test("stage-FAILURE + apply-success is durable (applied home), not poison", async () => {
+  const kv = makeKv();
+  // An outbox whose stage always throws (e.g. the durable KV is wedged), but
+  // markApplied/recordApplyFailure/listPending behave normally.
+  const realOutbox = new InboundApplyOutbox({ kvStore: kv });
+  const outbox = {
+    async stage() { throw new Error("stage boom"); },
+    markApplied: (...a) => realOutbox.markApplied(...a),
+    recordApplyFailure: (...a) => realOutbox.recordApplyFailure(...a),
+    listPending: (...a) => realOutbox.listPending(...a),
+  };
+  const processedLog = new ProcessedDepositLog({ kvStore: kv });
+  const applied = [];
+  const events = {
+    async applyUserMessage(msg) { applied.push(msg.eventId); },
+    async processDeposit() {},
+  };
+  const peerLinkProtocol = {
+    async processDeposit(f) {
+      return { consumed: true, decryptOk: true, userMessage: userMessage(f.body.seq) };
+    },
+  };
+  const pipeline = new InboundDepositPipeline({ peerLinkProtocol, events, processedLog, outbox, logger: SILENT });
+
+  const res = await pipeline.submit(frame(5));
+  assert.equal(res.durable, true, "applied to the message store ⇒ durable even though staging failed");
+  assert.equal(res.applied, true, "the message WAS applied");
+  assert.deepEqual(applied, ["e5"]);
+  assert.deepEqual(await realOutbox.listPending(MBOX), [], "nothing left staged");
+  // Marked processed ⇒ a redelivery dedups instead of doom-re-decrypting.
+  assert.equal(await processedLog.has(MBOX, "seq:5"), true, "deduped on redelivery");
+});

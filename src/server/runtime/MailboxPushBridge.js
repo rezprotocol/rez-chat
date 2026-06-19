@@ -54,7 +54,13 @@ export class MailboxPushBridge {
       }
       Promise.resolve(run)
         .then((result) => {
-          const ok = Boolean(result && (result.consumed || result.alreadyProcessed));
+          // Ack-safe ONLY when the deposit is DURABLE (audit P1.1): a decrypted
+          // user message must be durably staged-or-applied before the legacy
+          // ack-DELETE removes its buffer copy. A bare decrypt that then fails to
+          // stage AND apply is NOT acked — the catch-up drain retries it. `durable`
+          // falls back to `consumed` for non-durable pipelines/mocks that predate it.
+          const durable = result && result.durable != null ? result.durable : (result && result.consumed);
+          const ok = Boolean(durable || (result && result.alreadyProcessed));
           const ids = MailboxPushBridge.#frameIds(frame);
           if (process.env.REZ_PEERLINK_TRACE === "1") {
             logger.log(

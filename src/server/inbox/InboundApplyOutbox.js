@@ -1,5 +1,4 @@
-const ENTRY_PREFIX = "chat-server:inbox:apply-outbox:v1:";
-const INDEX_PREFIX = "chat-server:inbox:apply-outbox-index:v1:";
+const MAILBOX_PREFIX = "chat-server:inbox:apply-outbox:v1:";
 
 /**
  * Durable post-decrypt staging (apply-outbox) for the inbound deposit pipeline.
@@ -17,8 +16,19 @@ const INDEX_PREFIX = "chat-server:inbox:apply-outbox-index:v1:";
  * applied, and a poison entry (repeated apply failures) is surfaced as a System
  * notice and dropped so it can't retry forever.
  *
- * A per-mailbox index of pending dedupIds lets `listPending` enumerate without
- * requiring a `keys()`/scan on the KV. Backed by `getKeyValueStore(null)`.
+ * Audit P1.2 (crash-consistency): each mailbox's staged entries live in ONE KV
+ * value (a `{ [dedupId]: entry }` map under a single per-mailbox key), so every
+ * mutation — stage / markApplied / recordApplyFailure — is a SINGLE atomic
+ * `set`. The earlier design wrote the entry and a separate pending-index in two
+ * ops; a tear between them stranded the entry invisibly to `listPending` (the
+ * reproduced `{entryExists:true, pending:0}`). With one record there is no
+ * second write to tear against: an entry is enumerable the instant it is
+ * durable, and never otherwise.
+ *
+ * Single-writer per mailbox: the chat-server owns a mailbox's drain, and every
+ * outbox mutation runs serialized on the InboundDepositPipeline's submit queue,
+ * so the read-modify-write of the per-mailbox map never interleaves. Backed by
+ * `getKeyValueStore(null)`.
  */
 export class InboundApplyOutbox {
   #kvStore;
@@ -30,12 +40,8 @@ export class InboundApplyOutbox {
     this.#kvStore = kvStore;
   }
 
-  #entryKey(mailboxId, dedupId) {
-    return ENTRY_PREFIX + mailboxId + ":" + dedupId;
-  }
-
-  #indexKey(mailboxId) {
-    return INDEX_PREFIX + mailboxId;
+  #mailboxKey(mailboxId) {
+    return MAILBOX_PREFIX + mailboxId;
   }
 
   #ids(mailboxId, dedupId) {
@@ -43,6 +49,23 @@ export class InboundApplyOutbox {
     const dedup = typeof dedupId === "string" ? dedupId.trim() : "";
     if (!mbox || !dedup) return null;
     return { mailboxId: mbox, dedupId: dedup };
+  }
+
+  // The per-mailbox map of staged entries, normalized to a plain object.
+  async #loadMap(mailboxId) {
+    const stored = await this.#kvStore.get(this.#mailboxKey(mailboxId));
+    return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+  }
+
+  // Persist the per-mailbox map (one atomic write), pruning to empty → delete so
+  // a fully-drained mailbox leaves no key behind.
+  async #saveMap(mailboxId, map) {
+    const key = this.#mailboxKey(mailboxId);
+    if (!map || Object.keys(map).length === 0) {
+      await this.#kvStore.delete(key);
+      return;
+    }
+    await this.#kvStore.set(key, map);
   }
 
   /**
@@ -53,26 +76,26 @@ export class InboundApplyOutbox {
   async stage(mailboxId, dedupId, userMessage, { nowMs = Date.now() } = {}) {
     const ids = this.#ids(mailboxId, dedupId);
     if (!ids) return false;
-    const key = this.#entryKey(ids.mailboxId, ids.dedupId);
-    const existing = await this.#kvStore.get(key);
-    if (existing != null) return false;
-    await this.#kvStore.set(key, {
+    const map = await this.#loadMap(ids.mailboxId);
+    if (map[ids.dedupId] != null) return false;
+    map[ids.dedupId] = {
       mailboxId: ids.mailboxId,
       dedupId: ids.dedupId,
       userMessage,
       attempts: 0,
       firstStagedAtMs: Number.isFinite(nowMs) ? Number(nowMs) : Date.now(),
       lastAttemptAtMs: null,
-    });
-    await this.#addToIndex(ids.mailboxId, ids.dedupId);
+    };
+    await this.#saveMap(ids.mailboxId, map);
     return true;
   }
 
   async get(mailboxId, dedupId) {
     const ids = this.#ids(mailboxId, dedupId);
     if (!ids) return null;
-    const stored = await this.#kvStore.get(this.#entryKey(ids.mailboxId, ids.dedupId));
-    return stored == null ? null : stored;
+    const map = await this.#loadMap(ids.mailboxId);
+    const entry = map[ids.dedupId];
+    return entry == null ? null : entry;
   }
 
   async has(mailboxId, dedupId) {
@@ -85,8 +108,10 @@ export class InboundApplyOutbox {
   async markApplied(mailboxId, dedupId) {
     const ids = this.#ids(mailboxId, dedupId);
     if (!ids) return;
-    await this.#kvStore.delete(this.#entryKey(ids.mailboxId, ids.dedupId));
-    await this.#removeFromIndex(ids.mailboxId, ids.dedupId);
+    const map = await this.#loadMap(ids.mailboxId);
+    if (map[ids.dedupId] == null) return;
+    delete map[ids.dedupId];
+    await this.#saveMap(ids.mailboxId, map);
   }
 
   /**
@@ -96,15 +121,16 @@ export class InboundApplyOutbox {
   async recordApplyFailure(mailboxId, dedupId, { nowMs = Date.now() } = {}) {
     const ids = this.#ids(mailboxId, dedupId);
     if (!ids) return { attempts: 0, firstStagedAtMs: null };
-    const key = this.#entryKey(ids.mailboxId, ids.dedupId);
-    const entry = await this.#kvStore.get(key);
+    const map = await this.#loadMap(ids.mailboxId);
+    const entry = map[ids.dedupId];
     if (entry == null) return { attempts: 0, firstStagedAtMs: null };
     const attempts = (Number.isFinite(entry.attempts) ? Number(entry.attempts) : 0) + 1;
-    await this.#kvStore.set(key, {
+    map[ids.dedupId] = {
       ...entry,
       attempts,
       lastAttemptAtMs: Number.isFinite(nowMs) ? Number(nowMs) : Date.now(),
-    });
+    };
+    await this.#saveMap(ids.mailboxId, map);
     return { attempts, firstStagedAtMs: entry.firstStagedAtMs };
   }
 
@@ -114,33 +140,7 @@ export class InboundApplyOutbox {
   async listPending(mailboxId) {
     const mbox = typeof mailboxId === "string" ? mailboxId.trim() : "";
     if (!mbox) return [];
-    const index = await this.#kvStore.get(this.#indexKey(mbox));
-    const ids = Array.isArray(index) ? index : [];
-    const out = [];
-    for (const dedupId of ids) {
-      const entry = await this.#kvStore.get(this.#entryKey(mbox, dedupId));
-      if (entry != null) out.push(entry);
-    }
-    return out;
-  }
-
-  async #addToIndex(mailboxId, dedupId) {
-    const key = this.#indexKey(mailboxId);
-    const index = await this.#kvStore.get(key);
-    const ids = Array.isArray(index) ? index.slice() : [];
-    if (!ids.includes(dedupId)) {
-      ids.push(dedupId);
-      await this.#kvStore.set(key, ids);
-    }
-  }
-
-  async #removeFromIndex(mailboxId, dedupId) {
-    const key = this.#indexKey(mailboxId);
-    const index = await this.#kvStore.get(key);
-    if (!Array.isArray(index)) return;
-    const ids = index.filter((id) => id !== dedupId);
-    if (ids.length !== index.length) {
-      await this.#kvStore.set(key, ids);
-    }
+    const map = await this.#loadMap(mbox);
+    return Object.values(map).filter((entry) => entry != null);
   }
 }

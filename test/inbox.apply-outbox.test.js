@@ -70,3 +70,44 @@ test("pending index is per-mailbox isolated", async () => {
   assert.deepEqual((await ob.listPending("inbox:a")).map((e) => e.userMessage.n), [1]);
   assert.deepEqual((await ob.listPending("inbox:b")).map((e) => e.userMessage.n), [2]);
 });
+
+// Audit P1.2: a staged entry is enumerable the instant it is durable and never
+// otherwise — there is no separate index write to tear against. A failed write
+// stages NOTHING (atomic), instead of the old torn `{entryExists:true,pending:0}`.
+test("staging is atomic — a failed write strands no invisible entry", async () => {
+  const m = new Map();
+  let failNextSet = false;
+  const kv = {
+    async get(k) { return m.has(k) ? JSON.parse(JSON.stringify(m.get(k))) : undefined; },
+    async set(k, v) {
+      if (failNextSet) { failNextSet = false; throw new Error("kv set boom"); }
+      m.set(k, JSON.parse(JSON.stringify(v)));
+    },
+    async delete(k) { return m.delete(k); },
+  };
+  const ob = new InboundApplyOutbox({ kvStore: kv });
+
+  failNextSet = true;
+  await assert.rejects(() => ob.stage(MBOX, "seq:5", { a: 1 }), /kv set boom/);
+  // The write failed → the entry must NOT exist AND must NOT be enumerable.
+  assert.equal(await ob.has(MBOX, "seq:5"), false, "no half-written entry");
+  assert.deepEqual(await ob.listPending(MBOX), [], "nothing stranded invisibly");
+
+  // A retry (write now succeeds) stages cleanly and is immediately enumerable.
+  assert.equal(await ob.stage(MBOX, "seq:5", { a: 1 }), true);
+  assert.equal(await ob.has(MBOX, "seq:5"), true);
+  assert.deepEqual((await ob.listPending(MBOX)).map((e) => e.dedupId), ["seq:5"]);
+});
+
+test("a fully-drained mailbox leaves no key behind", async () => {
+  const m = new Map();
+  const kv = {
+    async get(k) { return m.has(k) ? JSON.parse(JSON.stringify(m.get(k))) : undefined; },
+    async set(k, v) { m.set(k, JSON.parse(JSON.stringify(v))); },
+    async delete(k) { return m.delete(k); },
+  };
+  const ob = new InboundApplyOutbox({ kvStore: kv });
+  await ob.stage(MBOX, "seq:1", { n: 1 });
+  await ob.markApplied(MBOX, "seq:1");
+  assert.equal(m.size, 0, "the per-mailbox record is removed once empty");
+});

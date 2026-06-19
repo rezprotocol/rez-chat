@@ -253,9 +253,9 @@ export class InboundDepositPipeline {
 
     // Audit P1.1 — durable post-decrypt staging. The double ratchet has now
     // advanced past this ciphertext, so it can never be re-decrypted. STAGE the
-    // decrypted payload durably BEFORE marking processed / reporting it
-    // ack-safe, so an application failure can be retried from the outbox instead
-    // of losing the message when the cursor prunes the ciphertext.
+    // decrypted payload durably BEFORE reporting it ack-safe, so an application
+    // failure can be retried from the outbox instead of losing the message when
+    // the cursor prunes the ciphertext.
     let staged = true;
     if (hasUserMessage && this.#outbox) {
       staged = false;
@@ -268,35 +268,17 @@ export class InboundDepositPipeline {
       }
     }
 
-    // Mark processed only after a real decrypt AND a successful durable stage (for
-    // a user message): a redelivery must dedup ONLY once the plaintext is durably
-    // recoverable, never while a stage failure means it isn't.
-    const shouldMark = decryptOk && (!hasUserMessage || staged);
-    if (this.#processedLog && dedupId && shouldMark) {
-      try {
-        await this.#processedLog.mark(mailboxId, dedupId);
-      } catch (err) {
-        this.#logger.error("[InboundDepositPipeline] processed-log mark failed: "
-          + (err && err.message ? err.message : err));
-      }
-    }
-
+    // Apply the decrypted user message to the message store (the durable home).
     let applied = true;
+    let userApplied = false;
     if (hasUserMessage) {
       try {
         await this.#events.applyUserMessage(status.userMessage);
-        // Applied → the message store is the durable home; drop the outbox copy.
-        if (this.#outbox && staged) {
-          await this.#markOutboxApplied(mailboxId, dedupId);
-        }
+        userApplied = true;
       } catch (err) {
         applied = false;
         this.#logger.error("[InboundDepositPipeline] user-message apply failed: "
           + (err && err.message ? err.message : err));
-        // Leave it staged (already counted) for the retryApplyOutbox pass.
-        if (this.#outbox && staged) {
-          await this.#recordOutboxFailure(mailboxId, dedupId);
-        }
       }
     }
     try {
@@ -306,11 +288,40 @@ export class InboundDepositPipeline {
       this.#logger.error("[InboundDepositPipeline] plaintext deposit apply failed: "
         + (err && err.message ? err.message : err));
     }
-    // `durable` is the ack signal: a user message is ack-safe only once durably
-    // STAGED (apply may still be retried from the outbox); a non-message deposit
-    // (handshake/ack) inherits the consume signal as before. The cursor/buffer
-    // ack layers gate on `durable`, NEVER on a bare decrypt.
-    const durable = hasUserMessage ? staged : consumed;
+
+    // Audit P2 — STAGED-OR-APPLIED. A user message is durably recoverable iff it
+    // is staged in the outbox OR it was applied to the message store; EITHER is
+    // sufficient to advance the cursor. (The old `durable = staged` dropped the
+    // applied-but-not-staged case: a stage failure with a successful apply left a
+    // delivered message unackable — the cursor stuck, then a doomed re-decrypt
+    // wrongly surfaced it as poison.) A non-message deposit (handshake/ack)
+    // inherits the consume signal. Ack layers gate on `durable`, never a bare decrypt.
+    const durableUserMessage = staged || userApplied;
+    if (hasUserMessage && this.#outbox && staged) {
+      // Reconcile the staged copy with the apply outcome: drop it once applied,
+      // else count the failure so the retry pass can poison-bound it.
+      if (userApplied) {
+        await this.#markOutboxApplied(mailboxId, dedupId);
+      } else {
+        await this.#recordOutboxFailure(mailboxId, dedupId);
+      }
+    }
+
+    // Mark processed (dedup the one non-idempotent step, re-decrypt) only once the
+    // deposit is durably recoverable — never while a stage+apply double-failure
+    // means it is not. Marked AFTER apply so the dedup reflects the real outcome
+    // (the submit queue serializes, so there is no in-flight redelivery to race).
+    const shouldMark = decryptOk && (!hasUserMessage || durableUserMessage);
+    if (this.#processedLog && dedupId && shouldMark) {
+      try {
+        await this.#processedLog.mark(mailboxId, dedupId);
+      } catch (err) {
+        this.#logger.error("[InboundDepositPipeline] processed-log mark failed: "
+          + (err && err.message ? err.message : err));
+      }
+    }
+
+    const durable = hasUserMessage ? durableUserMessage : consumed;
     return { consumed, decryptOk, alreadyProcessed: false, applied, durable };
   }
 

@@ -155,6 +155,15 @@ export class InboxCatchupService extends BaseServerService {
       throw new Error("InboxCatchupService: inboxClaimant.inboxId is not set");
     }
 
+    // Audit P1.1 (both modes) — before draining new deposits, retry any
+    // decrypted-but-unapplied payloads staged in the apply-outbox. This runs
+    // for the legacy/fs path too: a message acked as `durable` (staged) but not
+    // yet applied has the outbox as its ONLY recovery path (the buffer copy may
+    // be gone / un-re-decryptable), and poison entries surface as System notices
+    // rather than vanishing. Previously this ran only in the durable branch, so
+    // a legacy-path staged-but-unapplied entry was stranded forever.
+    await this.#retryApplyOutbox(mailboxId);
+
     // D2 dual-mode gate: a durable-capable node (S2) uses the server-held cursor
     // model (inline { seq, ciphertextB64 } + mailbox.cursorAck); a legacy/fs node
     // keeps the list/fetch/ack delete model untouched. This single check is what
@@ -207,7 +216,13 @@ export class InboxCatchupService extends BaseServerService {
         } catch (err) {
           this.logger.error("[InboxCatchupService] pipeline submit threw for " + eventId + ": " + (err && err.message ? err.message : err));
         }
-        const ok = Boolean(result && (result.consumed || result.alreadyProcessed));
+        // Ack-safe ONLY when the deposit is DURABLE (audit P1.1): a decrypted user
+        // message must be durably staged-or-applied before we ack-DELETE the relay
+        // buffer copy (its only ciphertext) — a bare decrypt that then fails to
+        // stage AND apply must leave the deposit buffered, not delete it. `durable`
+        // falls back to `consumed` for non-durable pipelines/mocks that predate it.
+        const durable = result && result.durable != null ? result.durable : (result && result.consumed);
+        const ok = Boolean(durable || (result && result.alreadyProcessed));
         if (process.env.REZ_INBOX_CATCHUP_DEBUG === "1" || process.env.REZ_PEERLINK_TRACE === "1") {
           this.logger.log(
             "[InboxCatchupService] item evt=" + eventId + " ctLen=" + ciphertextB64.length
@@ -243,11 +258,8 @@ export class InboxCatchupService extends BaseServerService {
     if (typeof sdk.mailbox.list !== "function" || typeof sdk.mailbox.cursorAck !== "function") {
       throw new Error("InboxCatchupService (durable) requires sdk.mailbox.list/cursorAck");
     }
-    // Audit P1.1: before draining new seqs, retry any decrypted-but-unapplied
-    // payloads staged in the apply-outbox. Their cursor may already have advanced
-    // (the ciphertext is gone), so the outbox is the only recovery path; poison
-    // entries surface as visible System notices rather than vanishing.
-    await this.#retryApplyOutbox(mailboxId);
+    // (The apply-outbox retry runs once per drain in #drainOnce, before this
+    // mode branch — so both the durable and legacy paths get it.)
     while (true) {
       const page = await sdk.mailbox.list({ mailboxId, cursor: null, limit: this.#pageLimit });
       const items = page && Array.isArray(page.items) ? page.items : [];

@@ -232,6 +232,65 @@ test("InboxCatchupService acks a dedup hit (already consumed via live push) with
   assert.equal(items[INBOX].length, 0, "buffer drained");
 });
 
+test("legacy drain leaves a non-durable deposit BUFFERED, not ack-deleted (audit P1.1 durable ack gate)", async () => {
+  const INBOX = "inbox:nondurable";
+  const ackSpy = [];
+  const items = { [INBOX]: [{ eventId: "evt_x", objectId: "o", createdAt: 1 }] };
+  const sdk = makeSdkWithMailbox({
+    items,
+    fetchByEventId: { [INBOX + "|evt_x"]: { ciphertextB64: "WA==" } },
+    ackSpy,
+  });
+  const bus = new ChatServerBus();
+  bus.runtime.sdk = sdk;
+
+  // The decrypt succeeded (consumed) but the message is NOT durable — staging
+  // AND applying both failed. ack-DELETING here would destroy the only ciphertext
+  // of a message we never persisted. The legacy path must gate on `durable`.
+  const pipeline = {
+    submit() {
+      return Promise.resolve({ consumed: true, decryptOk: true, alreadyProcessed: false, applied: false, durable: false });
+    },
+  };
+  const service = new InboxCatchupService({
+    bus,
+    inboxClaimant: { inboxId: INBOX },
+    inboundPipeline: pipeline,
+    processedLog: new ProcessedDepositLog({ kvStore: new MemKv() }),
+  });
+  await service.start();
+
+  assert.deepEqual(ackSpy, [], "a consumed-but-not-durable deposit is NOT ack-deleted");
+  assert.deepEqual(items[INBOX].map((i) => i.eventId), ["evt_x"], "left buffered for a later retry");
+});
+
+test("legacy drain runs the apply-outbox retry pass too (audit P1.1 — both modes, not only durable)", async () => {
+  const INBOX = "inbox:retryob";
+  const items = { [INBOX]: [] }; // empty buffer — the drain still must run the outbox retry
+  const sdk = makeSdkWithMailbox({ items, fetchByEventId: {} });
+  const bus = new ChatServerBus();
+  bus.runtime.sdk = sdk;
+
+  const retryCalls = [];
+  const pipeline = {
+    submit() { return Promise.resolve({ consumed: true, decryptOk: true, durable: true }); },
+    retryApplyOutbox(mailboxId, opts) {
+      retryCalls.push({ mailboxId, opts });
+      return Promise.resolve({ applied: [], quarantined: [] });
+    },
+  };
+  const service = new InboxCatchupService({
+    bus,
+    inboxClaimant: { inboxId: INBOX },
+    inboundPipeline: pipeline,
+    processedLog: new ProcessedDepositLog({ kvStore: new MemKv() }),
+  });
+  await service.start();
+
+  assert.ok(retryCalls.length >= 1, "the legacy drain runs the staged-but-unapplied retry pass");
+  assert.equal(retryCalls[0].mailboxId, INBOX);
+});
+
 test("InboxCatchupService pages across nextCursor responses and acks every item", async () => {
   const INBOX = "inbox:paged";
   const items = [];
