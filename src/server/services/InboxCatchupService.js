@@ -243,6 +243,11 @@ export class InboxCatchupService extends BaseServerService {
     if (typeof sdk.mailbox.list !== "function" || typeof sdk.mailbox.cursorAck !== "function") {
       throw new Error("InboxCatchupService (durable) requires sdk.mailbox.list/cursorAck");
     }
+    // Audit P1.1: before draining new seqs, retry any decrypted-but-unapplied
+    // payloads staged in the apply-outbox. Their cursor may already have advanced
+    // (the ciphertext is gone), so the outbox is the only recovery path; poison
+    // entries surface as visible System notices rather than vanishing.
+    await this.#retryApplyOutbox(mailboxId);
     while (true) {
       const page = await sdk.mailbox.list({ mailboxId, cursor: null, limit: this.#pageLimit });
       const items = page && Array.isArray(page.items) ? page.items : [];
@@ -278,7 +283,12 @@ export class InboxCatchupService extends BaseServerService {
         } catch (err) {
           this.logger.error("[InboxCatchupService] durable pipeline submit threw for seq=" + seq + ": " + (err && err.message ? err.message : err));
         }
-        const ok = Boolean(result && (result.consumed || result.alreadyProcessed));
+        // Ack-safe ONLY when the deposit is DURABLE (audit P1.1): a user message
+        // must be durably staged in the apply-outbox (not merely decrypted) before
+        // the cursor advances and the home prunes its only ciphertext. `durable`
+        // falls back to `consumed` for non-durable pipelines/mocks that predate it.
+        const durable = result && result.durable != null ? result.durable : (result && result.consumed);
+        const ok = Boolean(durable || (result && result.alreadyProcessed));
         if (ok) {
           throughSeq = seq;
           consumedSeqs.push(seq);
@@ -401,6 +411,37 @@ export class InboxCatchupService extends BaseServerService {
   // the deposit identity (durable seq or legacy eventId), and how hard we tried; the
   // thread/sender/content are unknowable (the ciphertext never decrypted). The UI
   // renders it as a "couldn't be delivered" failed-message notice (System thread).
+  // Drive the pipeline's apply-outbox retry, then surface any poison entries it
+  // gave up on as quarantine notices (System thread). Bounds come from the same
+  // poison knobs as decrypt quarantine, so the two paths behave consistently.
+  async #retryApplyOutbox(mailboxId) {
+    if (!this.#pipeline || typeof this.#pipeline.retryApplyOutbox !== "function") return;
+    let result = null;
+    try {
+      result = await this.#pipeline.retryApplyOutbox(mailboxId, {
+        maxAttempts: this.#maxDecryptAttempts,
+        maxAgeMs: this.#maxQuarantineAgeMs,
+        nowMs: this.#clock(),
+      });
+    } catch (err) {
+      this.logger.error("[InboxCatchupService] apply-outbox retry pass failed: " + (err && err.message ? err.message : err));
+      return;
+    }
+    const quarantined = result && Array.isArray(result.quarantined) ? result.quarantined : [];
+    for (const q of quarantined) {
+      const dedupId = q && typeof q.dedupId === "string" ? q.dedupId : "";
+      let seq = null;
+      let eventId = "";
+      if (dedupId.indexOf("seq:") === 0) {
+        const n = Number(dedupId.slice(4));
+        if (Number.isInteger(n)) seq = n;
+      } else {
+        eventId = dedupId;
+      }
+      this.#emitQuarantined({ mailboxId, seq, eventId, attempts: q.attempts, ageMs: q.ageMs, reason: q.reason });
+    }
+  }
+
   #emitQuarantined({ mailboxId, seq = null, eventId = "", attempts = 0, ageMs = 0, reason = "attempts" }) {
     try {
       this._emit("mailbox.deposit.quarantined", new MailboxDepositQuarantinedEvent({

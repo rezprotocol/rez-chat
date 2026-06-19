@@ -43,6 +43,7 @@ export class InboundDepositPipeline {
   #peerLinkProtocol;
   #events;
   #processedLog;
+  #outbox;
   #logger;
   #tail;
   #pending;
@@ -50,7 +51,7 @@ export class InboundDepositPipeline {
   #maxPending;
   #maxRetainAttempts;
 
-  constructor({ peerLinkProtocol, events, processedLog = null, logger = console, maxPending = 256, maxRetainAttempts = 12 } = {}) {
+  constructor({ peerLinkProtocol, events, processedLog = null, outbox = null, logger = console, maxPending = 256, maxRetainAttempts = 12 } = {}) {
     if (!peerLinkProtocol || typeof peerLinkProtocol.processDeposit !== "function") {
       throw new Error("InboundDepositPipeline requires peerLinkProtocol.processDeposit");
     }
@@ -65,6 +66,12 @@ export class InboundDepositPipeline {
     this.#processedLog = processedLog && typeof processedLog.has === "function"
       && typeof processedLog.mark === "function"
       ? processedLog
+      : null;
+    // Optional durable post-decrypt apply-outbox (audit P1.1). When present, a
+    // decrypted user message is STAGED here before it can be acked, so an
+    // application failure never lets the cursor prune the only ciphertext.
+    this.#outbox = outbox && typeof outbox.stage === "function" && typeof outbox.markApplied === "function"
+      ? outbox
       : null;
     this.#logger = logger;
     this.#tail = Promise.resolve();
@@ -219,8 +226,11 @@ export class InboundDepositPipeline {
           + (err && err.message ? err.message : err));
       }
       // Already decrypted + consumed earlier (live push). The buffer copy is
-      // redundant — report consumed so the drain acks it; never re-decrypt.
-      if (already) return { consumed: true, decryptOk: false, alreadyProcessed: true, applied: false };
+      // redundant — never re-decrypt. durable:true because marking only happens
+      // AFTER a successful durable stage (below), so an already-processed deposit
+      // was provably staged (or applied). Any staged-but-unapplied payload is
+      // re-applied by the retryApplyOutbox pass, not here.
+      if (already) return { consumed: true, decryptOk: false, alreadyProcessed: true, applied: false, durable: true };
     }
 
     // processDeposit now returns an honest status: { consumed, decryptOk,
@@ -239,9 +249,30 @@ export class InboundDepositPipeline {
     }
     const consumed = Boolean(status && status.consumed);
     const decryptOk = Boolean(status && status.decryptOk);
-    // Mark processed only after a real (non-idempotent) decrypt, so a re-fetch
-    // never re-runs the advanced ratchet. A deposit left for retry stays unmarked.
-    if (this.#processedLog && dedupId && decryptOk) {
+    const hasUserMessage = Boolean(status && status.userMessage);
+
+    // Audit P1.1 — durable post-decrypt staging. The double ratchet has now
+    // advanced past this ciphertext, so it can never be re-decrypted. STAGE the
+    // decrypted payload durably BEFORE marking processed / reporting it
+    // ack-safe, so an application failure can be retried from the outbox instead
+    // of losing the message when the cursor prunes the ciphertext.
+    let staged = true;
+    if (hasUserMessage && this.#outbox) {
+      staged = false;
+      try {
+        await this.#outbox.stage(mailboxId, dedupId, status.userMessage);
+        staged = true;
+      } catch (err) {
+        this.#logger.error("[InboundDepositPipeline] apply-outbox stage failed: "
+          + (err && err.message ? err.message : err));
+      }
+    }
+
+    // Mark processed only after a real decrypt AND a successful durable stage (for
+    // a user message): a redelivery must dedup ONLY once the plaintext is durably
+    // recoverable, never while a stage failure means it isn't.
+    const shouldMark = decryptOk && (!hasUserMessage || staged);
+    if (this.#processedLog && dedupId && shouldMark) {
       try {
         await this.#processedLog.mark(mailboxId, dedupId);
       } catch (err) {
@@ -249,14 +280,23 @@ export class InboundDepositPipeline {
           + (err && err.message ? err.message : err));
       }
     }
+
     let applied = true;
-    if (status && status.userMessage) {
+    if (hasUserMessage) {
       try {
         await this.#events.applyUserMessage(status.userMessage);
+        // Applied → the message store is the durable home; drop the outbox copy.
+        if (this.#outbox && staged) {
+          await this.#markOutboxApplied(mailboxId, dedupId);
+        }
       } catch (err) {
         applied = false;
         this.#logger.error("[InboundDepositPipeline] user-message apply failed: "
           + (err && err.message ? err.message : err));
+        // Leave it staged (already counted) for the retryApplyOutbox pass.
+        if (this.#outbox && staged) {
+          await this.#recordOutboxFailure(mailboxId, dedupId);
+        }
       }
     }
     try {
@@ -266,11 +306,85 @@ export class InboundDepositPipeline {
       this.#logger.error("[InboundDepositPipeline] plaintext deposit apply failed: "
         + (err && err.message ? err.message : err));
     }
-    // Note (D2): `consumed` reflects what processDeposit decided; we keep it true
-    // even when an idempotent apply logged an error — re-decrypt is impossible and
-    // the applies are canonical-key idempotent, so a redelivery would not recover
-    // them anyway. Only a genuinely-unconsumed (undecryptable-yet) deposit is left
-    // buffered for retry.
-    return { consumed, decryptOk, alreadyProcessed: false, applied };
+    // `durable` is the ack signal: a user message is ack-safe only once durably
+    // STAGED (apply may still be retried from the outbox); a non-message deposit
+    // (handshake/ack) inherits the consume signal as before. The cursor/buffer
+    // ack layers gate on `durable`, NEVER on a bare decrypt.
+    const durable = hasUserMessage ? staged : consumed;
+    return { consumed, decryptOk, alreadyProcessed: false, applied, durable };
+  }
+
+  async #markOutboxApplied(mailboxId, dedupId) {
+    try {
+      await this.#outbox.markApplied(mailboxId, dedupId);
+    } catch (err) {
+      this.#logger.error("[InboundDepositPipeline] apply-outbox markApplied failed: "
+        + (err && err.message ? err.message : err));
+    }
+  }
+
+  async #recordOutboxFailure(mailboxId, dedupId, nowMs) {
+    try {
+      return await this.#outbox.recordApplyFailure(mailboxId, dedupId, { nowMs: Number.isFinite(nowMs) ? nowMs : Date.now() });
+    } catch (err) {
+      this.#logger.error("[InboundDepositPipeline] apply-outbox recordApplyFailure failed: "
+        + (err && err.message ? err.message : err));
+      return { attempts: 0, firstStagedAtMs: null };
+    }
+  }
+
+  /**
+   * Retry application of staged-but-unapplied outbox entries for a mailbox (the
+   * cursor may already have advanced past them — the plaintext lives in the
+   * outbox, never re-decrypted). Serialized on the same submit queue. Entries
+   * that exceed the poison bound are dropped and RETURNED so the caller can
+   * surface a visible System notice. Returns { applied: string[], quarantined:
+   * Array<{ dedupId, attempts, ageMs, reason }> }.
+   */
+  retryApplyOutbox(mailboxId, opts = {}) {
+    const run = this.#tail.then(() => this.#retryApplyOutbox(mailboxId, opts));
+    this.#tail = run.catch(() => {});
+    return run;
+  }
+
+  async #retryApplyOutbox(mailboxId, { maxAttempts = 0, maxAgeMs = 0, nowMs = Date.now() } = {}) {
+    const applied = [];
+    const quarantined = [];
+    if (!this.#outbox || typeof this.#outbox.listPending !== "function") {
+      return { applied, quarantined };
+    }
+    let pending = [];
+    try {
+      pending = await this.#outbox.listPending(mailboxId);
+    } catch (err) {
+      this.#logger.error("[InboundDepositPipeline] apply-outbox listPending failed: "
+        + (err && err.message ? err.message : err));
+      return { applied, quarantined };
+    }
+    for (const entry of pending) {
+      const dedupId = entry && typeof entry.dedupId === "string" ? entry.dedupId : "";
+      if (!dedupId) continue;
+      try {
+        await this.#events.applyUserMessage(entry.userMessage);
+        await this.#markOutboxApplied(mailboxId, dedupId);
+        applied.push(dedupId);
+      } catch (err) {
+        this.#logger.error("[InboundDepositPipeline] apply-outbox retry failed for " + dedupId + ": "
+          + (err && err.message ? err.message : err));
+        const res = await this.#recordOutboxFailure(mailboxId, dedupId, nowMs);
+        const ageMs = (Number.isFinite(res.firstStagedAtMs) && Number.isFinite(nowMs))
+          ? Math.max(0, nowMs - res.firstStagedAtMs)
+          : 0;
+        const overAttempts = Number.isFinite(maxAttempts) && maxAttempts > 0 && res.attempts >= maxAttempts;
+        const overAge = Number.isFinite(maxAgeMs) && maxAgeMs > 0 && ageMs >= maxAgeMs;
+        if (overAttempts || overAge) {
+          // Poison apply: stop retrying forever. Drop from the outbox and report
+          // it so the drain surfaces a visible System notice (no silent loss).
+          await this.#markOutboxApplied(mailboxId, dedupId);
+          quarantined.push({ dedupId, attempts: res.attempts, ageMs, reason: overAge ? "age" : "attempts" });
+        }
+      }
+    }
+    return { applied, quarantined };
   }
 }

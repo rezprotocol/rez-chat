@@ -3,6 +3,7 @@ import { ChatServerBus } from "./ChatServerBus.js";
 import { ChatBridge } from "../transport/ChatBridge.js";
 import { InboundDepositPipeline } from "../runtime/InboundDepositPipeline.js";
 import { ProcessedDepositLog } from "../inbox/ProcessedDepositLog.js";
+import { InboundApplyOutbox } from "../inbox/InboundApplyOutbox.js";
 import {
   ServerRuntimeService,
   ServerSessionService,
@@ -305,10 +306,15 @@ export class ChatServerApp {
     // re-decrypt fails the advanced double ratchet and used to swallow the next
     // (genuinely new) offline message.
     const processedLog = new ProcessedDepositLog({ kvStore: this.#storageProvider.getKeyValueStore(null) });
+    // Durable post-decrypt apply-outbox (audit P1.1): a decrypted message is
+    // staged here before the cursor/buffer ack can advance, so an application
+    // failure is retried instead of silently losing the only ciphertext.
+    const applyOutbox = new InboundApplyOutbox({ kvStore: this.#storageProvider.getKeyValueStore(null) });
     const inboundPipeline = new InboundDepositPipeline({
       peerLinkProtocol: services.peerLinkProtocol,
       events: services.events,
       processedLog,
+      outbox: applyOutbox,
       logger,
     });
     // Catchup is only meaningful when an inbox is claimed (production). In

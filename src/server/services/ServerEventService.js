@@ -399,20 +399,28 @@ export class ServerEventService extends BaseServerService {
     let messagePersisted = false;
     let persistedMutated = null;
     if (threadId && canonicalMessageId) {
-      const persistResult = await this.bus.stores.threadStore.upsertDepositedMessage({
-        messageId: canonicalMessageId,
-        threadId,
-        senderKey: senderAccountId || mailboxId,
-        packetB64: ciphertextB64,
-        acceptedAtMs: now,
-        senderAccountId,
-        status: "delivered",
-        text: previewText,
-        payload: decodedPayload,
-      }).catch((err) => {
+      // This is the message-of-record write. Audit P1.1: do NOT swallow a
+      // failure here — propagate it so the inbound pipeline records applied:false,
+      // the durable cursor is NOT advanced, and the decrypted payload is retried
+      // from the apply-outbox. Swallowing (return null) made the cursor advance
+      // and the only ciphertext be pruned → silent message loss.
+      let persistResult;
+      try {
+        persistResult = await this.bus.stores.threadStore.upsertDepositedMessage({
+          messageId: canonicalMessageId,
+          threadId,
+          senderKey: senderAccountId || mailboxId,
+          packetB64: ciphertextB64,
+          acceptedAtMs: now,
+          senderAccountId,
+          status: "delivered",
+          text: previewText,
+          payload: decodedPayload,
+        });
+      } catch (err) {
         this.logger.error("[ServerEventService] inbound message persist failed", err && err.message ? err.message : err);
-        return null;
-      });
+        throw err;
+      }
       if (persistResult) {
         messagePersisted = true;
         // Out-of-order mutations (edit/reaction/tombstone delivered before their
