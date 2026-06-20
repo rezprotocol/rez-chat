@@ -91,7 +91,7 @@ function makeService({ sdk }) {
     inboxClaimant: makeInboxClaimant(),
     logger,
   });
-  return { svc, errors };
+  return { svc, errors, bus };
 }
 
 test("durable node + device key: device.bind is called once with the built records, bound to the claimed inbox", async () => {
@@ -105,6 +105,20 @@ test("durable node + device key: device.bind is called once with the built recor
   assert.deepEqual(calls.buildBinding, [INBOX], "binding built for the claimed inbox");
   assert.equal(calls.bind[0].deviceRegistration, REGISTRATION, "the built registration is forwarded verbatim");
   assert.deepEqual(calls.bind[0].deviceInboxBinding, { __kind: "DeviceInboxBindingV1", inboxId: INBOX });
+});
+
+test("R3 #3: gate OPEN bridges multiDeviceFanout onto bus.runtime (send-path gate can engage)", async () => {
+  const { sdk } = makeSdk({ durable: true, gateOpen: true, deviceKeyPub: "device-pub" });
+  const { svc, bus } = makeService({ sdk });
+  await svc.connect();
+  assert.equal(bus.runtime.multiDeviceFanout, true, "the negotiated E6 capability reached the runtime");
+});
+
+test("R3 #3: gate CLOSED leaves bus.runtime.multiDeviceFanout false (legacy single-device send)", async () => {
+  const { sdk } = makeSdk({ durable: true, gateOpen: false, deviceKeyPub: "device-pub" });
+  const { svc, bus } = makeService({ sdk });
+  await svc.connect();
+  assert.equal(bus.runtime.multiDeviceFanout, false, "gate closed ⇒ sender stays on the legacy path");
 });
 
 test("non-durable node: device.bind is NOT called (shipped fs / DO-relay path unchanged)", async () => {

@@ -27,27 +27,45 @@ export function nodeAdvertisesDurableInbox(sdk) {
 }
 
 /**
- * SSOT for "has this node lifted the single-device cap (E6 gate open)?" (Audit
- * R2 #6 — kills the gate split-brain P2 by negotiating one capability instead of
- * each side reading its own flag).
+ * SSOT for the negotiated E6 multi-device fan-out gate: has this node lifted the
+ * single-device cap and advertised `multiDeviceFanout` in `session.ready`?
+ * (Audit R2 #6 — kills the gate split-brain by negotiating ONE capability
+ * instead of each side reading its own flag.)
  *
- * When true, the node creates a NEW device cursor ONLY from a proven device.bind
- * — the legacy inbox.claim no-ops the cursor. So a client that merely connects
- * (claims) but never successfully binds would report "connected" yet have no
- * durable cursor, and later cursorAck/list would fail DEVICE_NOT_REGISTERED.
- * ServerRuntimeService therefore treats device.bind as a READINESS REQUIREMENT
- * (not a best-effort backfill) exactly when this returns true. Defaults false ⇒
- * gate-closed pg / fs / desktop nodes keep the legacy claim-creates-cursor path,
- * where a failed bind is harmless (the claim already made the cursor).
+ * Both downstream gates derive from this single capability read so they can
+ * never disagree: ServerRuntimeService treats device.bind as a readiness
+ * requirement (nodeRequiresProvenDevice), AND threads it onto
+ * bus.runtime.multiDeviceFanout so ServerMessagesService's per-device sender
+ * fan-out can actually engage (Audit R3 #3 — without this bridge the Slice-8
+ * node-gate flip never reached the sender). Defaults false ⇒ gate-closed pg /
+ * fs / desktop nodes keep the legacy single-device claim/sealForPeer path
+ * byte-for-byte unchanged.
  *
  * @param {object} sdk
  * @returns {boolean}
  */
-export function nodeRequiresProvenDevice(sdk) {
+export function nodeEnablesMultiDeviceFanout(sdk) {
   if (!sdk || typeof sdk.getSessionInfo !== "function") return false;
   const info = sdk.getSessionInfo();
   if (!info || typeof info !== "object") return false;
   const caps = info.capabilities;
   if (!caps || typeof caps !== "object") return false;
   return caps.multiDeviceFanout === true;
+}
+
+/**
+ * The same negotiated E6 gate, read for its readiness meaning: when the node
+ * enables multi-device fan-out it creates a NEW device cursor ONLY from a proven
+ * device.bind (the legacy inbox.claim no-ops the cursor). So a client that
+ * connects but never binds would report "connected" yet have no durable cursor,
+ * and later cursorAck/list would fail DEVICE_NOT_REGISTERED. ServerRuntimeService
+ * therefore treats device.bind as a READINESS REQUIREMENT exactly when this is
+ * true. Delegates to nodeEnablesMultiDeviceFanout so the two gates share one
+ * capability read (SSOT).
+ *
+ * @param {object} sdk
+ * @returns {boolean}
+ */
+export function nodeRequiresProvenDevice(sdk) {
+  return nodeEnablesMultiDeviceFanout(sdk);
 }

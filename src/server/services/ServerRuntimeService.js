@@ -3,7 +3,7 @@ import { createRezClient, REZ_CONTRACT_TYPES } from "@rezprotocol/sdk/client";
 import { ConnectionStateEvent } from "../../records/index.js";
 import { BaseServerService } from "../base/BaseServerService.js";
 import { MailboxPushBridge } from "../runtime/MailboxPushBridge.js";
-import { nodeAdvertisesDurableInbox, nodeRequiresProvenDevice } from "../inbox/durableMode.js";
+import { nodeAdvertisesDurableInbox, nodeRequiresProvenDevice, nodeEnablesMultiDeviceFanout } from "../inbox/durableMode.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -106,6 +106,13 @@ export class ServerRuntimeService extends BaseServerService {
   async connect() {
     if (this.#connected) return this.#sdk;
     await this.#sdk.connect();
+    // Bridge the NEGOTIATED E6 multi-device fan-out capability (advertised by
+    // the node in session.ready, now resolvable via getSessionInfo) onto the
+    // runtime so ServerMessagesService's per-device sender fan-out gate can see
+    // it (Audit R3 #3). Without this the node could flip its E6 gate at Slice 8
+    // and the sender would still silently take the legacy single-device path.
+    // Defaults false ⇒ fs / DO-relay / gate-closed pg nodes are unchanged.
+    this.bus.runtime.multiDeviceFanout = nodeEnablesMultiDeviceFanout(this.#sdk);
     // Register chat-server's persistent inbox claim with the node. The node
     // persists the inboxId → claimantPublicKey mapping in its
     // InboxClaimRegistry and binds the WS session to this inbox. From this
