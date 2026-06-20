@@ -229,3 +229,42 @@ test("device-set service is a no-op when this account runs no per-device session
   assert.equal(await svc.resolveForPeer({ peerAccountId: "rez:acct:whatever" }), null);
   assert.equal(overlay.map.size, 0, "a disabled service never touches the overlay");
 });
+
+test("Audit R2 #2: a re-PUBLISHED (re-sealed, same revision) set does NOT reset the session after the cache TTL", async () => {
+  const overlay = makeOverlay();
+  const alice = await makeAccount({ mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount({ mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+  const aliceDeviceSet = makeService(alice, overlay);
+
+  let now = 1000;
+  const bobDeviceSet = new ServerDeviceSetService({
+    bus: makeBus({ peerLinks: bob.svc, sdk: { durableRecords: overlay.double() } }),
+    ownerAccountId: bob.accountId,
+    clock: () => now,
+  });
+
+  await aliceDeviceSet.publishForPeer({ peerAccountId: bob.accountId });
+  const first = await bobDeviceSet.resolveForPeer({ peerAccountId: alice.accountId });
+  assert.equal(first.established.length, 1, "first resolve establishes one device session");
+  await aliceDeviceSet.completeResponder({ peerAccountId: bob.accountId, peerDeviceId: bob.deviceId, handshakeData: first.established[0].handshakeData });
+
+  // Advance the ratchet once over the established session.
+  const { encryptedPacket: m1 } = await bob.svc.encryptDirectMessageForDevice({ peerAccountId: alice.accountId, peerLinkId: "pl_bob_alice", peerDeviceId: alice.deviceId, plaintextBytes: enc("one") });
+  assert.equal(dec((await alice.svc.decryptFromDevice({ peerAccountId: bob.accountId, peerLinkId: "pl_alice_bob", peerDeviceId: bob.deviceId, packetBytes: m1.toBytes() })).plaintextBytes), "one");
+
+  // Alice re-publishes — same devices + same revision, but a FRESH seal nonce, so
+  // the sealed ciphertext at the slot is byte-different. The old ciphertext-key
+  // compare would treat this as "changed" and re-ingest, resetting Bob's session.
+  await aliceDeviceSet.publishForPeer({ peerAccountId: bob.accountId });
+
+  now += 6 * 60 * 1000; // past the 5-minute cache TTL ⇒ Bob re-fetches + re-ingests
+  const second = await bobDeviceSet.resolveForPeer({ peerAccountId: alice.accountId });
+  assert.equal(second.established.length, 0, "the re-sealed same-revision set establishes nothing (no reset)");
+  assert.equal(second.revision, first.revision, "same monotonic revision honored");
+
+  // Bob's session is intact — a follow-up still decrypts on Alice's UNCHANGED
+  // responder (this would throw if the session had been reset by the re-ingest).
+  const { encryptedPacket: m2 } = await bob.svc.encryptDirectMessageForDevice({ peerAccountId: alice.accountId, peerLinkId: "pl_bob_alice", peerDeviceId: alice.deviceId, plaintextBytes: enc("two") });
+  assert.equal(dec((await alice.svc.decryptFromDevice({ peerAccountId: bob.accountId, peerLinkId: "pl_alice_bob", peerDeviceId: bob.deviceId, packetBytes: m2.toBytes() })).plaintextBytes), "two");
+});

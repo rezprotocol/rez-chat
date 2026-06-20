@@ -23,6 +23,17 @@ import { BaseServerService } from "../base/BaseServerService.js";
  * per-device sessions (no device key — web / legacy vault), every method is a
  * no-op (`isEnabled()` false), so nothing changes for those paths.
  */
+// How long a resolved device set is trusted before re-fetching (Audit P2). The
+// old cache short-circuited BEFORE any fetch and never expired, so a peer's
+// device add/remove/revoke could not propagate without the (uncalled) invalidate.
+// A bounded TTL re-fetches; the SDK ingest is then idempotent per device and
+// gated on the signed MONOTONIC revision (Audit R2 #2), so re-fetching an
+// UNCHANGED set establishes nothing and a rolled-back (lower revision) set is
+// rejected. (The earlier content-key compare hashed the sealed ciphertext, which
+// carries a fresh nonce per publish — so every refresh looked "changed" and reset
+// the initiator sessions while the responder kept the old one ⇒ desync.)
+const DEVICE_SET_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 export class ServerDeviceSetService extends BaseServerService {
   #clock;
   #resolved;
@@ -30,7 +41,7 @@ export class ServerDeviceSetService extends BaseServerService {
   constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
-    // peerAccountId -> { deviceSetRecord, established, fetchedAtMs }
+    // peerAccountId -> { deviceSetRecord, established, fetchedAtMs, revision }
     this.#resolved = new Map();
     this._register("device-set", "publishForPeer", (payload) => this.publishForPeer(payload || {}));
     this._register("device-set", "resolveForPeer", (payload) => this.resolveForPeer(payload || {}));
@@ -87,8 +98,9 @@ export class ServerDeviceSetService extends BaseServerService {
     if (!peer) {
       throw new Error("ServerDeviceSetService.resolveForPeer requires peerAccountId");
     }
-    if (!forceRefresh && this.#resolved.has(peer)) {
-      return this.#resolved.get(peer);
+    const existing = this.#resolved.get(peer);
+    if (!forceRefresh && existing && (this.#clock() - existing.fetchedAtMs) < DEVICE_SET_CACHE_TTL_MS) {
+      return existing;
     }
     const durableRecords = this.#durableRecords();
     if (!durableRecords) {
@@ -97,13 +109,44 @@ export class ServerDeviceSetService extends BaseServerService {
     const coords = await this.#peerLinks().resolvePeerDeviceSetCoordinates({ peerAccountId: peer });
     const record = await durableRecords.get(coords);
     if (!record) {
+      // The peer's set is gone — drop any stale cache so we stop fanning out to it.
+      this.#resolved.delete(peer);
       return null;
     }
-    const result = await this.#peerLinks().ingestPeerDeviceSet({ peerAccountId: peer, record, nowMs: this.#clock() });
+    // Ingest against the highest revision we've already accepted. The SDK opens +
+    // verifies the signed inner DeviceSetRecordV1, REJECTS a lower revision as a
+    // rollback, and establishes initiator sessions ONLY for devices we don't yet
+    // have a session for (idempotent) — so an unchanged republish neither churns
+    // sessions nor desyncs the responder (Audit R2 #2).
+    const knownRevision = existing && Number.isInteger(existing.revision) ? existing.revision : 0;
+    let result;
+    try {
+      result = await this.#peerLinks().ingestPeerDeviceSet({
+        peerAccountId: peer,
+        record,
+        nowMs: this.#clock(),
+        minRevision: knownRevision,
+      });
+    } catch (err) {
+      if (err && err.code === "DEVICE_SET_STALE_REVISION" && existing) {
+        // A replayed / older set — keep the higher-revision one we already hold.
+        existing.fetchedAtMs = this.#clock();
+        if (this.logger && typeof this.logger.warn === "function") {
+          this.logger.warn("[ServerDeviceSetService] ignored stale device-set revision for peer", peer,
+            err && err.message ? err.message : err);
+        }
+        return existing;
+      }
+      throw err;
+    }
+    const revision = Number.isInteger(result.revision)
+      ? result.revision
+      : (result.deviceSetRecord && Number.isInteger(result.deviceSetRecord.revision) ? result.deviceSetRecord.revision : 0);
     const cached = {
       deviceSetRecord: result.deviceSetRecord,
       established: result.established,
       fetchedAtMs: this.#clock(),
+      revision,
     };
     this.#resolved.set(peer, cached);
     return cached;
