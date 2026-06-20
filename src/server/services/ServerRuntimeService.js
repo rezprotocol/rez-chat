@@ -3,7 +3,7 @@ import { createRezClient, REZ_CONTRACT_TYPES } from "@rezprotocol/sdk/client";
 import { ConnectionStateEvent } from "../../records/index.js";
 import { BaseServerService } from "../base/BaseServerService.js";
 import { MailboxPushBridge } from "../runtime/MailboxPushBridge.js";
-import { nodeAdvertisesDurableInbox } from "../inbox/durableMode.js";
+import { nodeAdvertisesDurableInbox, nodeRequiresProvenDevice } from "../inbox/durableMode.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -186,24 +186,42 @@ export class ServerRuntimeService extends BaseServerService {
    * cursor then keys on the SIGNED self-certifying deviceId rather than the
    * unsigned SessionHello string.
    *
-   * Gated three ways so the shipped delivery path can never change:
-   *   - the SDK must expose the devices/identity capabilities (older clients
-   *     and test fakes don't);
-   *   - the keystore must carry a device key (legacy vaults yield null);
-   *   - the node must advertise `durableInbox` (DO relays / fs nodes don't, so
-   *     this is a no-op there — the device.bind handler would only answer
-   *     SERVICE_UNAVAILABLE).
-   * Best-effort: a bind failure is logged, never thrown — connect must survive,
-   * the cursor falls back to the session deviceId, and E6 fan-out stays gated
-   * until Slice 8, so there is no functional regression from a failed bind.
+   * Gated on the node advertising `durableInbox` (DO relays / fs nodes don't, so
+   * this is a no-op there — the device.bind handler would only answer
+   * SERVICE_UNAVAILABLE).
+   *
+   * Readiness semantics depend on the node's E6 gate (Audit R2 #6):
+   *   - Gate CLOSED (default; node does NOT advertise `multiDeviceFanout`): the
+   *     inbox.claim already created the durable cursor keyed on the session
+   *     deviceId, so device.bind only BACKFILLS the proven key. A failure is
+   *     harmless (the cursor exists) ⇒ best-effort, logged not thrown. This is
+   *     the shipped single-device path — byte-for-byte unchanged.
+   *   - Gate OPEN (node advertises `multiDeviceFanout`): the claim NO-OPS the
+   *     cursor, so device.bind is the ONLY way to obtain one. A client that
+   *     connected but could not bind has NO usable cursor and would later fail
+   *     with DEVICE_NOT_REGISTERED. So bind becomes a READINESS REQUIREMENT: a
+   *     missing device key or a failed bind THROWS, failing connect() rather than
+   *     reporting a ready connection with no cursor.
+   * Since the gate stays CLOSED until Slice 8, the throwing path is currently
+   * inert in production — no regression to the shipped delivery path.
    */
   async #registerDeviceBind() {
     const sdk = this.#sdk;
-    if (!sdk || !sdk.identity || !sdk.devices) return;
-    if (typeof sdk.identity.getDeviceKeyPublicKeyB64 !== "function") return;
-    const deviceKeyPublicKeyB64 = sdk.identity.getDeviceKeyPublicKeyB64();
-    if (!deviceKeyPublicKeyB64) return;
     if (!nodeAdvertisesDurableInbox(sdk)) return;
+    const gateOpen = nodeRequiresProvenDevice(sdk);
+
+    const hasDeviceKey = sdk && sdk.identity && sdk.devices
+      && typeof sdk.identity.getDeviceKeyPublicKeyB64 === "function"
+      && Boolean(sdk.identity.getDeviceKeyPublicKeyB64());
+    if (!hasDeviceKey) {
+      if (gateOpen) {
+        throw new Error(
+          "ServerRuntimeService: node has multi-device fan-out enabled but this client "
+          + "has no device key to prove via device.bind — refusing to report ready without a durable cursor",
+        );
+      }
+      return; // gate closed: the legacy claim cursor suffices
+    }
 
     const inboxId = this.#inboxClaimant.inboxId;
     try {
@@ -216,6 +234,10 @@ export class ServerRuntimeService extends BaseServerService {
         code: err && err.code ? err.code : null,
         message: err && err.message ? err.message : String(err),
       });
+      // Gate OPEN: no proven bind ⇒ no cursor ⇒ not ready. Propagate so connect()
+      // fails instead of advertising a connection that cannot receive durable mail.
+      if (gateOpen) throw err;
+      // Gate CLOSED: best-effort backfill; the claim cursor already works.
     }
   }
 

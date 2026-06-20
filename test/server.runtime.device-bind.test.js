@@ -45,7 +45,7 @@ function makeInboxClaimant() {
   };
 }
 
-function makeSdk({ durable = true, deviceKeyPub = "device-pub", bindImpl = null } = {}) {
+function makeSdk({ durable = true, deviceKeyPub = "device-pub", bindImpl = null, gateOpen = false } = {}) {
   const calls = { bind: [], buildReg: 0, buildBinding: [], sendRequest: [] };
   const REGISTRATION = { __kind: "DeviceRegistrationV1" };
   const sdk = {
@@ -56,7 +56,7 @@ function makeSdk({ durable = true, deviceKeyPub = "device-pub", bindImpl = null 
         nodeKeyId: "node-key",
         nodePublicKeyB64: "node-pub",
         relayKeyId: "relay-key",
-        capabilities: { durableInbox: durable === true, localInboxId: INBOX },
+        capabilities: { durableInbox: durable === true, multiDeviceFanout: gateOpen === true, localInboxId: INBOX },
       };
     },
     async sendRequest(req) { calls.sendRequest.push(req); return { body: {} }; },
@@ -138,4 +138,33 @@ test("SDK without the devices/identity capabilities (older client / fake): no-op
   const { svc } = makeService({ sdk });
   await svc.connect();
   assert.equal(svc.connected, true);
+});
+
+// --- Audit R2 #6: device.bind is a READINESS GATE when the node advertises the
+// open E6 gate (multiDeviceFanout). The claim no-ops the cursor there, so a
+// connection that cannot bind has NO durable cursor and must NOT report ready.
+
+test("gate OPEN + device key: device.bind succeeds, connect is ready", async () => {
+  const { sdk, calls } = makeSdk({ durable: true, gateOpen: true, deviceKeyPub: "device-pub" });
+  const { svc } = makeService({ sdk });
+  await svc.connect();
+  assert.equal(svc.connected, true);
+  assert.equal(calls.bind.length, 1, "device.bind called under the open gate");
+});
+
+test("gate OPEN + device.bind FAILS: connect throws (no ready connection without a cursor)", async () => {
+  const { sdk, calls } = makeSdk({ durable: true, gateOpen: true, bindImpl: () => { throw Object.assign(new Error("boom"), { code: "DEVICE_LIMIT" }); } });
+  const { svc, errors } = makeService({ sdk });
+  await assert.rejects(() => svc.connect(), /boom/);
+  assert.equal(svc.connected, false, "connect did not report ready");
+  assert.equal(calls.bind.length, 1, "bind was attempted");
+  assert.ok(errors.length >= 1, "the failure was logged before rethrow");
+});
+
+test("gate OPEN + no device key: connect throws (cannot prove a device for a cursor)", async () => {
+  const { sdk, calls } = makeSdk({ durable: true, gateOpen: true, deviceKeyPub: null });
+  const { svc } = makeService({ sdk });
+  await assert.rejects(() => svc.connect(), /no device key/);
+  assert.equal(svc.connected, false);
+  assert.equal(calls.bind.length, 0, "bind not attempted without a device key");
 });

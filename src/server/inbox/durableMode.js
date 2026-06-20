@@ -25,3 +25,29 @@ export function nodeAdvertisesDurableInbox(sdk) {
   if (!caps || typeof caps !== "object") return false;
   return caps.durableInbox === true;
 }
+
+/**
+ * SSOT for "has this node lifted the single-device cap (E6 gate open)?" (Audit
+ * R2 #6 — kills the gate split-brain P2 by negotiating one capability instead of
+ * each side reading its own flag).
+ *
+ * When true, the node creates a NEW device cursor ONLY from a proven device.bind
+ * — the legacy inbox.claim no-ops the cursor. So a client that merely connects
+ * (claims) but never successfully binds would report "connected" yet have no
+ * durable cursor, and later cursorAck/list would fail DEVICE_NOT_REGISTERED.
+ * ServerRuntimeService therefore treats device.bind as a READINESS REQUIREMENT
+ * (not a best-effort backfill) exactly when this returns true. Defaults false ⇒
+ * gate-closed pg / fs / desktop nodes keep the legacy claim-creates-cursor path,
+ * where a failed bind is harmless (the claim already made the cursor).
+ *
+ * @param {object} sdk
+ * @returns {boolean}
+ */
+export function nodeRequiresProvenDevice(sdk) {
+  if (!sdk || typeof sdk.getSessionInfo !== "function") return false;
+  const info = sdk.getSessionInfo();
+  if (!info || typeof info !== "object") return false;
+  const caps = info.capabilities;
+  if (!caps || typeof caps !== "object") return false;
+  return caps.multiDeviceFanout === true;
+}
