@@ -28,6 +28,11 @@ import { SeedKeys } from "@rezprotocol/sdk/crypto/seedDerivation";
 // a label for a different key — that would silently couple two identities.
 const SEED_LABEL_DESKTOP_ACCOUNT = "rez/identity/desktop-account/v1";
 const SEED_LABEL_CHAT_SERVER = "rez/identity/chat-server/v1";
+// Account-level identity-DH key (X25519) for X3DH DH1 + the device-set
+// peer-scoped seal. Seed-derived so it is the SAME on every device of an account
+// — the requirement for a peer's sealed device set to be openable by all of an
+// account's devices (Audit P1). NEVER reuse this label for another key.
+const SEED_LABEL_X3DH_DH = "rez/identity/x3dh-dh/v1";
 // Seed-derived KEK for the portable encrypted account backup (Phase 5). The
 // mnemonic is the backup key: export/import both derive this from the seed, so
 // the random app-data key can be recovered on a fresh device WITHOUT the OS
@@ -295,6 +300,7 @@ export class DesktopVaultService {
         accountId: chatServerIdentity.getAccountId(),
         publicKeyB64: chatServerKeys.publicKeyB64,
         privateKeyB64: chatServerKeys.privateKeyB64,
+        accountIdentityDhKeyPair: SeedKeys.deriveX25519({ seed, label: SEED_LABEL_X3DH_DH }),
       };
       return this.unlock({ accountId: created.accountId, password: pwd });
     } finally {
@@ -596,6 +602,12 @@ export class DesktopVaultService {
       accountId: ident.accountId,
       publicKeyB64: ident.publicKeyB64,
       privateKeyB64: ident.privateKeyB64,
+      // Seed-derived account identity-DH key (X25519), shared across all of the
+      // account's devices — threaded into PeerLinkService for the device-set
+      // peer-scoped seal (Audit P1). Null on a pre-migration vault.
+      accountIdentityDhKeyPair: ident.accountIdentityDhKeyPair
+        ? { publicKeyB64: ident.accountIdentityDhKeyPair.publicKeyB64, privateKeyB64: ident.accountIdentityDhKeyPair.privateKeyB64 }
+        : null,
     };
   }
 
@@ -923,6 +935,7 @@ export class DesktopVaultService {
         accountId: chatServerIdentity.getAccountId(),
         publicKeyB64: chatServerKeys.publicKeyB64,
         privateKeyB64: chatServerKeys.privateKeyB64,
+        accountIdentityDhKeyPair: SeedKeys.deriveX25519({ seed, label: SEED_LABEL_X3DH_DH }),
       };
       return this.unlock({ accountId: created.accountId, password: newPwd });
     } finally {
@@ -1287,6 +1300,7 @@ export class DesktopVaultService {
         accountId: identity.getAccountId(),
         publicKeyB64: chatServerKeys.publicKeyB64,
         privateKeyB64: chatServerKeys.privateKeyB64,
+        accountIdentityDhKeyPair: SeedKeys.deriveX25519({ seed, label: SEED_LABEL_X3DH_DH }),
       };
     } finally {
       seed.fill(0);

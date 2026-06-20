@@ -207,6 +207,13 @@ export async function bootstrapChatServer({
     // Absent (legacy/web vault) ⇒ legacy single-device path, unchanged.
     deviceKeyPair: deviceKey && deviceKey.deviceKeyPair ? deviceKey.deviceKeyPair : null,
     deviceId: deviceKey && deviceKey.deviceId ? deviceKey.deviceId : null,
+    // Audit P1: the SEED-DERIVED account identity-DH key (X25519), shared across
+    // every device of this account, so a peer's sealed device set is openable on
+    // all of them. Sourced from the raw chat-server identity (ensureChatServerIdentity
+    // strips it). Null on a pre-migration vault ⇒ legacy device-local random key.
+    accountIdentityDhKeyPair: expectedChatServerIdentity && expectedChatServerIdentity.accountIdentityDhKeyPair
+      ? expectedChatServerIdentity.accountIdentityDhKeyPair
+      : null,
   });
 
   await selfProvisionAccountBinding({
