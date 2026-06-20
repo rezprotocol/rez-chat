@@ -122,6 +122,35 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
    *
    * @returns {Promise<null | { userMessage: object }>}
    */
+  /**
+   * Establish the responder per-device session from an in-band first-contact
+   * device handshake (S2.5 / Audit P1). The handshake is bound to the SENDER's
+   * identity, so we complete the responder against (peerAccountId = sender,
+   * peerDeviceId = sender's device); decryptDirectMessageAnyPeer then trials the
+   * now-established device session. Idempotent (skips when a session already
+   * exists, so a re-delivered first message never re-runs the handshake and
+   * clobbers an advanced ratchet) and best-effort (a failure is logged, not
+   * thrown — the deposit stays buffered and retries).
+   */
+  async _establishDeviceResponderFromHandshake(peerLinks, deviceHandshake) {
+    if (typeof peerLinks.hasDeviceSessions !== "function" || !peerLinks.hasDeviceSessions()) return;
+    if (typeof peerLinks.completeDeviceSetResponder !== "function") return;
+    const senderAccountId = typeof deviceHandshake.senderAccountId === "string" ? deviceHandshake.senderAccountId.trim() : "";
+    const senderDeviceId = typeof deviceHandshake.senderDeviceId === "string" ? deviceHandshake.senderDeviceId.trim() : "";
+    const handshakeData = deviceHandshake.handshakeData;
+    if (!senderAccountId || !senderDeviceId || !handshakeData || typeof handshakeData !== "object") return;
+    try {
+      if (typeof peerLinks.hasDeviceSession === "function"
+          && await peerLinks.hasDeviceSession({ peerAccountId: senderAccountId, peerDeviceId: senderDeviceId })) {
+        return; // already established — idempotent, do not re-run the handshake
+      }
+      await peerLinks.completeDeviceSetResponder({ peerAccountId: senderAccountId, peerDeviceId: senderDeviceId, handshakeData });
+    } catch (err) {
+      this.logger.error("[ServerPeerLinkProtocolService] device responder establish failed",
+        err && err.message ? err.message : err);
+    }
+  }
+
   async processDeposit(event) {
     const tr = process.env.REZ_PEERLINK_TRACE === "1";
     const frame = event && typeof event === "object" ? event : {};
@@ -283,6 +312,13 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     // E2EE direct message (user content or delivery ack inside ciphertext).
     if (bodyObj.e2ee === 1 && typeof bodyObj.v === "number" && typeof bodyObj.payload === "string") {
       if (typeof peerLinks.decryptDirectMessageAnyPeer !== "function") return;
+      // First-contact per-device handshake (S2.5), carried IN-BAND in this
+      // envelope (Audit P1). Establish the responder device session against the
+      // SENDER BEFORE decrypt, so the device-session trial inside
+      // decryptDirectMessageAnyPeer finds it. Idempotent + best-effort.
+      if (bodyObj.deviceHandshake && typeof bodyObj.deviceHandshake === "object") {
+        await this._establishDeviceResponderFromHandshake(peerLinks, bodyObj.deviceHandshake);
+      }
       let decResult;
       try {
         decResult = await peerLinks.decryptDirectMessageAnyPeer({
