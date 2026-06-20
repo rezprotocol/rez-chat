@@ -29,9 +29,19 @@ export class ServerSessionService extends BaseServerService {
     const localInboxId = capabilities && typeof capabilities === "object"
       ? String(capabilities.localInboxId || "").trim()
       : "";
+    // S2.5 Slice 5: report the chat-server's REAL session deviceId — the SIGNED
+    // self-cert id (rez:dev:sha256) when a device key is present, else the
+    // persistent chat-server id — instead of the legacy hardcoded "server".
+    // Falls back to "server" only when the SDK can't surface one (test fakes).
+    const sdkDeviceId = sdk && sdk.identity && typeof sdk.identity.getDeviceId === "function"
+      ? sdk.identity.getDeviceId()
+      : null;
+    const deviceId = typeof sdkDeviceId === "string" && sdkDeviceId.trim().length > 0
+      ? sdkDeviceId.trim()
+      : "server";
     return {
       accountId: this.ownerAccountId,
-      deviceId: "server",
+      deviceId,
       localInboxId,
     };
   }

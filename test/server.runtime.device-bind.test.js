@@ -1,0 +1,141 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { ServerRuntimeService } from "../src/server/services/ServerRuntimeService.js";
+
+// S2.5 Slice 5 leaf 3 — the chat-side `device.bind` wiring on connect(). After
+// the inbox claim, ServerRuntimeService presents this device's proven key to the
+// home so the durable cursor keys on the SIGNED self-cert deviceId. This pins the
+// THREE gates that keep the shipped (fs / DO-relay) delivery path unchanged and
+// the best-effort discipline (a bind failure never breaks connect). The crypto +
+// frame shape are proven un-mocked in rez-sdk devices.capability.test.js.
+
+const INBOX = "rez:inbox:chat-server";
+
+function makeBus() {
+  const handlers = new Map();
+  return {
+    runtime: {},
+    stores: {},
+    // MailboxPushBridge.attach requires an inboundPipeline with submit(); no
+    // deposit frame arrives in this test, so submit is never actually called.
+    services: { inboundPipeline: { submit() {} } },
+    resolveReady: { runtime() {} },
+    on(name, fn) {
+      if (!handlers.has(name)) handlers.set(name, new Set());
+      handlers.get(name).add(fn);
+      return () => handlers.get(name).delete(fn);
+    },
+    emit() {},
+    registerFunction() {},
+    call() { return Promise.resolve(null); },
+  };
+}
+
+function makeInboxClaimant() {
+  return {
+    inboxId: INBOX,
+    claimStore: {
+      async createReattestation(inboxId) {
+        return { inboxId, claimantPublicKeyB64: "claimant-pub", claimedAtMs: 1000, claimSignatureB64: "claim-sig" };
+      },
+      async createNodeDelegation({ inboxId, nodeKeyId, nodePublicKeyB64, relayKeyId }) {
+        return { inboxId, nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs: 1000, expiresAtMs: 9_000_000_000_000, delegationSigB64: "deleg-sig" };
+      },
+    },
+  };
+}
+
+function makeSdk({ durable = true, deviceKeyPub = "device-pub", bindImpl = null } = {}) {
+  const calls = { bind: [], buildReg: 0, buildBinding: [], sendRequest: [] };
+  const REGISTRATION = { __kind: "DeviceRegistrationV1" };
+  const sdk = {
+    async connect() {},
+    onState() { return () => {}; },
+    getSessionInfo() {
+      return {
+        nodeKeyId: "node-key",
+        nodePublicKeyB64: "node-pub",
+        relayKeyId: "relay-key",
+        capabilities: { durableInbox: durable === true, localInboxId: INBOX },
+      };
+    },
+    async sendRequest(req) { calls.sendRequest.push(req); return { body: {} }; },
+    subscriptions: { onMailboxDeposited() { return () => {}; } },
+    mailbox: { ack() {} },
+    identity: {
+      getDeviceKeyPublicKeyB64() { return deviceKeyPub; },
+      getDeviceId() { return "rez:dev:self-cert"; },
+      async buildDeviceRegistration() { calls.buildReg += 1; return REGISTRATION; },
+      async buildDeviceInboxBinding({ inboxId } = {}) { calls.buildBinding.push(inboxId); return { __kind: "DeviceInboxBindingV1", inboxId }; },
+    },
+    devices: {
+      async bind(args) {
+        calls.bind.push(args);
+        if (typeof bindImpl === "function") return bindImpl(args);
+        return { inboxId: INBOX, deviceId: "rez:dev:self-cert" };
+      },
+    },
+  };
+  return { sdk, calls, REGISTRATION };
+}
+
+function makeService({ sdk }) {
+  const bus = makeBus();
+  const errors = [];
+  const logger = { error: (...a) => errors.push(a), warn() {}, info() {}, log() {} };
+  const svc = new ServerRuntimeService({
+    bus,
+    identity: { accountId: "rez:acct:chat", deviceId: "rez:dev:self-cert", publicKeyB64: "p", privateKeyB64: "s" },
+    uplinks: ["ws://node"],
+    sdk,
+    inboxClaimant: makeInboxClaimant(),
+    logger,
+  });
+  return { svc, errors };
+}
+
+test("durable node + device key: device.bind is called once with the built records, bound to the claimed inbox", async () => {
+  const { sdk, calls, REGISTRATION } = makeSdk({ durable: true, deviceKeyPub: "device-pub" });
+  const { svc } = makeService({ sdk });
+  await svc.connect();
+
+  assert.equal(calls.sendRequest.length, 1, "inbox claim sent");
+  assert.equal(calls.bind.length, 1, "device.bind called once");
+  assert.equal(calls.buildReg, 1);
+  assert.deepEqual(calls.buildBinding, [INBOX], "binding built for the claimed inbox");
+  assert.equal(calls.bind[0].deviceRegistration, REGISTRATION, "the built registration is forwarded verbatim");
+  assert.deepEqual(calls.bind[0].deviceInboxBinding, { __kind: "DeviceInboxBindingV1", inboxId: INBOX });
+});
+
+test("non-durable node: device.bind is NOT called (shipped fs / DO-relay path unchanged)", async () => {
+  const { sdk, calls } = makeSdk({ durable: false });
+  const { svc } = makeService({ sdk });
+  await svc.connect();
+  assert.equal(calls.sendRequest.length, 1, "inbox claim still sent");
+  assert.equal(calls.bind.length, 0, "no device.bind against a node without durableInbox");
+});
+
+test("no device key (legacy keystore): device.bind is NOT called", async () => {
+  const { sdk, calls } = makeSdk({ durable: true, deviceKeyPub: null });
+  const { svc } = makeService({ sdk });
+  await svc.connect();
+  assert.equal(calls.bind.length, 0, "no device.bind without a device key to prove");
+});
+
+test("device.bind failure is logged but never breaks connect (best-effort; E6 gated)", async () => {
+  const { sdk, calls } = makeSdk({ durable: true, bindImpl: () => { throw Object.assign(new Error("boom"), { code: "INVALID_SIGNATURE" }); } });
+  const { svc, errors } = makeService({ sdk });
+  await svc.connect();
+  assert.equal(svc.connected, true, "connect succeeds despite the bind failure");
+  assert.equal(calls.bind.length, 1);
+  assert.equal(errors.length, 1, "the failure is logged, not swallowed");
+  assert.match(errors[0][0], /device\.bind failed/);
+});
+
+test("SDK without the devices/identity capabilities (older client / fake): no-op, connect succeeds", async () => {
+  const { sdk } = makeSdk({ durable: true });
+  delete sdk.devices;
+  const { svc } = makeService({ sdk });
+  await svc.connect();
+  assert.equal(svc.connected, true);
+});

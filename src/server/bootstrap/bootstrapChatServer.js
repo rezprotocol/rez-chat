@@ -218,9 +218,18 @@ export async function bootstrapChatServer({
   const chatServer = new ChatServerApp({
     identity: {
       accountId: identity.accountId,
-      deviceId: identity.deviceId,
+      // S2.5 Slice 5: when a device key (C) is present, the SDK session
+      // authenticates AS the SIGNED self-certifying deviceId (rez:dev:sha256),
+      // and `device.bind` keys the durable home cursor on it. Absent (legacy /
+      // web vault) ⇒ the persistent chat-server deviceId, unchanged. The wire
+      // SessionHello.deviceId is set from this field (AuthStateMachine).
+      deviceId: deviceKey && deviceKey.deviceId ? deviceKey.deviceId : identity.deviceId,
       publicKeyB64: identity.publicKeyB64,
       privateKeyB64: identity.privateKeyB64,
+      // The device keypair (C) so the SDK's IdentityCapability can build the
+      // device-signed DeviceInboxBindingV1 + account-signed DeviceRegistrationV1
+      // for `device.bind`. Null on a legacy keystore.
+      deviceKey: deviceKey && deviceKey.deviceKeyPair ? deviceKey.deviceKeyPair : null,
     },
     uplinks: [wsUrl],
     storageProvider,

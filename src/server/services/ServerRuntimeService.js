@@ -3,6 +3,7 @@ import { createRezClient, REZ_CONTRACT_TYPES } from "@rezprotocol/sdk/client";
 import { ConnectionStateEvent } from "../../records/index.js";
 import { BaseServerService } from "../base/BaseServerService.js";
 import { MailboxPushBridge } from "../runtime/MailboxPushBridge.js";
+import { nodeAdvertisesDurableInbox } from "../inbox/durableMode.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -113,6 +114,11 @@ export class ServerRuntimeService extends BaseServerService {
     // rooted under this claim for cross-account deposits.
     if (this.#inboxClaimant) {
       await this.#registerInboxClaim();
+      // S2.5 Slice 5: present this device's proven key to the home so the durable
+      // cursor keys on the SIGNED self-cert deviceId. Best-effort + gated on the
+      // node advertising `durableInbox` — a no-op against fs/DO-relay nodes, so
+      // the shipped single-device path is byte-for-byte unchanged. E6 closed.
+      await this.#registerDeviceBind();
     }
     // Single owner of the SDK's onMailboxDeposited subscription. Forwards
     // each push frame onto the chat bus so ServerEventService,
@@ -173,6 +179,44 @@ export class ServerRuntimeService extends BaseServerService {
       throw err;
     }
     if (debug) console.log("[INBOX-DEBUG] ServerRuntimeService.#registerInboxClaim INBOX_CLAIM accepted", { inboxId });
+  }
+
+  /**
+   * Present this device's proven key to the home (S2.5 Slice 5). The durable
+   * cursor then keys on the SIGNED self-certifying deviceId rather than the
+   * unsigned SessionHello string.
+   *
+   * Gated three ways so the shipped delivery path can never change:
+   *   - the SDK must expose the devices/identity capabilities (older clients
+   *     and test fakes don't);
+   *   - the keystore must carry a device key (legacy vaults yield null);
+   *   - the node must advertise `durableInbox` (DO relays / fs nodes don't, so
+   *     this is a no-op there — the device.bind handler would only answer
+   *     SERVICE_UNAVAILABLE).
+   * Best-effort: a bind failure is logged, never thrown — connect must survive,
+   * the cursor falls back to the session deviceId, and E6 fan-out stays gated
+   * until Slice 8, so there is no functional regression from a failed bind.
+   */
+  async #registerDeviceBind() {
+    const sdk = this.#sdk;
+    if (!sdk || !sdk.identity || !sdk.devices) return;
+    if (typeof sdk.identity.getDeviceKeyPublicKeyB64 !== "function") return;
+    const deviceKeyPublicKeyB64 = sdk.identity.getDeviceKeyPublicKeyB64();
+    if (!deviceKeyPublicKeyB64) return;
+    if (!nodeAdvertisesDurableInbox(sdk)) return;
+
+    const inboxId = this.#inboxClaimant.inboxId;
+    try {
+      const deviceRegistration = await sdk.identity.buildDeviceRegistration();
+      const deviceInboxBinding = await sdk.identity.buildDeviceInboxBinding({ inboxId });
+      await sdk.devices.bind({ deviceRegistration, deviceInboxBinding });
+    } catch (err) {
+      this.logger.error("ServerRuntimeService.#registerDeviceBind device.bind failed", {
+        inboxId,
+        code: err && err.code ? err.code : null,
+        message: err && err.message ? err.message : String(err),
+      });
+    }
   }
 
   #resolveNodeIdentity() {
