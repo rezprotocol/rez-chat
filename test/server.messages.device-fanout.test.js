@@ -42,7 +42,7 @@ function makeHarness({ multiDeviceFanout = false, deviceSet = null } = {}) {
     },
   };
   const svc = new ServerMessagesService({ bus, threadStore, threadIndex, groupStore, ownerAccountId: OWNER, clock: () => 1000 });
-  return { svc, calls };
+  return { svc, calls, sdk };
 }
 
 test("gate CLOSED: a DM send uses the legacy single-device sealForPeer (no per-device fan-out)", async () => {
@@ -79,4 +79,31 @@ test("gate OPEN but the peer published NO device set: falls back to the legacy p
   await svc.sendMessage({ threadId: THREAD_ID, payload: { text: "hello" } });
   assert.equal(calls.sealForPeerDevice.length, 0);
   assert.equal(calls.sealForPeer.length, 1, "no resolvable device set ⇒ legacy single-device send");
+});
+
+test("gate OPEN: a partial fan-out (one device's dispatch fails) is NOT reported as success (Audit P1)", async () => {
+  const deviceSet = {
+    deviceSetRecord: { devices: [
+      { deviceId: "rez:dev:1", devicePublicKeyB64: "k1", inboxId: "inbox:dev1" },
+      { deviceId: "rez:dev:2", devicePublicKeyB64: "k2", inboxId: "inbox:dev2" },
+    ] },
+    established: [],
+  };
+  const { svc, calls, sdk } = makeHarness({ multiDeviceFanout: true, deviceSet });
+  // Make the second device's dispatch throw (a transient network failure before
+  // the node could queue it — so the node will never retry it).
+  sdk.mesh.dispatch = async (object, address) => {
+    calls.dispatch.push({ object, address });
+    if (address && address.inboxId === "inbox:dev2") throw new Error("network down");
+    return { queued: false };
+  };
+  // The send must surface a failure (DEVICE_FANOUT_INCOMPLETE), not silently
+  // report the message as sent because dev1 succeeded.
+  await assert.rejects(
+    () => svc.sendMessage({ threadId: THREAD_ID, payload: { text: "hello" } }),
+    (err) => /fan-out incomplete/.test(err.message) || err.code === "DEVICE_FANOUT_INCOMPLETE",
+  );
+  // Both devices were attempted; dev1's deposit did go out (the durable home
+  // dedups it on retry), so no double-deliver risk.
+  assert.equal(calls.sealForPeerDevice.length, 2, "both devices attempted");
 });

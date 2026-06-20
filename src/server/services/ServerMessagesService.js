@@ -663,7 +663,9 @@ export class ServerMessagesService extends BaseServerService {
 
     let sentCount = 0;
     let queuedCount = 0;
+    let failedCount = 0;
     const queuedInboxIds = [];
+    const failedReasons = [];
     for (const r of results) {
       if (r.status === "fulfilled") {
         if (r.value && r.value.queued === true) {
@@ -675,8 +677,28 @@ export class ServerMessagesService extends BaseServerService {
           sentCount++;
         }
       } else {
-        this.logger.error("[ServerMessagesService] per-device send failed", r.reason && r.reason.message ? r.reason.message : r.reason);
+        failedCount++;
+        const reason = r.reason && r.reason.message ? r.reason.message : String(r.reason);
+        failedReasons.push(reason);
+        this.logger.error("[ServerMessagesService] per-device send failed", reason);
       }
+    }
+    // A fan-out that could NOT reach every device is not a success — reporting
+    // "sent" because one of N devices succeeded silently loses the message for
+    // the others (Audit P1). A device that the node QUEUED (queued:true) is
+    // retried by the node's PersistentOutboundQueue, but a device whose dispatch
+    // THREW is not. So fail the whole send when any device threw: the caller's
+    // send-failure path surfaces it + retries, and the durable home dedups the
+    // already-delivered devices on a content hash, so the retry re-fans-out
+    // safely (no double-deliver). Mirrors the single-device path, where a thrown
+    // dispatch fails the send.
+    if (failedCount > 0) {
+      const err = new Error("per-device fan-out incomplete: " + failedCount + "/" + devices.length
+        + " device(s) failed (" + failedReasons.join("; ") + ")");
+      err.code = "DEVICE_FANOUT_INCOMPLETE";
+      err.failedCount = failedCount;
+      err.deviceCount = devices.length;
+      throw err;
     }
     return { sentCount, queuedCount, queuedInboxIds, deviceCount: devices.length };
   }
