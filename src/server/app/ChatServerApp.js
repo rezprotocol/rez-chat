@@ -1,4 +1,4 @@
-import { ThreadStoreService, ThreadIndexService, ContactStore, ConnectRequestStore, GroupStore, ChannelStore, LinkPreviewStore } from "../storage/index.js";
+import { ThreadStoreService, ThreadIndexService, ContactStore, ConnectRequestStore, GroupStore, ChannelStore, LinkPreviewStore, DeviceFanoutCacheStore } from "../storage/index.js";
 import { ChatServerBus } from "./ChatServerBus.js";
 import { ChatBridge } from "../transport/ChatBridge.js";
 import { InboundDepositPipeline } from "../runtime/InboundDepositPipeline.js";
@@ -185,6 +185,14 @@ export class ChatServerApp {
       storageProvider,
       clock: this.#clock,
     });
+    // Durable per-(messageId, peerDeviceId) sealed-ciphertext cache so a send
+    // retry — including one after a sender restart — replays identical bytes
+    // instead of re-encrypting (Audit R3 #4). Only exercised on the gated
+    // per-device fan-out path; harmless (untouched) on fs / DO-relay nodes.
+    this.bus.stores.deviceFanoutStore = new DeviceFanoutCacheStore({
+      storageProvider,
+      clock: this.#clock,
+    });
     this.bus.stores.globalGroupLookup = new GlobalGroupLookup({
       groupStore: this.bus.stores.groupStore,
     });
@@ -223,6 +231,7 @@ export class ChatServerApp {
         threadStore: this.bus.stores.threadStore,
         threadIndex: this.bus.stores.threadIndex,
         groupStore: this.bus.stores.groupStore,
+        deviceFanoutStore: this.bus.stores.deviceFanoutStore,
         ownerAccountId: this.#ownerAccountId,
         clock,
         logger,

@@ -1,6 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ServerMessagesService } from "../src/server/services/ServerMessagesService.js";
+import { DeviceFanoutCacheStore } from "../src/server/storage/DeviceFanoutCacheStore.js";
+
+// An in-memory KV that clones on write (mimics the real FS/pg KV's JSON
+// round-trip), so the durable device-fanout cache is exercised faithfully and a
+// non-JSON-safe regression would surface.
+function makeStorageProvider() {
+  const m = new Map();
+  const kv = {
+    async get(k) { return m.has(k) ? JSON.parse(m.get(k)) : undefined; },
+    async set(k, v) { m.set(k, JSON.stringify(v)); },
+    async delete(k) { return m.delete(k); },
+    async keys(prefix) { const o = []; for (const k of m.keys()) if (!prefix || k.startsWith(prefix)) o.push(k); return o; },
+  };
+  return { getKeyValueStore() { return kv; } };
+}
 
 // S2.5 Slice 5 leaf 2 — the GATED per-device sender fan-out DECISION. Drives the
 // public sendMessage for a DM thread and asserts:
@@ -15,12 +30,20 @@ const OWNER = "rez:acct:owner";
 const PEER = "rez:acct:peer";
 const THREAD_ID = "th_owner_peer_direct";
 
-function makeHarness({ multiDeviceFanout = false, deviceSet = null } = {}) {
+function makeHarness({ multiDeviceFanout = false, deviceSet = null, storageProvider = makeStorageProvider() } = {}) {
   const calls = { sealForPeer: [], sealForPeerDevice: [], dispatch: [] };
   const sdk = {
     getIdentity: () => ({ localInboxId: "inbox:owner" }),
     sealForPeer: async (a) => { calls.sealForPeer.push(a); return { object: { sf: true }, address: { inboxId: a.deliverInboxId } }; },
-    sealForPeerDevice: async (a) => { calls.sealForPeerDevice.push(a); return { object: { sfd: true }, address: { inboxId: a.deliverInboxId } }; },
+    // Mirror the real sealForPeerDevice shape so the durable cache round-trips
+    // faithfully: object carries Uint8Array payloadBytes + plain metadata.
+    sealForPeerDevice: async (a) => {
+      calls.sealForPeerDevice.push(a);
+      return {
+        object: { payloadBytes: new TextEncoder().encode("ct-" + a.peerDeviceId), metadata: { peerDeviceId: a.peerDeviceId }, capChain: null },
+        address: { inboxId: a.deliverInboxId },
+      };
+    },
     mesh: { dispatch: async (object, address) => { calls.dispatch.push({ object, address }); return { queued: false }; } },
   };
   const threadStore = {
@@ -41,8 +64,9 @@ function makeHarness({ multiDeviceFanout = false, deviceSet = null } = {}) {
       return Promise.resolve(null);
     },
   };
-  const svc = new ServerMessagesService({ bus, threadStore, threadIndex, groupStore, ownerAccountId: OWNER, clock: () => 1000 });
-  return { svc, calls, sdk };
+  const deviceFanoutStore = new DeviceFanoutCacheStore({ storageProvider, clock: () => 1000 });
+  const svc = new ServerMessagesService({ bus, threadStore, threadIndex, groupStore, deviceFanoutStore, ownerAccountId: OWNER, clock: () => 1000 });
+  return { svc, calls, sdk, storageProvider };
 }
 
 test("gate CLOSED: a DM send uses the legacy single-device sealForPeer (no per-device fan-out)", async () => {
@@ -147,4 +171,42 @@ test("Audit R2 #4: a retry replays cached ciphertext only to the FAILED device �
   assert.equal(calls.dispatch.length, 3, "retry re-dispatched ONLY the failed device (2 + 1)");
   const dev1Dispatches = calls.dispatch.filter((d) => d.address && d.address.inboxId === "inbox:dev1").length;
   assert.equal(dev1Dispatches, 1, "the delivered device was NOT re-dispatched (no double receive-ratchet advance)");
+});
+
+test("Audit R3 #4: a retry AFTER a sender RESTART replays the cached ciphertext — no re-encrypt", async () => {
+  const deviceSet = {
+    deviceSetRecord: { devices: [
+      { deviceId: "rez:dev:1", devicePublicKeyB64: "k1", inboxId: "inbox:dev1" },
+      { deviceId: "rez:dev:2", devicePublicKeyB64: "k2", inboxId: "inbox:dev2" },
+    ] },
+    established: [],
+  };
+  // The durable store is the ONLY state shared across the simulated restart.
+  const sp = makeStorageProvider();
+
+  // --- Process 1: dev1 delivers, dev2's dispatch throws ⇒ the send fails. ---
+  const h1 = makeHarness({ multiDeviceFanout: true, deviceSet, storageProvider: sp });
+  h1.sdk.mesh.dispatch = async (object, address) => {
+    h1.calls.dispatch.push({ object, address });
+    if (address && address.inboxId === "inbox:dev2") throw new Error("network down");
+    return { queued: false };
+  };
+  await assert.rejects(
+    () => h1.svc.sendMessage({ threadId: THREAD_ID, messageId: "msg-restart", payload: { text: "hello" } }),
+    (err) => err.code === "DEVICE_FANOUT_INCOMPLETE" || /fan-out incomplete/.test(err.message),
+  );
+  assert.equal(h1.calls.sealForPeerDevice.length, 2, "process 1 sealed both devices once");
+
+  // --- SIMULATED RESTART: a brand-new service over the SAME durable store. The
+  // in-memory Map is gone; only the persisted ciphertext + delivered marks remain.
+  const h2 = makeHarness({ multiDeviceFanout: true, deviceSet, storageProvider: sp });
+  // dev2 now succeeds.
+  await h2.svc.sendMessage({ threadId: THREAD_ID, messageId: "msg-restart", payload: { text: "hello" } });
+
+  assert.equal(h2.calls.sealForPeerDevice.length, 0,
+    "the restarted process re-encrypted NOTHING — it replayed the persisted bytes / honored the persisted delivered mark");
+  const dev1After = h2.calls.dispatch.filter((d) => d.address && d.address.inboxId === "inbox:dev1").length;
+  const dev2After = h2.calls.dispatch.filter((d) => d.address && d.address.inboxId === "inbox:dev2").length;
+  assert.equal(dev1After, 0, "the already-delivered device is skipped after restart (persisted deliveredOk)");
+  assert.equal(dev2After, 1, "only the previously-failed device is re-dispatched, replaying its cached ciphertext");
 });

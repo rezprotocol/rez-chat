@@ -57,24 +57,22 @@ export class ServerMessagesService extends BaseServerService {
   #queuedByInbox = new Map();
   #queueTracking = new Map();
   #outboundStatusUnsubscribe = null;
-  // Per-(messageId, peerDeviceId) sealed-ciphertext cache for gated per-device
-  // fan-out (Audit R2 #4). Re-encrypting a device on a send retry advances that
-  // device's ratchet AGAIN — duplicating to already-delivered devices and burning
-  // the failed device's skip tolerance. So we encrypt ONCE per device per message
-  // and, on a retry of the SAME messageId, replay the identical bytes ONLY to
-  // devices not yet delivered (re-dispatching to a delivered device would
-  // double-advance its receive ratchet → decrypt-fail). Bounded by TTL + size;
-  // entries are transient in-flight state, not durable.
-  //   key `${messageId}::${peerDeviceId}` → { sealed, deliveredOk, createdAtMs }
-  #deviceFanoutCache = new Map();
-  static #DEVICE_FANOUT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-  static #DEVICE_FANOUT_CACHE_MAX = 4096;
+  // DURABLE per-(messageId, peerDeviceId) sealed-ciphertext cache (injected
+  // DeviceFanoutCacheStore) for gated per-device fan-out. Re-encrypting a device
+  // on a send retry advances that device's ratchet AGAIN — duplicating to
+  // already-delivered devices and burning the failed device's skip tolerance. So
+  // we encrypt ONCE per device per message and, on a retry of the SAME messageId,
+  // replay the identical bytes ONLY to devices not yet delivered. Persisting it
+  // means a retry AFTER A SENDER RESTART (recovery re-send) replays too, instead
+  // of re-encrypting from a fresh ratchet position. Audit R2 #4 + R3 #4.
+  #deviceFanoutStore;
 
   constructor({
     bus,
     threadStore,
     threadIndex,
     groupStore,
+    deviceFanoutStore,
     ownerAccountId,
     clock = () => Date.now(),
     logger = console,
@@ -83,9 +81,13 @@ export class ServerMessagesService extends BaseServerService {
     if (!threadStore || !threadIndex || !groupStore) {
       throw new Error("ServerMessagesService requires thread/index/group stores");
     }
+    if (!deviceFanoutStore || typeof deviceFanoutStore.get !== "function") {
+      throw new Error("ServerMessagesService requires a deviceFanoutStore");
+    }
     this.#threadStore = threadStore;
     this.#threadIndex = threadIndex;
     this.#groupStore = groupStore;
+    this.#deviceFanoutStore = deviceFanoutStore;
     this.#clock = clock;
     this.#queuedMessages = [];
     this._register("thread.messages", "list", (payload) => this.listMessages(payload));
@@ -100,6 +102,11 @@ export class ServerMessagesService extends BaseServerService {
   async start() {
     await this.#recoverQueuedMessages().catch((err) => {
       this.logger.error("[ServerMessagesService] queued message recovery failed", err && err.message ? err.message : err);
+    });
+    // Best-effort: sweep device-fanout cache entries that aged out while the
+    // process was down so the durable store can't accumulate them.
+    await this.#deviceFanoutStore.prune().catch((err) => {
+      this.logger.error("[ServerMessagesService] device-fanout cache prune failed", err && err.message ? err.message : err);
     });
     const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
     if (sdk && sdk.subscriptions && typeof sdk.subscriptions.onEvent === "function") {
@@ -668,7 +675,7 @@ export class ServerMessagesService extends BaseServerService {
         throw new Error("device set entry missing deviceId/inboxId");
       }
       const cacheKey = cacheKeyFor(peerDeviceId);
-      const cached = cacheKey ? this.#deviceFanoutCache.get(cacheKey) : null;
+      const cached = cacheKey ? await this.#deviceFanoutStore.get(cacheKey) : null;
       // Already delivered on a prior attempt (Audit R2 #4): do NOT re-encrypt OR
       // re-dispatch. Re-dispatching identical ratchet bytes would double-advance
       // the recipient's receive ratchet and fail to decrypt — and re-encrypting
@@ -676,8 +683,9 @@ export class ServerMessagesService extends BaseServerService {
       if (cached && cached.deliveredOk) {
         return { alreadyDelivered: true };
       }
-      // Reuse the ciphertext sealed on a prior (failed) attempt, else seal ONCE
-      // and cache it — so the device ratchet advances exactly once for this
+      // Reuse the ciphertext sealed on a prior (failed) attempt — durably, so
+      // even a retry after a sender restart replays it (Audit R3 #4) — else seal
+      // ONCE and persist it, so the device ratchet advances exactly once for this
       // message no matter how many times the send is retried.
       let sealed = cached && cached.sealed ? cached.sealed : null;
       if (!sealed) {
@@ -689,7 +697,7 @@ export class ServerMessagesService extends BaseServerService {
           receiptInboxId: localInboxId || undefined,
           deviceHandshakeData: handshakeByDevice.has(peerDeviceId) ? handshakeByDevice.get(peerDeviceId) : null,
         });
-        if (cacheKey) this.#cacheDeviceFanout(cacheKey, sealed);
+        if (cacheKey) await this.#deviceFanoutStore.put(cacheKey, sealed);
       }
       const dispatch = await sdk.mesh.dispatch(sealed.object, sealed.address);
       return { dispatch, cacheKey };
@@ -700,6 +708,7 @@ export class ServerMessagesService extends BaseServerService {
     let failedCount = 0;
     const queuedInboxIds = [];
     const failedReasons = [];
+    const delivered = [];
     for (const r of results) {
       if (r.status === "fulfilled") {
         const value = r.value || {};
@@ -707,10 +716,8 @@ export class ServerMessagesService extends BaseServerService {
         // Mark delivered so a later retry of this messageId skips the device.
         // A queued device is also "handled" — the node's PersistentOutboundQueue
         // retries it WITHOUT re-encryption, so the chat must not re-dispatch it.
-        if (value.cacheKey) {
-          const entry = this.#deviceFanoutCache.get(value.cacheKey);
-          if (entry) entry.deliveredOk = true;
-        }
+        // Persisted below (after the loop) so the skip survives a sender restart.
+        if (value.cacheKey) delivered.push(value.cacheKey);
         const dispatch = value.dispatch;
         if (dispatch && dispatch.queued === true) {
           queuedCount++;
@@ -726,6 +733,13 @@ export class ServerMessagesService extends BaseServerService {
         failedReasons.push(reason);
         this.logger.error("[ServerMessagesService] per-device send failed", reason);
       }
+    }
+    // Persist the delivered marks BEFORE any incomplete-fan-out throw: a partial
+    // fan-out throws to trigger a retry, and the retry must skip the devices that
+    // already succeeded (durably, so a sender restart between attempts still
+    // skips them) rather than re-encrypt + re-deliver to them.
+    for (const cacheKey of delivered) {
+      await this.#deviceFanoutStore.markDelivered(cacheKey);
     }
     // A fan-out that could NOT reach every device is not a success — reporting
     // "sent" because one of N devices succeeded silently loses the message for
@@ -746,27 +760,6 @@ export class ServerMessagesService extends BaseServerService {
       throw err;
     }
     return { sentCount, queuedCount, queuedInboxIds, deviceCount: devices.length };
-  }
-
-  /**
-   * Cache one device's sealed ciphertext for replay on a send retry (Audit R2
-   * #4). Bounded: a sweep of expired entries + FIFO eviction keeps this transient
-   * in-flight state from growing without limit (entries are never persisted).
-   */
-  #cacheDeviceFanout(key, sealed) {
-    const now = this.#clock();
-    if (this.#deviceFanoutCache.size >= ServerMessagesService.#DEVICE_FANOUT_CACHE_MAX) {
-      const ttl = ServerMessagesService.#DEVICE_FANOUT_CACHE_TTL_MS;
-      for (const [k, v] of this.#deviceFanoutCache) {
-        if (now - v.createdAtMs > ttl) this.#deviceFanoutCache.delete(k);
-      }
-      while (this.#deviceFanoutCache.size >= ServerMessagesService.#DEVICE_FANOUT_CACHE_MAX) {
-        const oldest = this.#deviceFanoutCache.keys().next().value;
-        if (oldest === undefined) break;
-        this.#deviceFanoutCache.delete(oldest);
-      }
-    }
-    this.#deviceFanoutCache.set(key, { sealed, deliveredOk: false, createdAtMs: now });
   }
 
   /**

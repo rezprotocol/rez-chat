@@ -6,3 +6,4 @@ export { GroupStore } from "./ChatGroupStore.js";
 export { ChannelStore } from "./ChatChannelStore.js";
 export { BackupStoreService } from "./ChatBackupStore.js";
 export { LinkPreviewStore } from "./LinkPreviewStore.js";
+export { DeviceFanoutCacheStore } from "./DeviceFanoutCacheStore.js";
