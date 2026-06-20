@@ -175,7 +175,7 @@ export async function startRezChat(options = {}) {
      * `chatServerIdentity` MUST come from `DesktopVaultService.getChatServerIdentity()`
      * — that's the only source that derives it from the user's mnemonic.
      */
-    async startChatServer({ chatServerIdentity = null, allowChatServerIdentityRotation = false } = {}) {
+    async startChatServer({ chatServerIdentity = null, deviceKey = null, allowChatServerIdentityRotation = false } = {}) {
       if (chatServerState) return chatServerState;
       if (!chatServerIdentity || !chatServerIdentity.accountId || !chatServerIdentity.publicKeyB64 || !chatServerIdentity.privateKeyB64) {
         throw new Error("startChatServer requires chatServerIdentity with accountId/publicKeyB64/privateKeyB64");
@@ -185,6 +185,10 @@ export async function startRezChat(options = {}) {
         wsUrl,
         expectedNodePublicKeyB64,
         expectedChatServerIdentity: chatServerIdentity,
+        // S2.5: this device's key (C) for per-device E2EE. Optional — a vault
+        // predating device-key persistence yields null and the chat server runs
+        // the legacy single-device path.
+        deviceKey,
         allowChatServerIdentityRotation: allowChatServerIdentityRotation === true,
       });
       await bootstrapped.chatServer.start();

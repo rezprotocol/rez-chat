@@ -350,6 +350,11 @@ export class DesktopVaultService {
       profileName: resolvedName,
       identityPublicKey: unlocked.identityPublicKey,
       identityKeyPair: cloneJson(unlocked.identityKeyPair),
+      // The device-local key (C) for per-device E2EE (S2.5). Self-certifying
+      // deviceId = sha256(devicePub). Threaded into the chat server to serve as
+      // this device's per-device X3DH signing identity (rooted in the chat-server
+      // identity B via DeviceRegistrationV1).
+      deviceKeyPair: unlocked.deviceKeyPair ? cloneJson(unlocked.deviceKeyPair) : null,
       appDataKeyBytes,
       chatServerIdentity,
     };
@@ -591,6 +596,21 @@ export class DesktopVaultService {
       accountId: ident.accountId,
       publicKeyB64: ident.publicKeyB64,
       privateKeyB64: ident.privateKeyB64,
+    };
+  }
+
+  /**
+   * The active account's device-local key (C) + self-certifying deviceId, for
+   * per-device E2EE (S2.5). Null for a vault that predates device-key
+   * persistence (the chat server then runs the legacy single-device path).
+   */
+  getActiveDeviceKey() {
+    if (!this.#activeAccount) return null;
+    const dk = this.#activeAccount.deviceKeyPair;
+    if (!dk || !dk.publicKeyB64 || !dk.privateKeyB64) return null;
+    return {
+      deviceId: this.#activeAccount.deviceId,
+      deviceKeyPair: { publicKeyB64: dk.publicKeyB64, privateKeyB64: dk.privateKeyB64 },
     };
   }
 

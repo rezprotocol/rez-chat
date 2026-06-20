@@ -132,6 +132,7 @@ export async function bootstrapChatServer({
   expectedNodePublicKeyB64 = "",
   logger = console,
   expectedChatServerIdentity = null,
+  deviceKey = null,
   allowChatServerIdentityRotation = false,
 } = {}) {
   if (typeof nodeDataDir !== "string" || nodeDataDir.trim().length === 0) {
@@ -200,6 +201,12 @@ export async function bootstrapChatServer({
     inviteBinding: { mailboxId: inboxClaimant.inboxId, capabilityId: inboxClaimant.inboxId },
     cryptoProvider,
     inboxClaimantSigner: inboxClaimant.createCapabilitySigner(),
+    // S2.5 per-device E2EE: this device's key (C), rooted in the chat-server
+    // identity B. When present, PeerLinkService can run per-device sessions; the
+    // E6 fan-out gate keeps the default send path single-device until Slice 8.
+    // Absent (legacy/web vault) ⇒ legacy single-device path, unchanged.
+    deviceKeyPair: deviceKey && deviceKey.deviceKeyPair ? deviceKey.deviceKeyPair : null,
+    deviceId: deviceKey && deviceKey.deviceId ? deviceKey.deviceId : null,
   });
 
   await selfProvisionAccountBinding({

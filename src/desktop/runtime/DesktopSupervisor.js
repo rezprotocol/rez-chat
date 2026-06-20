@@ -298,8 +298,12 @@ export class DesktopSupervisor {
       // mnemonic-derived identity instead of throwing on mismatch. Once
       // Phase 6's pre-BIP39 wipe lands at launch time, this can tighten to
       // false in steady-state.
+      const deviceKey = typeof this.#vault.getActiveDeviceKey === "function"
+        ? this.#vault.getActiveDeviceKey()
+        : null;
       await this.#chatApp.startChatServer({
         chatServerIdentity,
+        deviceKey,
         allowChatServerIdentityRotation: true,
       });
       chatServerStarted = true;
