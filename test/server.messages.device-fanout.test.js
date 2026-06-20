@@ -107,3 +107,44 @@ test("gate OPEN: a partial fan-out (one device's dispatch fails) is NOT reported
   // dedups it on retry), so no double-deliver risk.
   assert.equal(calls.sealForPeerDevice.length, 2, "both devices attempted");
 });
+
+test("Audit R2 #4: a retry replays cached ciphertext only to the FAILED device — no re-encrypt, no re-dispatch to delivered", async () => {
+  const deviceSet = {
+    deviceSetRecord: { devices: [
+      { deviceId: "rez:dev:1", devicePublicKeyB64: "k1", inboxId: "inbox:dev1" },
+      { deviceId: "rez:dev:2", devicePublicKeyB64: "k2", inboxId: "inbox:dev2" },
+    ] },
+    established: [],
+  };
+  const { svc, calls, sdk } = makeHarness({ multiDeviceFanout: true, deviceSet });
+  let dev2Attempts = 0;
+  sdk.mesh.dispatch = async (object, address) => {
+    calls.dispatch.push({ object, address });
+    if (address && address.inboxId === "inbox:dev2") {
+      dev2Attempts += 1;
+      if (dev2Attempts === 1) throw new Error("network down"); // fail once, then succeed
+    }
+    return { queued: false };
+  };
+
+  // First attempt: dev2's dispatch throws ⇒ the whole send fails.
+  await assert.rejects(
+    () => svc.sendMessage({ threadId: THREAD_ID, messageId: "msg-retry", payload: { text: "hello" } }),
+    (err) => err.code === "DEVICE_FANOUT_INCOMPLETE" || /fan-out incomplete/.test(err.message),
+  );
+  assert.equal(calls.sealForPeerDevice.length, 2, "first attempt sealed both devices once");
+  assert.equal(calls.dispatch.length, 2, "first attempt dispatched both (dev2 threw)");
+
+  // Retry the SAME messageId: dev1 is already delivered (skip — no re-seal, no
+  // re-dispatch); dev2 replays its CACHED ciphertext (no re-seal) and now succeeds.
+  await svc.sendMessage({ threadId: THREAD_ID, messageId: "msg-retry", payload: { text: "hello" } });
+
+  assert.equal(calls.sealForPeerDevice.length, 2, "NO re-encryption on retry (still 2 total seals)");
+  const dev1Seals = calls.sealForPeerDevice.filter((a) => a.peerDeviceId === "rez:dev:1").length;
+  const dev2Seals = calls.sealForPeerDevice.filter((a) => a.peerDeviceId === "rez:dev:2").length;
+  assert.equal(dev1Seals, 1, "dev1 sealed exactly once across both attempts");
+  assert.equal(dev2Seals, 1, "dev2 sealed exactly once (retry replayed the cached bytes)");
+  assert.equal(calls.dispatch.length, 3, "retry re-dispatched ONLY the failed device (2 + 1)");
+  const dev1Dispatches = calls.dispatch.filter((d) => d.address && d.address.inboxId === "inbox:dev1").length;
+  assert.equal(dev1Dispatches, 1, "the delivered device was NOT re-dispatched (no double receive-ratchet advance)");
+});

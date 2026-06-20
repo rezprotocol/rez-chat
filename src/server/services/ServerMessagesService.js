@@ -57,6 +57,18 @@ export class ServerMessagesService extends BaseServerService {
   #queuedByInbox = new Map();
   #queueTracking = new Map();
   #outboundStatusUnsubscribe = null;
+  // Per-(messageId, peerDeviceId) sealed-ciphertext cache for gated per-device
+  // fan-out (Audit R2 #4). Re-encrypting a device on a send retry advances that
+  // device's ratchet AGAIN — duplicating to already-delivered devices and burning
+  // the failed device's skip tolerance. So we encrypt ONCE per device per message
+  // and, on a retry of the SAME messageId, replay the identical bytes ONLY to
+  // devices not yet delivered (re-dispatching to a delivered device would
+  // double-advance its receive ratchet → decrypt-fail). Bounded by TTL + size;
+  // entries are transient in-flight state, not durable.
+  //   key `${messageId}::${peerDeviceId}` → { sealed, deliveredOk, createdAtMs }
+  #deviceFanoutCache = new Map();
+  static #DEVICE_FANOUT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+  static #DEVICE_FANOUT_CACHE_MAX = 4096;
 
   constructor({
     bus,
@@ -548,6 +560,7 @@ export class ServerMessagesService extends BaseServerService {
           groupId: threadGroupId,
           plaintextBodyBytes,
           localInboxId,
+          messageId: eventTag,
         });
         if (fanOut.sentCount > 0) return { eventId: "gw:" + now + ":" + eventTag, queued: false, queuedInboxIds: [] };
         if (fanOut.queuedCount > 0) return { eventId: "", queued: true, queuedInboxIds: fanOut.queuedInboxIds };
@@ -573,6 +586,7 @@ export class ServerMessagesService extends BaseServerService {
         peerAccountId,
         plaintextBodyBytes,
         localInboxId,
+        messageId: eventTag,
       });
       if (fanned) {
         if (fanned.sentCount > 0) return { eventId: "gw:" + now + ":" + eventTag, queued: false, queuedInboxIds: [] };
@@ -620,7 +634,7 @@ export class ServerMessagesService extends BaseServerService {
    * byte-for-byte unchanged.
    * @returns {Promise<{sentCount, queuedCount, queuedInboxIds, deviceCount}|null>}
    */
-  async #fanOutToPeerDevices({ sdk, peerAccountId, plaintextBodyBytes, localInboxId } = {}) {
+  async #fanOutToPeerDevices({ sdk, peerAccountId, plaintextBodyBytes, localInboxId, messageId = "" } = {}) {
     if (!this.bus.runtime || this.bus.runtime.multiDeviceFanout !== true) return null;
     if (!sdk || typeof sdk.sealForPeerDevice !== "function" || !sdk.mesh) return null;
     const peer = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
@@ -645,20 +659,40 @@ export class ServerMessagesService extends BaseServerService {
       }
     }
 
-    const results = await Promise.allSettled(devices.map((device) => {
+    const cacheKeyFor = (deviceId) => (messageId ? messageId + "::" + deviceId : "");
+
+    const results = await Promise.allSettled(devices.map(async (device) => {
       const peerDeviceId = device && typeof device.deviceId === "string" ? device.deviceId.trim() : "";
       const deliverInboxId = device && typeof device.inboxId === "string" ? device.inboxId.trim() : "";
       if (!peerDeviceId || !deliverInboxId) {
-        return Promise.reject(new Error("device set entry missing deviceId/inboxId"));
+        throw new Error("device set entry missing deviceId/inboxId");
       }
-      return sdk.sealForPeerDevice({
-        peerAccountId: peer,
-        peerDeviceId,
-        deliverInboxId,
-        plaintextBodyBytes,
-        receiptInboxId: localInboxId || undefined,
-        deviceHandshakeData: handshakeByDevice.has(peerDeviceId) ? handshakeByDevice.get(peerDeviceId) : null,
-      }).then((sealed) => sdk.mesh.dispatch(sealed.object, sealed.address));
+      const cacheKey = cacheKeyFor(peerDeviceId);
+      const cached = cacheKey ? this.#deviceFanoutCache.get(cacheKey) : null;
+      // Already delivered on a prior attempt (Audit R2 #4): do NOT re-encrypt OR
+      // re-dispatch. Re-dispatching identical ratchet bytes would double-advance
+      // the recipient's receive ratchet and fail to decrypt — and re-encrypting
+      // would advance OUR send ratchet a second time. Report it as already sent.
+      if (cached && cached.deliveredOk) {
+        return { alreadyDelivered: true };
+      }
+      // Reuse the ciphertext sealed on a prior (failed) attempt, else seal ONCE
+      // and cache it — so the device ratchet advances exactly once for this
+      // message no matter how many times the send is retried.
+      let sealed = cached && cached.sealed ? cached.sealed : null;
+      if (!sealed) {
+        sealed = await sdk.sealForPeerDevice({
+          peerAccountId: peer,
+          peerDeviceId,
+          deliverInboxId,
+          plaintextBodyBytes,
+          receiptInboxId: localInboxId || undefined,
+          deviceHandshakeData: handshakeByDevice.has(peerDeviceId) ? handshakeByDevice.get(peerDeviceId) : null,
+        });
+        if (cacheKey) this.#cacheDeviceFanout(cacheKey, sealed);
+      }
+      const dispatch = await sdk.mesh.dispatch(sealed.object, sealed.address);
+      return { dispatch, cacheKey };
     }));
 
     let sentCount = 0;
@@ -668,10 +702,20 @@ export class ServerMessagesService extends BaseServerService {
     const failedReasons = [];
     for (const r of results) {
       if (r.status === "fulfilled") {
-        if (r.value && r.value.queued === true) {
+        const value = r.value || {};
+        if (value.alreadyDelivered) { sentCount++; continue; }
+        // Mark delivered so a later retry of this messageId skips the device.
+        // A queued device is also "handled" — the node's PersistentOutboundQueue
+        // retries it WITHOUT re-encryption, so the chat must not re-dispatch it.
+        if (value.cacheKey) {
+          const entry = this.#deviceFanoutCache.get(value.cacheKey);
+          if (entry) entry.deliveredOk = true;
+        }
+        const dispatch = value.dispatch;
+        if (dispatch && dispatch.queued === true) {
           queuedCount++;
-          if (r.value && typeof r.value.mailboxId === "string" && r.value.mailboxId.trim().length > 0) {
-            queuedInboxIds.push(r.value.mailboxId.trim());
+          if (typeof dispatch.mailboxId === "string" && dispatch.mailboxId.trim().length > 0) {
+            queuedInboxIds.push(dispatch.mailboxId.trim());
           }
         } else {
           sentCount++;
@@ -688,10 +732,11 @@ export class ServerMessagesService extends BaseServerService {
     // the others (Audit P1). A device that the node QUEUED (queued:true) is
     // retried by the node's PersistentOutboundQueue, but a device whose dispatch
     // THREW is not. So fail the whole send when any device threw: the caller's
-    // send-failure path surfaces it + retries, and the durable home dedups the
-    // already-delivered devices on a content hash, so the retry re-fans-out
-    // safely (no double-deliver). Mirrors the single-device path, where a thrown
-    // dispatch fails the send.
+    // send-failure path surfaces it + retries. The retry REPLAYS the cached
+    // ciphertext only to the still-undelivered devices (Audit R2 #4) — delivered
+    // devices are skipped and nothing is re-encrypted, so there is no double-
+    // deliver and no extra ratchet advance. Mirrors the single-device path,
+    // where a thrown dispatch fails the send.
     if (failedCount > 0) {
       const err = new Error("per-device fan-out incomplete: " + failedCount + "/" + devices.length
         + " device(s) failed (" + failedReasons.join("; ") + ")");
@@ -704,14 +749,35 @@ export class ServerMessagesService extends BaseServerService {
   }
 
   /**
+   * Cache one device's sealed ciphertext for replay on a send retry (Audit R2
+   * #4). Bounded: a sweep of expired entries + FIFO eviction keeps this transient
+   * in-flight state from growing without limit (entries are never persisted).
+   */
+  #cacheDeviceFanout(key, sealed) {
+    const now = this.#clock();
+    if (this.#deviceFanoutCache.size >= ServerMessagesService.#DEVICE_FANOUT_CACHE_MAX) {
+      const ttl = ServerMessagesService.#DEVICE_FANOUT_CACHE_TTL_MS;
+      for (const [k, v] of this.#deviceFanoutCache) {
+        if (now - v.createdAtMs > ttl) this.#deviceFanoutCache.delete(k);
+      }
+      while (this.#deviceFanoutCache.size >= ServerMessagesService.#DEVICE_FANOUT_CACHE_MAX) {
+        const oldest = this.#deviceFanoutCache.keys().next().value;
+        if (oldest === undefined) break;
+        this.#deviceFanoutCache.delete(oldest);
+      }
+    }
+    this.#deviceFanoutCache.set(key, { sealed, deliveredOk: false, createdAtMs: now });
+  }
+
+  /**
    * Send to ONE group member. Identical to the legacy single-device path
    * (sealForPeer → dispatch) UNLESS the gated per-device fan-out applies, in
    * which case the per-device results are collapsed to one per-member outcome so
    * the group-fan-out accounting is unchanged.
    */
-  async #sendToMember({ sdk, member, plaintextBodyBytes, localInboxId } = {}) {
+  async #sendToMember({ sdk, member, plaintextBodyBytes, localInboxId, messageId = "" } = {}) {
     const peerAccountId = member && typeof member.accountId === "string" ? member.accountId : "";
-    const fanned = await this.#fanOutToPeerDevices({ sdk, peerAccountId, plaintextBodyBytes, localInboxId });
+    const fanned = await this.#fanOutToPeerDevices({ sdk, peerAccountId, plaintextBodyBytes, localInboxId, messageId });
     if (fanned) {
       if (fanned.queuedCount > 0 && fanned.sentCount === 0) {
         return { queued: true, mailboxId: fanned.queuedInboxIds.length > 0 ? fanned.queuedInboxIds[0] : "" };
@@ -777,7 +843,7 @@ export class ServerMessagesService extends BaseServerService {
     }
   }
 
-  async #sendGroupFanOut({ sdk, groupId, plaintextBodyBytes, localInboxId } = {}) {
+  async #sendGroupFanOut({ sdk, groupId, plaintextBodyBytes, localInboxId, messageId = "" } = {}) {
     if (!sdk || typeof sdk.sealForPeer !== "function" || !sdk.mesh) {
       throw new Error("sendGroupFanOut: sdk unavailable");
     }
@@ -799,7 +865,7 @@ export class ServerMessagesService extends BaseServerService {
     // and the member published a device set (then it fans out per device and
     // collapses to one per-member outcome). Gate closed ⇒ identical to before.
     const results = await Promise.allSettled(
-      targets.map((member) => this.#sendToMember({ sdk, member, plaintextBodyBytes, localInboxId })),
+      targets.map((member) => this.#sendToMember({ sdk, member, plaintextBodyBytes, localInboxId, messageId })),
     );
     // Sender-side recovery: a message handed to the mesh for a co-member is now
     // expected to come back as an end-to-end delivery-ack. Record it per recipient
