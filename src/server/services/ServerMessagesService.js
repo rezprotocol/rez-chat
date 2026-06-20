@@ -564,6 +564,22 @@ export class ServerMessagesService extends BaseServerService {
       throw new Error("Cannot deliver to peer-link thread: peer account not resolved");
     }
     try {
+      // S2.5 Slice 5 — GATED per-device fan-out. When the E6 gate is open and
+      // the peer published a device set, encrypt once per device and dispatch to
+      // each device's inbox. Default (gate closed) returns null ⇒ the legacy
+      // single-device sealForPeer below runs unchanged.
+      const fanned = await this.#fanOutToPeerDevices({
+        sdk: resolvedSdk,
+        peerAccountId,
+        plaintextBodyBytes,
+        localInboxId,
+      });
+      if (fanned) {
+        if (fanned.sentCount > 0) return { eventId: "gw:" + now + ":" + eventTag, queued: false, queuedInboxIds: [] };
+        if (fanned.queuedCount > 0) return { eventId: "", queued: true, queuedInboxIds: fanned.queuedInboxIds };
+        return { eventId: "", queued: false, queuedInboxIds: [] };
+      }
+
       // Seal the message for the peer (crypto + inbox resolution), then hand
       // the opaque object to the mesh. The creator names no transport.
       const sealed = await resolvedSdk.sealForPeer({
@@ -592,6 +608,100 @@ export class ServerMessagesService extends BaseServerService {
       if (err && err.queued === true) return { eventId: "", queued: true, queuedInboxIds: peerInboxId ? [peerInboxId] : [] };
       throw err;
     }
+  }
+
+  /**
+   * S2.5 Slice 5 — GATED per-device fan-out. Encrypt the message once per
+   * recipient DEVICE (own session) and dispatch to each device's own inbox.
+   * Returns null (caller falls back to the legacy single-device sealForPeer)
+   * UNLESS the E6 fan-out gate is open AND the peer published a resolvable
+   * device set. The gate (`bus.runtime.multiDeviceFanout`) defaults closed and
+   * flips at Slice 8 — so by default this is a no-op and the shipped path is
+   * byte-for-byte unchanged.
+   * @returns {Promise<{sentCount, queuedCount, queuedInboxIds, deviceCount}|null>}
+   */
+  async #fanOutToPeerDevices({ sdk, peerAccountId, plaintextBodyBytes, localInboxId } = {}) {
+    if (!this.bus.runtime || this.bus.runtime.multiDeviceFanout !== true) return null;
+    if (!sdk || typeof sdk.sealForPeerDevice !== "function" || !sdk.mesh) return null;
+    const peer = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
+    if (!peer) return null;
+
+    let resolved = null;
+    try {
+      resolved = await this._call("device-set", "resolveForPeer", { peerAccountId: peer });
+    } catch (err) {
+      this.logger.error("[ServerMessagesService] device-set resolve failed", err && err.message ? err.message : err);
+      return null;
+    }
+    const devices = resolved && resolved.deviceSetRecord && Array.isArray(resolved.deviceSetRecord.devices)
+      ? resolved.deviceSetRecord.devices
+      : [];
+    if (devices.length === 0) return null;
+
+    const handshakeByDevice = new Map();
+    if (resolved && Array.isArray(resolved.established)) {
+      for (const e of resolved.established) {
+        if (e && typeof e.peerDeviceId === "string") handshakeByDevice.set(e.peerDeviceId, e.handshakeData);
+      }
+    }
+
+    const results = await Promise.allSettled(devices.map((device) => {
+      const peerDeviceId = device && typeof device.deviceId === "string" ? device.deviceId.trim() : "";
+      const deliverInboxId = device && typeof device.inboxId === "string" ? device.inboxId.trim() : "";
+      if (!peerDeviceId || !deliverInboxId) {
+        return Promise.reject(new Error("device set entry missing deviceId/inboxId"));
+      }
+      return sdk.sealForPeerDevice({
+        peerAccountId: peer,
+        peerDeviceId,
+        deliverInboxId,
+        plaintextBodyBytes,
+        receiptInboxId: localInboxId || undefined,
+        deviceHandshakeData: handshakeByDevice.has(peerDeviceId) ? handshakeByDevice.get(peerDeviceId) : null,
+      }).then((sealed) => sdk.mesh.dispatch(sealed.object, sealed.address));
+    }));
+
+    let sentCount = 0;
+    let queuedCount = 0;
+    const queuedInboxIds = [];
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        if (r.value && r.value.queued === true) {
+          queuedCount++;
+          if (r.value && typeof r.value.mailboxId === "string" && r.value.mailboxId.trim().length > 0) {
+            queuedInboxIds.push(r.value.mailboxId.trim());
+          }
+        } else {
+          sentCount++;
+        }
+      } else {
+        this.logger.error("[ServerMessagesService] per-device send failed", r.reason && r.reason.message ? r.reason.message : r.reason);
+      }
+    }
+    return { sentCount, queuedCount, queuedInboxIds, deviceCount: devices.length };
+  }
+
+  /**
+   * Send to ONE group member. Identical to the legacy single-device path
+   * (sealForPeer → dispatch) UNLESS the gated per-device fan-out applies, in
+   * which case the per-device results are collapsed to one per-member outcome so
+   * the group-fan-out accounting is unchanged.
+   */
+  async #sendToMember({ sdk, member, plaintextBodyBytes, localInboxId } = {}) {
+    const peerAccountId = member && typeof member.accountId === "string" ? member.accountId : "";
+    const fanned = await this.#fanOutToPeerDevices({ sdk, peerAccountId, plaintextBodyBytes, localInboxId });
+    if (fanned) {
+      if (fanned.queuedCount > 0 && fanned.sentCount === 0) {
+        return { queued: true, mailboxId: fanned.queuedInboxIds.length > 0 ? fanned.queuedInboxIds[0] : "" };
+      }
+      return { queued: false };
+    }
+    const sealed = await sdk.sealForPeer({
+      peerAccountId,
+      plaintextBodyBytes,
+      receiptInboxId: localInboxId || undefined,
+    });
+    return sdk.mesh.dispatch(sealed.object, sealed.address);
   }
 
   async #deliverMutationPayload({ threadId, wirePayload } = {}) {
@@ -662,15 +772,12 @@ export class ServerMessagesService extends BaseServerService {
     if (targets.length === 0) {
       return { sentCount: 0, failedCount: 0, skippedCount: 0, queuedCount: 0, queuedInboxIds: [] };
     }
+    // S2.5 Slice 5 — each member send goes through #sendToMember, which is the
+    // legacy single-device sealForPeer path UNLESS the E6 fan-out gate is open
+    // and the member published a device set (then it fans out per device and
+    // collapses to one per-member outcome). Gate closed ⇒ identical to before.
     const results = await Promise.allSettled(
-      targets.map((member) => sdk.sealForPeer({
-        peerAccountId: member.accountId,
-        plaintextBodyBytes,
-        receiptInboxId: localInboxId || undefined,
-      }).then((sealed) => sdk.mesh.dispatch(
-        sealed.object,
-        sealed.address,
-      ))),
+      targets.map((member) => this.#sendToMember({ sdk, member, plaintextBodyBytes, localInboxId })),
     );
     // Sender-side recovery: a message handed to the mesh for a co-member is now
     // expected to come back as an end-to-end delivery-ack. Record it per recipient
