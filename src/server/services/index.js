@@ -9,6 +9,7 @@ export { ServerInvitesService } from "./ServerInvitesService.js";
 export { ServerConnectionService } from "./ServerConnectionService.js";
 export { ServerEventService } from "./ServerEventService.js";
 export { ServerPeerLinkProtocolService } from "./ServerPeerLinkProtocolService.js";
+export { ServerDeviceSetService } from "./ServerDeviceSetService.js";
 export { InboxCatchupService } from "./InboxCatchupService.js";
 export { GlobalGroupLookup } from "./GlobalGroupLookup.js";
 export { ServerFileTransferService } from "./ServerFileTransferService.js";

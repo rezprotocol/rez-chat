@@ -16,6 +16,7 @@ import {
   ServerConnectionService,
   ServerEventService,
   ServerPeerLinkProtocolService,
+  ServerDeviceSetService,
   ServerFileTransferService,
   ServerProfileService,
   ServerLinksService,
@@ -289,6 +290,16 @@ export class ChatServerApp {
         logger,
       }),
       peerLinkProtocol: new ServerPeerLinkProtocolService({
+        bus: this.bus,
+        ownerAccountId: this.#ownerAccountId,
+        clock,
+        logger,
+      }),
+      // S2.5 Slice 5: per-device E2EE device-set publish/resolve/respond. A no-op
+      // unless this account runs per-device sessions (a device key is present —
+      // desktop with a v2 keystore). The E6 fan-out gate lives in the sender
+      // (ServerMessagesService), not here.
+      deviceSet: new ServerDeviceSetService({
         bus: this.bus,
         ownerAccountId: this.#ownerAccountId,
         clock,
