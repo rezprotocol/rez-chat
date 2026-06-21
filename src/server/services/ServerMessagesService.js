@@ -666,7 +666,12 @@ export class ServerMessagesService extends BaseServerService {
       }
     }
 
-    const cacheKeyFor = (deviceId) => (messageId ? messageId + "::" + deviceId : "");
+    // The cache slot is the full (owner, peer, message, device) tuple (Audit R4
+    // #7) — never messageId::deviceId alone — so no two owners/peers/messages
+    // collide. A messageId-less send is uncacheable (coords null ⇒ no replay).
+    const coordsFor = (deviceId) => (messageId && deviceId
+      ? { ownerAccountId: this.ownerAccountId, peerAccountId: peer, messageId, peerDeviceId: deviceId }
+      : null);
 
     const results = await Promise.allSettled(devices.map(async (device) => {
       const peerDeviceId = device && typeof device.deviceId === "string" ? device.deviceId.trim() : "";
@@ -674,8 +679,8 @@ export class ServerMessagesService extends BaseServerService {
       if (!peerDeviceId || !deliverInboxId) {
         throw new Error("device set entry missing deviceId/inboxId");
       }
-      const cacheKey = cacheKeyFor(peerDeviceId);
-      const cached = cacheKey ? await this.#deviceFanoutStore.get(cacheKey) : null;
+      const coords = coordsFor(peerDeviceId);
+      const cached = coords ? await this.#deviceFanoutStore.get(coords) : null;
       // Already delivered on a prior attempt (Audit R2 #4): do NOT re-encrypt OR
       // re-dispatch. Re-dispatching identical ratchet bytes would double-advance
       // the recipient's receive ratchet and fail to decrypt — and re-encrypting
@@ -697,10 +702,10 @@ export class ServerMessagesService extends BaseServerService {
           receiptInboxId: localInboxId || undefined,
           deviceHandshakeData: handshakeByDevice.has(peerDeviceId) ? handshakeByDevice.get(peerDeviceId) : null,
         });
-        if (cacheKey) await this.#deviceFanoutStore.put(cacheKey, sealed);
+        if (coords) await this.#deviceFanoutStore.put(coords, sealed);
       }
       const dispatch = await sdk.mesh.dispatch(sealed.object, sealed.address);
-      return { dispatch, cacheKey };
+      return { dispatch, coords };
     }));
 
     let sentCount = 0;
@@ -717,7 +722,7 @@ export class ServerMessagesService extends BaseServerService {
         // A queued device is also "handled" — the node's PersistentOutboundQueue
         // retries it WITHOUT re-encryption, so the chat must not re-dispatch it.
         // Persisted below (after the loop) so the skip survives a sender restart.
-        if (value.cacheKey) delivered.push(value.cacheKey);
+        if (value.coords) delivered.push(value.coords);
         const dispatch = value.dispatch;
         if (dispatch && dispatch.queued === true) {
           queuedCount++;
@@ -738,8 +743,8 @@ export class ServerMessagesService extends BaseServerService {
     // fan-out throws to trigger a retry, and the retry must skip the devices that
     // already succeeded (durably, so a sender restart between attempts still
     // skips them) rather than re-encrypt + re-deliver to them.
-    for (const cacheKey of delivered) {
-      await this.#deviceFanoutStore.markDelivered(cacheKey);
+    for (const coords of delivered) {
+      await this.#deviceFanoutStore.markDelivered(coords);
     }
     // A fan-out that could NOT reach every device is not a success — reporting
     // "sent" because one of N devices succeeded silently loses the message for

@@ -235,9 +235,15 @@ test("Audit R2 #2: a re-PUBLISHED (re-sealed, same revision) set does NOT reset 
   const alice = await makeAccount({ mailboxId: "rez:inbox:alice" });
   const bob = await makeAccount({ mailboxId: "rez:inbox:bob" });
   await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
-  const aliceDeviceSet = makeService(alice, overlay);
-
+  // Alice publishes on the SAME synthetic clock Bob resolves on — otherwise the
+  // set's issuedAtMs (real Date.now) would read as far-future against Bob's tiny
+  // clock and (correctly, Audit R4 #8) be rejected as future-issued.
   let now = 1000;
+  const aliceDeviceSet = new ServerDeviceSetService({
+    bus: makeBus({ peerLinks: alice.svc, sdk: { durableRecords: overlay.double() } }),
+    ownerAccountId: alice.accountId,
+    clock: () => now,
+  });
   const bobDeviceSet = new ServerDeviceSetService({
     bus: makeBus({ peerLinks: bob.svc, sdk: { durableRecords: overlay.double() } }),
     ownerAccountId: bob.accountId,
