@@ -115,7 +115,9 @@ function makeOverlay() {
   const double = () => ({
     async put({ record }) {
       const j = record && typeof record.toJSON === "function" ? record.toJSON() : JSON.parse(JSON.stringify(record));
-      m.set(key(j.publisherPublicKeyB64, j.recordKind, j.recordId), j);
+      // DurableRecordV2 (S8 L5): the OWNER key occupies the publisher position
+      // of the storage coordinate — identical slot math to V1's publisher key.
+      m.set(key(j.ownerPublicKeyB64, j.recordKind, j.recordId), j);
     },
     async get({ recordKind, recordId, publisherPublicKeyB64 }) {
       const v = m.get(key(publisherPublicKeyB64, recordKind, recordId));
