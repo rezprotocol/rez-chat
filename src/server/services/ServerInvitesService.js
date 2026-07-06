@@ -219,14 +219,26 @@ export class ServerInvitesService extends BaseServerService {
       throw err;
     }
 
-    // Substitution safety: the fetched envelope MUST be signed by the same
-    // identity the invite code commits to. The node already bound the record
-    // to publisherPublicKeyB64; this binds the inner envelope's signer too,
-    // so a record publisher cannot wrap a different inviter's envelope.
-    const envelopeSignerPub = envelopeData.envelope.signerRef
-      && typeof envelopeData.envelope.signerRef.signerPublicKeyB64 === "string"
-      ? envelopeData.envelope.signerRef.signerPublicKeyB64 : "";
-    if (envelopeSignerPub !== publisherPublicKeyB64) {
+    // Substitution safety: the fetched envelope MUST belong to the identity
+    // the invite code commits to. The node already bound the record to
+    // publisherPublicKeyB64; this binds the inner envelope too, so a record
+    // publisher cannot wrap a different inviter's envelope. Anchor-aware
+    // (S8 L6): a DELEGATED envelope (non-empty certChain) is signed by a
+    // device key, so compare the ACCOUNT ANCHOR — the binding's account
+    // identity key, which the SDK's acceptInvite verifies the chain roots at —
+    // against the code's committed key. A direct envelope keeps the shipped
+    // signer comparison byte-for-byte.
+    const envelopeIsDelegated = Array.isArray(envelopeData.envelope.certChain)
+      && envelopeData.envelope.certChain.length > 0;
+    const envelopeCommittedPub = envelopeIsDelegated
+      ? (envelopeData.envelope.binding
+          && envelopeData.envelope.binding.x3dh
+          && typeof envelopeData.envelope.binding.x3dh.accountIdentityPublicKeyB64 === "string"
+        ? envelopeData.envelope.binding.x3dh.accountIdentityPublicKeyB64 : "")
+      : (envelopeData.envelope.signerRef
+          && typeof envelopeData.envelope.signerRef.signerPublicKeyB64 === "string"
+        ? envelopeData.envelope.signerRef.signerPublicKeyB64 : "");
+    if (envelopeCommittedPub !== publisherPublicKeyB64) {
       const err = new Error("acceptInvite: invite envelope signer does not match invite code");
       err.code = "PUBLISHER_KEY_MISMATCH";
       throw err;

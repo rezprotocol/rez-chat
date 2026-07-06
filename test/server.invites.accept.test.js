@@ -171,6 +171,75 @@ test("invite.accept materializes a ready direct thread and sidebar index row", a
   assert.equal(contacts.items[0].relationshipState, "active");
 });
 
+// S8 L6: the substitution check is ANCHOR-AWARE. A delegated envelope is
+// signed by a device key (signerRef ≠ the code's committed key); the identity
+// the code commits to is the ACCOUNT ANCHOR in the binding, which the SDK's
+// acceptInvite verifies the cert chain roots at.
+test("invite.accept (delegated envelope): the ACCOUNT ANCHOR — not the device signer — must match the invite code", async () => {
+  let now = 1000;
+  const DEVICE_PUB = "MCowBQYDK2VwAyEAdGhpc2lzYWRldmljZWtleWZvcnRlc3RzISEhISE=";
+  const snapshot = {
+    peerLinkId: "pl_accept_d1",
+    state: "handshake_sent",
+    sessionState: "pending_remote_confirm",
+    localAccountId: "rez:acct:bob",
+    peerAccountId: "rez:acct:alice",
+    peerInboxId: "inbox:alice",
+  };
+  const inviteId = "plinv_delegated";
+  const delegatedEnvelope = {
+    creatorDisplayName: "Alice",
+    signerRef: { accountId: "rez:acct:alice", signerPublicKeyB64: DEVICE_PUB },
+    certChain: [{ accountIdentityPublicKeyB64: INVITER_PUB }],
+    binding: { x3dh: { accountIdentityPublicKeyB64: INVITER_PUB } },
+  };
+  const fakePeerLinks = {
+    ownerAccountId: "rez:acct:bob",
+    getStoredInviteEnvelope: async () => null,
+    acceptInvite: async () => ({ snapshot, event: null }),
+  };
+  const durableRecords = makeDurableRecordStore();
+  await durableRecords.put({ record: makeDurableRecord({ inviteId, envelope: delegatedEnvelope }) });
+  const server = createServer({
+    clock: () => { now += 1; return now; },
+    sdk: {
+      getIdentity: () => ({ localInboxId: "inbox:bob" }),
+      mailbox: { deposit: async () => ({ eventId: "evt-1" }) },
+      peerLinks: { getPeerLink: async () => snapshot },
+      durableRecords,
+    },
+    peerLinks: fakePeerLinks,
+  });
+
+  // The device signer differs from the committed key, but the account anchor
+  // matches — the delegated envelope is admitted.
+  const accepted = await server.bus.call("invite", "accept", {
+    inviteCode: encodeInviteCodeV3({ inviteId, publisherPublicKeyB64: INVITER_PUB }),
+    acceptorDisplayName: "Bob",
+  });
+  assert.equal(accepted.peerAccountId, "rez:acct:alice");
+
+  // A delegated envelope whose anchor does NOT match the committed key is a
+  // substitution — rejected even though it carries a chain.
+  const wrongAnchorId = "plinv_delegated_wrong";
+  await durableRecords.put({
+    record: makeDurableRecord({
+      inviteId: wrongAnchorId,
+      envelope: {
+        ...delegatedEnvelope,
+        binding: { x3dh: { accountIdentityPublicKeyB64: DEVICE_PUB } },
+      },
+    }),
+  });
+  await assert.rejects(
+    () => server.bus.call("invite", "accept", {
+      inviteCode: encodeInviteCodeV3({ inviteId: wrongAnchorId, publisherPublicKeyB64: INVITER_PUB }),
+      acceptorDisplayName: "Bob",
+    }),
+    (err) => err && /does not match invite code/.test(err.message),
+  );
+});
+
 test("invite.create forwards title; invite.accept materializes the group with that title", async () => {
   let now = 1000;
   const inviteCreateCalls = [];
