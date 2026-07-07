@@ -237,6 +237,19 @@ export class DesktopAccountAuthService {
     return result;
   }
 
+  // S10 — provision THIS device as a delegated member of an existing account
+  // (the new-device half of the PSK link ceremony). The vault ends unlocked
+  // as the linked account; the caller drives runtime connect like create.
+  async linkDevice({ linkCode = "", profileName = "", password = "" } = {}) {
+    if (!this._desktop.vault || typeof this._desktop.vault.linkDevice !== "function") {
+      throw new Error("Device linking unavailable: bridge does not expose vault.linkDevice");
+    }
+    const result = await this._desktop.vault.linkDevice({ linkCode, profileName, password });
+    await this.#completeAuth(result);
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
+    return result;
+  }
+
   async unlock({ accountId = null, password = "", enableDeviceUnlock = false } = {}) {
     const result = await this._desktop.vault.unlock({ accountId, password, enableDeviceUnlock: enableDeviceUnlock === true });
     await this.#completeAuth(result);

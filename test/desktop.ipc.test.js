@@ -102,6 +102,7 @@ test("desktop IPC registers only generic bus + lifecycle channels", () => {
     "desktop:vault:getAvatarDataB64",
     "desktop:vault:getAvatarFileHash",
     "desktop:vault:importBackup",
+    "desktop:vault:linkDevice",
     "desktop:vault:listAccounts",
     "desktop:vault:lock",
     "desktop:vault:purgeAccount",

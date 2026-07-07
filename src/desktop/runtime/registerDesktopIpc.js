@@ -49,6 +49,8 @@ export function registerDesktopRuntimeIpc({ ipcMain, supervisor, biometricGate =
   ipcMain.handle("desktop:vault:status", () => invoke(() => supervisor.vaultStatus()));
   ipcMain.handle("desktop:environment:capabilities", () => invoke(() => supervisor.environmentCapabilities()));
   ipcMain.handle("desktop:vault:createAccount", (_event, args = {}) => invoke((params) => supervisor.createAccount(params), args));
+  // S10: the full new-device link ceremony (runner + delegated vault row).
+  ipcMain.handle("desktop:vault:linkDevice", (_event, args = {}) => invoke((params) => supervisor.linkDevice(params), args));
   ipcMain.handle("desktop:vault:unlock", (_event, args = {}) => invoke((params) => supervisor.unlock(params), args));
   ipcMain.handle("desktop:vault:unlockWithDevice", (_event, args = {}) => invoke(async (params) => {
     // SECURITY_AUDIT MED-10: a renderer-side compromise can call this IPC

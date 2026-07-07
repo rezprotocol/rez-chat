@@ -177,3 +177,39 @@ test("desktop auth disableDeviceUnlock routes through bridge and refreshes list"
   assert.equal(disableCalls, 1);
   assert.equal(sessionStore.snapshot().accountList[0].deviceUnlockEnabled, false);
 });
+
+test("S10 desktop auth linkDevice routes through bridge and completes auth like create", async () => {
+  const sessionStore = new SessionStore();
+  let observedLinkArgs = null;
+  const desktop = {
+    vault: {
+      async status() { return { hasAccounts: false, locked: true }; },
+      async listAccounts() {
+        return { accounts: [{ id: "rez:acct:linked", label: "Phone", accountIdHint: "rez:acct:linked" }] };
+      },
+      async getActiveIdentitySummary() { return null; },
+      async linkDevice(args) {
+        observedLinkArgs = args;
+        return { accountId: "rez:acct:linked", deviceId: "rez:dev:linked", profileName: "Phone", identityPublicKey: "b-pub" };
+      },
+    },
+  };
+  const bootstrap = new DesktopAuthBootstrapService({ sessionStore, desktop });
+  const auth = new DesktopAccountAuthService({ sessionStore, authBootstrapService: bootstrap, desktop });
+  await bootstrap.init();
+  const result = await auth.linkDevice({ linkCode: "rez:link:v1:code", profileName: "Phone", password: "password123" });
+  assert.equal(observedLinkArgs.linkCode, "rez:link:v1:code");
+  assert.equal(result.accountId, "rez:acct:linked");
+  assert.equal(sessionStore.snapshot().status, SESSION_STATUS.UNLOCKED);
+});
+
+test("S10 desktop auth linkDevice throws when the bridge lacks the method (older shell)", async () => {
+  const sessionStore = new SessionStore();
+  const desktop = createDesktopStub({ status: { hasAccounts: false } });
+  const bootstrap = new DesktopAuthBootstrapService({ sessionStore, desktop });
+  const auth = new DesktopAccountAuthService({ sessionStore, authBootstrapService: bootstrap, desktop });
+  await assert.rejects(
+    () => auth.linkDevice({ linkCode: "rez:link:v1:x", profileName: "P", password: "pw" }),
+    /does not expose vault\.linkDevice/,
+  );
+});

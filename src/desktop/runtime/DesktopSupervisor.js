@@ -1,5 +1,6 @@
 import path from "node:path";
 import { DesktopBusBridge } from "./DesktopBusBridge.js";
+import { runDeviceLinkRequester } from "./DesktopDeviceLinkRunner.js";
 
 function normalizeString(value) {
   return String(value == null ? "" : value).trim();
@@ -18,6 +19,7 @@ function normalizeString(value) {
 export class DesktopSupervisor {
   #vault;
   #startRezChat;
+  #deviceLinkRunner;
   #rezChatOptions;
   #chatApp;
   #userEnvironment;
@@ -32,11 +34,13 @@ export class DesktopSupervisor {
     rezChatOptions = {},
     chatApp = null,
     userEnvironment = null,
+    deviceLinkRunner = null,
     logger = console,
   } = {}) {
     if (!vault) throw new Error("DesktopSupervisor requires vault");
     this.#vault = vault;
     this.#startRezChat = typeof startRezChat === "function" ? startRezChat : null;
+    this.#deviceLinkRunner = typeof deviceLinkRunner === "function" ? deviceLinkRunner : runDeviceLinkRequester;
     this.#rezChatOptions = rezChatOptions && typeof rezChatOptions === "object" ? rezChatOptions : {};
     this.#chatApp = chatApp || null;
     this.#userEnvironment = userEnvironment || null;
@@ -149,6 +153,54 @@ export class DesktopSupervisor {
 
   async createAccount(params = {}) {
     return this.#vault.createAccount(params);
+  }
+
+  /**
+   * S10 — link THIS device to an existing account (the NEW-device half of the
+   * PSK ceremony). Runs the requester over a temporary SDK client against the
+   * LOCAL node (which is up pre-login), then provisions the delegated vault
+   * row. Does NOT connect: the UI drives the normal unlock→connect path so
+   * the delegated chat server boots through the shipped S9 flow.
+   */
+  async linkDevice({ linkCode = "", profileName = "", password = "" } = {}) {
+    const code = normalizeString(linkCode);
+    if (!code) throw new Error("linkDevice requires linkCode");
+    if (this.#chatApp && this.#chatApp.chatServer != null) {
+      throw new Error("linkDevice: a chat session is active — log out before linking this device");
+    }
+    if (!this.#chatApp && this.#startRezChat) {
+      this.#chatApp = await this.#startRezChat(this.#rezChatOptions);
+      this.#notifyChatAppListeners();
+    }
+    const wsUrl = this.#chatApp && typeof this.#chatApp.wsUrl === "string" ? this.#chatApp.wsUrl : "";
+    if (!wsUrl) {
+      throw new Error("linkDevice: local node unavailable (chat shell not started)");
+    }
+    let expectedNodePublicKeyB64 = "";
+    if (this.#chatApp.nodeApp && this.#chatApp.nodeApp.runtime
+      && typeof this.#chatApp.nodeApp.runtime.getIdentity === "function") {
+      const nodeIdentity = this.#chatApp.nodeApp.runtime.getIdentity();
+      expectedNodePublicKeyB64 = nodeIdentity && typeof nodeIdentity.nodePublicKeyB64 === "string"
+        ? nodeIdentity.nodePublicKeyB64
+        : "";
+    }
+    const result = await this.#deviceLinkRunner({
+      linkCode: code,
+      wsUrl,
+      expectedNodePublicKeyB64,
+      logger: this.#logger,
+    });
+    return this.#vault.createDelegatedAccount({
+      profileName,
+      password,
+      deviceKeyPair: result.delegation.deviceKeyPair,
+      delegationBundle: {
+        accountSignPublicKeyB64: result.delegation.accountSignPublicKeyB64,
+        accountDhKeyPair: result.delegation.accountDhKeyPair,
+        certChain: result.delegation.certChain,
+        cachedDeviceSet: result.delegation.cachedDeviceSet,
+      },
+    });
   }
 
   async unlock(params = {}) {

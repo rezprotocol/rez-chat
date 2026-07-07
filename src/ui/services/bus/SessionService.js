@@ -25,6 +25,7 @@ export class SessionService extends BaseBusService {
     this._register("session", "unlockWithDevice", (payload) => this.unlockWithDevice(payload));
     this._register("session", "disableDeviceUnlock", (payload) => this.disableDeviceUnlock(payload));
     this._register("session", "create", (payload) => this.createAccount(payload));
+    this._register("session", "linkDevice", (payload) => this.linkDevice(payload));
     this._register("session", "lock", () => this.lock());
     this._register("session", "selectAccount", (payload) => this.selectAccount(payload));
     this._register("session", "inspectBootstrap", () => this.inspectBootstrap());
@@ -246,6 +247,49 @@ export class SessionService extends BaseBusService {
       return this._sessionStore.snapshot();
     } catch (err) {
       const message = err && err.message ? err.message : "Account creation failed.";
+      this._sessionStore.setError(message);
+      throw err;
+    }
+  }
+
+  // S10 — link THIS device to an existing account with a device-link code.
+  // Mirrors createAccount's UX contract: confirm-password check, sessionStore
+  // error slot, and the same unlock -> runtime-connect chain (which boots the
+  // DELEGATED chat server through the shipped S9 path).
+  async linkDevice({ linkCode = "", name = "", profileName = "", password = "", confirmPassword = "" } = {}) {
+    const resolvedName = nonEmptyString(name) || nonEmptyString(profileName);
+    if (String(password) !== String(confirmPassword)) {
+      this._sessionStore.setError("Passwords do not match.");
+      return null;
+    }
+    if (typeof this._accountAuthService.linkDevice !== "function") {
+      this._sessionStore.setError("Device linking requires the Rez desktop app.");
+      return null;
+    }
+    this._sessionStore.setUnlocking();
+    try {
+      const unlocked = await this._accountAuthService.linkDevice({
+        linkCode,
+        profileName: resolvedName,
+        password,
+      });
+      this._sessionStore.setUnlocked({
+        accountId: unlocked && unlocked.accountId ? unlocked.accountId : null,
+        deviceId: unlocked && unlocked.deviceId ? unlocked.deviceId : null,
+        localInboxId: unlocked && unlocked.localInboxId ? unlocked.localInboxId : null,
+        ownerAccountId: unlocked && unlocked.ownerAccountId ? unlocked.ownerAccountId : null,
+      });
+      this.bus.emit("session.unlocked", this._sessionStore.snapshot());
+      this.bus.emit("session.authenticated", this._sessionStore.snapshot());
+      const connectSeq = ++this._runtimeConnectSeq;
+      this._connectRuntimeAfterUnlock({ connectSeq }).catch((err) => {
+        if (this._logger && typeof this._logger.warn === "function") {
+          this._logger.warn("runtime connect failed after device link", err && err.message ? err.message : err);
+        }
+      });
+      return this._sessionStore.snapshot();
+    } catch (err) {
+      const message = err && err.message ? err.message : "Device linking failed.";
       this._sessionStore.setError(message);
       throw err;
     }

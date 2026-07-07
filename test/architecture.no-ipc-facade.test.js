@@ -46,6 +46,7 @@ test("guardrail: registerDesktopIpc registers only generic + lifecycle IPC handl
     "desktop:vault:status",
     "desktop:environment:capabilities",
     "desktop:vault:createAccount",
+    "desktop:vault:linkDevice",
     "desktop:vault:unlock",
     "desktop:vault:unlockWithDevice",
     "desktop:vault:disableDeviceUnlock",
@@ -139,6 +140,8 @@ test("guardrail: DesktopSupervisor does not enumerate bus directives as methods"
     "vaultStatus",
     "environmentCapabilities",
     "createAccount",
+    // S10 device-link: a vault/lifecycle op (pre-login), not a bus directive.
+    "linkDevice",
     "noteVaultActivity",
     "unlock",
     "unlockWithDevice",

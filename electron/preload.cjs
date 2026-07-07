@@ -78,6 +78,7 @@ contextBridge.exposeInMainWorld("rezDesktop", {
   vault: {
     status: () => unwrap(ipcRenderer.invoke("desktop:vault:status")),
     createAccount: (params) => unwrap(ipcRenderer.invoke("desktop:vault:createAccount", params || {})),
+    linkDevice: (params) => unwrap(ipcRenderer.invoke("desktop:vault:linkDevice", params || {})),
     unlock: (params) => unwrap(ipcRenderer.invoke("desktop:vault:unlock", params || {})),
     unlockWithDevice: (params) => unwrap(ipcRenderer.invoke("desktop:vault:unlockWithDevice", params || {})),
     disableDeviceUnlock: (params) => unwrap(ipcRenderer.invoke("desktop:vault:disableDeviceUnlock", params || {})),

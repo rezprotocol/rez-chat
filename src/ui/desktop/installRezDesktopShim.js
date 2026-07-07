@@ -295,6 +295,7 @@ export function installRezDesktopShim() {
     vault: {
       status: () => callVault("desktop:vault:status"),
       createAccount: (params) => callVault("desktop:vault:createAccount", params),
+      linkDevice: (params) => callVault("desktop:vault:linkDevice", params),
       unlock: (params) => callVault("desktop:vault:unlock", params),
       unlockWithDevice: (params) => callVault("desktop:vault:unlockWithDevice", params),
       disableDeviceUnlock: (params) => callVault("desktop:vault:disableDeviceUnlock", params),

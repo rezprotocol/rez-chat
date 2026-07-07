@@ -34,6 +34,7 @@ const ENVIRONMENT_KEYS = ["capabilities"];
 const VAULT_KEYS = [
   "status",
   "createAccount",
+  "linkDevice",
   "unlock",
   "unlockWithDevice",
   "disableDeviceUnlock",

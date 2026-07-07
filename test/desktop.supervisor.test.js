@@ -180,3 +180,71 @@ test("supervisor #runtimeSummary reports chat-server accountId as ownerAccountId
   assert.equal(summary.localInboxId, "inbox-supervisor");
   await supervisor.stop();
 });
+
+// --- S10: linkDevice — the new-device ceremony through the supervisor ------
+
+test("linkDevice runs the injected runner against the local node and provisions the delegated vault row", async () => {
+  const vault = new FakeVault();
+  const runnerCalls = [];
+  const delegatedCalls = [];
+  vault.createDelegatedAccount = async (params) => {
+    delegatedCalls.push(params);
+    vault.locked = false;
+    vault.identity = { accountId: "rez:acct:linked", deviceId: "rez:dev:linked" };
+    return vault.getActiveIdentitySummary();
+  };
+  const chatApp = createFakeChatApp();
+  chatApp.wsUrl = "ws://127.0.0.1:9999/ws";
+  chatApp.chatServer = null; // no live session — link allowed
+  chatApp.nodeApp = { runtime: { getIdentity() { return { nodePublicKeyB64: "node-pub" }; } } };
+  const delegation = {
+    accountSignPublicKeyB64: "B-pub",
+    accountDhKeyPair: { publicKeyB64: "dh-pub", privateKeyB64: "dh-priv" },
+    deviceKeyPair: { publicKeyB64: "c-pub", privateKeyB64: "c-priv" },
+    certChain: [{ certId: "rez:cap:x" }],
+    cachedDeviceSet: null,
+  };
+  const supervisor = new DesktopSupervisor({
+    vault,
+    chatApp,
+    deviceLinkRunner: async (params) => {
+      runnerCalls.push(params);
+      return { delegation, deviceId: "rez:dev:linked", fingerprint: "aaaa-bbbb-cccc-dddd-eeee" };
+    },
+    logger: { warn() {} },
+  });
+  await supervisor.start();
+
+  const result = await supervisor.linkDevice({ linkCode: "rez:link:v1:code", profileName: "Phone", password: "pw-long-enough" });
+  assert.equal(result.accountId, "rez:acct:linked");
+  assert.equal(runnerCalls.length, 1);
+  assert.equal(runnerCalls[0].linkCode, "rez:link:v1:code");
+  assert.equal(runnerCalls[0].wsUrl, "ws://127.0.0.1:9999/ws");
+  assert.equal(runnerCalls[0].expectedNodePublicKeyB64, "node-pub");
+  assert.equal(delegatedCalls.length, 1);
+  assert.equal(delegatedCalls[0].profileName, "Phone");
+  assert.deepEqual(delegatedCalls[0].deviceKeyPair, delegation.deviceKeyPair, "C goes to the vault separately");
+  assert.equal("deviceKeyPair" in delegatedCalls[0].delegationBundle, false, "the bundle param never carries C");
+  assert.deepEqual(delegatedCalls[0].delegationBundle.certChain, delegation.certChain);
+  await supervisor.stop();
+});
+
+test("linkDevice guards: missing code; active chat session refuses", async () => {
+  const vault = new FakeVault();
+  const chatApp = createFakeChatApp();
+  chatApp.wsUrl = "ws://127.0.0.1:9999/ws";
+  const supervisor = new DesktopSupervisor({
+    vault,
+    chatApp,
+    deviceLinkRunner: async () => { throw new Error("must not run"); },
+    logger: { warn() {} },
+  });
+  await supervisor.start();
+  await assert.rejects(() => supervisor.linkDevice({ linkCode: "" }), /requires linkCode/);
+  // createFakeChatApp pre-populates chatServer ⇒ a session is live.
+  await assert.rejects(
+    () => supervisor.linkDevice({ linkCode: "rez:link:v1:x", profileName: "P", password: "pw" }),
+    /log out before linking/,
+  );
+  await supervisor.stop();
+});
