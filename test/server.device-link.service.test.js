@@ -128,7 +128,7 @@ test("full ceremony through the directives: start → pending(fingerprint) → a
   const keys = makePrimaryKeys();
   const { svc, bus } = makeService({ overlay, keys });
 
-  const started = await svc.start({});
+  const started = await svc.startCeremony({});
   assert.match(started.linkCode, /^rez:link:v1:/);
   assert.ok(started.expiresAtMs > Date.now());
   await waitForEvent(bus, "code-issued");
@@ -144,18 +144,18 @@ test("full ceremony through the directives: start → pending(fingerprint) → a
   assert.match(pending.fingerprint, /^[0-9a-f]{4}(-[0-9a-f]{4}){4}$/);
   assert.match(pending.newDeviceId, /^rez:dev:[0-9a-f]{64}$/);
 
-  const statusPending = await svc.status({});
+  const statusPending = await svc.statusCeremony({});
   assert.equal(statusPending.state, "pending");
   assert.equal(statusPending.newDeviceId, pending.newDeviceId);
 
-  const approved = await svc.approve({ newDeviceId: pending.newDeviceId });
+  const approved = await svc.approveCeremony({ newDeviceId: pending.newDeviceId });
   assert.equal(approved.state, "responding");
 
   const requester = await requesterRun;
   assert.equal(requester.deviceId, pending.newDeviceId, "the requester IS the approved device");
   assert.equal(requester.fingerprint, pending.fingerprint);
   await waitForEvent(bus, "confirmed");
-  assert.equal((await svc.status({})).state, "confirmed");
+  assert.equal((await svc.statusCeremony({})).state, "confirmed");
 
   // The ceremony output provisions a REAL delegated vault account.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rez-devlink-svc-"));
@@ -189,20 +189,20 @@ test("approve with a mismatched newDeviceId is rejected and the ceremony stays p
   const overlay = makeOverlay();
   const keys = makePrimaryKeys();
   const { svc, bus } = makeService({ overlay, keys });
-  const started = await svc.start({});
+  const started = await svc.startCeremony({});
   const requesterRun = runDeviceLinkRequester({
     code: started.linkCode, crypto: CRYPTO, records: overlay, ...FAST, deadlineMs: 20_000,
   }).catch((err) => err);
 
   const pending = await waitForEvent(bus, "pending");
   await assert.rejects(
-    () => svc.approve({ newDeviceId: "rez:dev:" + "0".repeat(64) }),
+    () => svc.approveCeremony({ newDeviceId: "rez:dev:" + "0".repeat(64) }),
     (err) => err.code === "DEVICE_ID_MISMATCH",
   );
-  assert.equal((await svc.status({})).state, "pending", "still pending after the bad approve");
+  assert.equal((await svc.statusCeremony({})).state, "pending", "still pending after the bad approve");
 
   // The RIGHT approve still completes the ceremony.
-  await svc.approve({ newDeviceId: pending.newDeviceId });
+  await svc.approveCeremony({ newDeviceId: pending.newDeviceId });
   const requester = await requesterRun;
   assert.equal(requester.deviceId, pending.newDeviceId);
   await waitForEvent(bus, "confirmed");
@@ -212,13 +212,13 @@ test("cancel while pending vetoes the ceremony; the requester never gets a bundl
   const overlay = makeOverlay();
   const keys = makePrimaryKeys();
   const { svc, bus } = makeService({ overlay, keys });
-  const started = await svc.start({});
+  const started = await svc.startCeremony({});
   const requesterRun = runDeviceLinkRequester({
     code: started.linkCode, crypto: CRYPTO, records: overlay, ...FAST, deadlineMs: 2_000,
   }).catch((err) => err);
 
   await waitForEvent(bus, "pending");
-  const cancelled = await svc.cancel({});
+  const cancelled = await svc.cancelCeremony({});
   assert.equal(cancelled.state, "cancelled");
   await waitForEvent(bus, "cancelled");
   const requesterErr = await requesterRun;
@@ -231,18 +231,18 @@ test("gates: delegated runtime, missing B-dh, double start, no pending approve",
   const keys = makePrimaryKeys();
 
   const delegated = makeService({ overlay, keys, hasAdminRoot: false });
-  await assert.rejects(() => delegated.svc.start({}), (err) => err.code === "DELEGATED_DEVICE");
+  await assert.rejects(() => delegated.svc.startCeremony({}), (err) => err.code === "DELEGATED_DEVICE");
 
   const noDh = makeService({ overlay, keys, dh: false });
-  await assert.rejects(() => noDh.svc.start({}), /account identity-DH key unavailable/);
+  await assert.rejects(() => noDh.svc.startCeremony({}), /account identity-DH key unavailable/);
 
   const { svc } = makeService({ overlay, keys });
-  await assert.rejects(() => svc.approve({ newDeviceId: "rez:dev:" + "0".repeat(64) }), (err) => err.code === "NO_PENDING_REQUEST");
-  await svc.start({});
-  await assert.rejects(() => svc.start({}), (err) => err.code === "LINK_IN_PROGRESS");
-  await svc.cancel({});
+  await assert.rejects(() => svc.approveCeremony({ newDeviceId: "rez:dev:" + "0".repeat(64) }), (err) => err.code === "NO_PENDING_REQUEST");
+  await svc.startCeremony({});
+  await assert.rejects(() => svc.startCeremony({}), (err) => err.code === "LINK_IN_PROGRESS");
+  await svc.cancelCeremony({});
   // After a terminal state a fresh start works (new PSK).
-  const again = await svc.start({});
+  const again = await svc.startCeremony({});
   assert.match(again.linkCode, /^rez:link:v1:/);
-  await svc.cancel({});
+  await svc.cancelCeremony({});
 });

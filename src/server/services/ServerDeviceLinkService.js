@@ -38,10 +38,10 @@ export class ServerDeviceLinkService extends BaseServerService {
     super({ bus, ownerAccountId, logger });
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
     this.#ceremony = null;
-    this._register("deviceLink", "start", (payload) => this.start(payload || {}));
-    this._register("deviceLink", "status", (payload) => this.status(payload || {}));
-    this._register("deviceLink", "approve", (payload) => this.approve(payload || {}));
-    this._register("deviceLink", "cancel", (payload) => this.cancel(payload || {}));
+    this._register("deviceLink", "start", (payload) => this.startCeremony(payload || {}));
+    this._register("deviceLink", "status", (payload) => this.statusCeremony(payload || {}));
+    this._register("deviceLink", "approve", (payload) => this.approveCeremony(payload || {}));
+    this._register("deviceLink", "cancel", (payload) => this.cancelCeremony(payload || {}));
   }
 
   #sdk() {
@@ -52,7 +52,7 @@ export class ServerDeviceLinkService extends BaseServerService {
     this._emit("deviceLink.updated", new DeviceLinkUpdatedEvent(fields));
   }
 
-  async start(payload) {
+  async startCeremony(payload) {
     this._coerceParams(payload, DeviceLinkStartParams);
     const sdk = this.#sdk();
     if (!sdk || !sdk.durableRecords) {
@@ -169,7 +169,7 @@ export class ServerDeviceLinkService extends BaseServerService {
     }
   }
 
-  async status(payload) {
+  async statusCeremony(payload) {
     this._coerceParams(payload, DeviceLinkStatusParams);
     const ceremony = this.#ceremony;
     if (!ceremony) {
@@ -183,7 +183,7 @@ export class ServerDeviceLinkService extends BaseServerService {
     });
   }
 
-  async approve(payload) {
+  async approveCeremony(payload) {
     const params = this._coerceParams(payload, DeviceLinkApproveParams);
     const ceremony = this.#ceremony;
     if (!ceremony || ceremony.state !== "pending" || !ceremony.pending || !ceremony.resolveApproval) {
@@ -207,7 +207,7 @@ export class ServerDeviceLinkService extends BaseServerService {
     return new DeviceLinkApproveResult({ state: "responding", newDeviceId: params.newDeviceId });
   }
 
-  async cancel(payload) {
+  async cancelCeremony(payload) {
     this._coerceParams(payload, DeviceLinkCancelParams);
     const ceremony = this.#ceremony;
     if (!ceremony) {
@@ -233,7 +233,7 @@ export class ServerDeviceLinkService extends BaseServerService {
 
   async stop() {
     if (this.#ceremony) {
-      await this.cancel({});
+      await this.cancelCeremony({});
       if (this.#ceremony.driver) {
         await this.#ceremony.driver;
       }

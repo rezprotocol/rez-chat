@@ -31,10 +31,16 @@ export async function runDeviceLinkRequester({
   }
   const cryptoProvider = new NodeCryptoProvider();
   const session = cryptoProvider.generateSigningKeyPair();
+  const sessionPubB64 = bytesToBase64(session.publicKey);
+  // A self-certifying deviceId for the throwaway ceremony session (session.hello
+  // requires one). It anchors nothing — the session is account-blind and
+  // discarded when the ceremony ends.
+  const sessionDeviceId = "rez:dev:" + Buffer.from(cryptoProvider.hashSha256(new TextEncoder().encode(sessionPubB64))).toString("hex");
   const sdk = createRezClient({
     identity: {
       accountId: deriveAccountIdFromPublicKey(session.publicKey),
-      publicKeyB64: bytesToBase64(session.publicKey),
+      deviceId: sessionDeviceId,
+      publicKeyB64: sessionPubB64,
       privateKeyB64: bytesToBase64(session.privateKey),
     },
     uplinks: [wsUrl],
