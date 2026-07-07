@@ -17,6 +17,7 @@ import {
   ServerEventService,
   ServerPeerLinkProtocolService,
   ServerDeviceSetService,
+  ServerAccountMutationService,
   ServerDeviceLinkService,
   ServerFileTransferService,
   ServerProfileService,
@@ -316,6 +317,14 @@ export class ChatServerApp {
       // desktop with a v2 keystore). The E6 fan-out gate lives in the sender
       // (ServerMessagesService), not here.
       deviceSet: new ServerDeviceSetService({
+        bus: this.bus,
+        ownerAccountId: this.#ownerAccountId,
+        clock,
+        logger,
+      }),
+      // S11: serialized device add/revoke + revocation propagation. Reuses the
+      // device-set republish + a public authority-state record. E6-independent.
+      accountMutation: new ServerAccountMutationService({
         bus: this.bus,
         ownerAccountId: this.#ownerAccountId,
         clock,

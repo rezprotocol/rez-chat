@@ -46,6 +46,12 @@ export class ServerDeviceSetService extends BaseServerService {
     this._register("device-set", "publishForPeer", (payload) => this.publishForPeer(payload || {}));
     this._register("device-set", "resolveForPeer", (payload) => this.resolveForPeer(payload || {}));
     this._register("device-set", "completeResponder", (payload) => this.completeResponder(payload || {}));
+    // S11: the account-mutation service drops a peer's cached set after a
+    // republish so the next resolveForPeer re-ingests at the new revision.
+    this._register("device-set", "invalidate", (payload) => {
+      this.invalidate(payload && payload.peerAccountId);
+      return { invalidated: true };
+    });
   }
 
   #peerLinks() {

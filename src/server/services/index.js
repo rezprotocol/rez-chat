@@ -10,6 +10,7 @@ export { ServerConnectionService } from "./ServerConnectionService.js";
 export { ServerEventService } from "./ServerEventService.js";
 export { ServerPeerLinkProtocolService } from "./ServerPeerLinkProtocolService.js";
 export { ServerDeviceSetService } from "./ServerDeviceSetService.js";
+export { ServerAccountMutationService } from "./ServerAccountMutationService.js";
 export { ServerDeviceLinkService } from "./ServerDeviceLinkService.js";
 export { InboxCatchupService } from "./InboxCatchupService.js";
 export { GlobalGroupLookup } from "./GlobalGroupLookup.js";
