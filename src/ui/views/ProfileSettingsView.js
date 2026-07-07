@@ -6,6 +6,7 @@ import { RecoveryPhraseDisplayModal } from "./RecoveryPhraseDisplayModal.js";
 import { ChangePasswordModal } from "./ChangePasswordModal.js";
 import { ExportBackupModal } from "./ExportBackupModal.js";
 import { TypedConfirmModalView } from "./TypedConfirmModalView.js";
+import { DeviceLinkModal } from "./DeviceLinkModal.js";
 
 export class ProfileSettingsView extends BusComponent {
   #nameInputEl;
@@ -135,6 +136,11 @@ export class ProfileSettingsView extends BusComponent {
       new ExportBackupModal({ bus: this.bus }).open();
     });
 
+    const linkDeviceBtn = h("button", { type: "button", className: securityBtnClass, "data-testid": "profile.linkDevice" }, "Link a new device");
+    linkDeviceBtn.addEventListener("click", () => {
+      new DeviceLinkModal({ bus: this.bus }).open();
+    });
+
     const deleteAccountBtn = h("button", { type: "button", className: dangerBtnClass }, "Delete account");
     deleteAccountBtn.addEventListener("click", () => {
       new TypedConfirmModalView({
@@ -161,6 +167,7 @@ export class ProfileSettingsView extends BusComponent {
     const securitySection = h("section", { className: "flex flex-col gap-space-sm mt-space-md pt-space-md border-t border-outline-variant/30" }, [
       h("label", { className: "text-label-micro font-label-technical text-outline uppercase tracking-wider" }, "Security"),
       changePasswordBtn,
+      linkDeviceBtn,
       showPhraseBtn,
       exportBackupBtn,
       deleteAccountBtn,

@@ -40,6 +40,7 @@ import { ContactsService } from "../services/bus/ContactsService.js";
 import { GroupsService } from "../services/bus/GroupsService.js";
 import { ChannelsService } from "../services/bus/ChannelsService.js";
 import { InvitesService } from "../services/bus/InvitesService.js";
+import { DeviceLinkService } from "../services/bus/DeviceLinkService.js";
 import { ConnectionService } from "../services/bus/ConnectionService.js";
 import { NotificationService } from "../services/bus/NotificationService.js";
 import { UiNavigationService } from "../services/bus/UiNavigationService.js";
@@ -183,6 +184,9 @@ export class ChatApp {
       invites: new InvitesService({
         bus: this.bus,
         inviteStore: this.bus.stores.invites,
+      }),
+      deviceLink: new DeviceLinkService({
+        bus: this.bus,
       }),
       connection: new ConnectionService({
         bus: this.bus,
