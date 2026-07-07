@@ -124,13 +124,16 @@ export class ServerAccountMutationService extends BaseServerService {
     const revision = Number.isInteger(result.revision) && result.revision >= 1 ? result.revision : 1;
     const owner = this.ownerAccountId || peerLinks.ownerAccountId;
 
+    // S12: republish the MULTI-device set (all active devices) when the home
+    // serves the aggregated set; single-device otherwise (byte-compat).
+    const accountDeviceSet = await this.#accountDeviceSetFromHome();
     const links = await peerLinks.peerLinkStorage.peerLinks.listByOwner(owner);
     const seen = new Set();
     for (const link of links) {
       const peer = link && typeof link.peerAccountId === "string" ? link.peerAccountId.trim() : "";
       if (!peer || seen.has(peer)) continue;
       seen.add(peer);
-      const built = await peerLinks.buildDeviceSetRecordForPeer({ peerAccountId: peer, revision, nowMs: this.#clock() });
+      const built = await peerLinks.buildDeviceSetRecordForPeer({ peerAccountId: peer, revision, nowMs: this.#clock(), accountDeviceSet });
       await durableRecords.put({ record: built.record });
       this._call("device-set", "invalidate", { peerAccountId: peer });
     }
@@ -183,6 +186,24 @@ export class ServerAccountMutationService extends BaseServerService {
     const revocationState = this.#project(opened.revocationState);
     this.#authorityStateCache.set(peer, { revocationState, epoch: opened.epoch, fetchedAtMs: this.#clock() });
     return revocationState;
+  }
+
+  // The account's home-aggregated active device set (all self-published bundles),
+  // or null when the home does not serve it (fs/desktop) or it is empty ⇒ the
+  // single-device publish path.
+  async #accountDeviceSetFromHome() {
+    const sdk = this.#sdk();
+    if (!sdk || !sdk.devices || typeof sdk.devices.getAccountDeviceSet !== "function") return null;
+    try {
+      const res = await sdk.devices.getAccountDeviceSet();
+      const devices = res && Array.isArray(res.devices) ? res.devices : [];
+      return devices.length > 0 ? devices : null;
+    } catch (err) {
+      if (this.logger && typeof this.logger.warn === "function") {
+        this.logger.warn("[ServerAccountMutationService] getAccountDeviceSet unavailable; single-device republish", err && err.message ? err.message : err);
+      }
+      return null;
+    }
   }
 
   // null-when-empty so a never-revoked peer is byte-identical to the primary path.

@@ -276,3 +276,76 @@ test("Audit R2 #2: a re-PUBLISHED (re-sealed, same revision) set does NOT reset 
   const { encryptedPacket: m2 } = await bob.svc.encryptDirectMessageForDevice({ peerAccountId: alice.accountId, peerLinkId: "pl_bob_alice", peerDeviceId: alice.deviceId, plaintextBytes: enc("two") });
   assert.equal(dec((await alice.svc.decryptFromDevice({ peerAccountId: bob.accountId, peerLinkId: "pl_alice_bob", peerDeviceId: bob.deviceId, packetBytes: m2.toBytes() })).plaintextBytes), "two");
 });
+
+// ---- S2.5 S12 L8: multi-device publish wiring (stub peerLinks — the real crypto
+// build is proven in rez-sdk peer-link.multidevice-fanout) ----
+
+function makeStubPeerLinks() {
+  const calls = { build: [], bundle: 0, listByOwner: 0 };
+  return {
+    calls,
+    deviceId: "rez:dev:self",
+    ownerAccountId: "rez:acct:self",
+    async buildDeviceSetRecordForPeer(args) {
+      calls.build.push(args);
+      return { record: { ownerPublicKeyB64: "B", recordKind: "peerlink-device-set", recordId: "r" }, recordKind: "peerlink-device-set", recordId: "r", publisherPublicKeyB64: "B" };
+    },
+    async buildAndRetainAccountDeviceBundle() {
+      calls.bundle += 1;
+      return { toJSON: () => ({ deviceId: "rez:dev:self", v: 1 }) };
+    },
+    peerLinkStorage: { peerLinks: { async listByOwner() { calls.listByOwner += 1; return [{ peerAccountId: "rez:acct:p1" }, { peerAccountId: "rez:acct:p2" }, { peerAccountId: "rez:acct:p1" }]; } } },
+  };
+}
+
+function makeStubService({ peerLinks, devices = {} } = {}) {
+  const puts = [];
+  const bus = makeBus({ peerLinks, sdk: { durableRecords: { async put(x) { puts.push(x); }, async get() { return null; } }, devices } });
+  const svc = new ServerDeviceSetService({ bus, ownerAccountId: "rez:acct:self", clock: () => 5000 });
+  return { svc, puts, bus };
+}
+
+test("L8 publishForPeer: MULTI-device when the home serves an aggregated set + threads the authority revision", async () => {
+  const peerLinks = makeStubPeerLinks();
+  const devices = {
+    async getAccountDeviceSet() { return { devices: [{ deviceId: "rez:dev:a", bundle: {} }, { deviceId: "rez:dev:b", bundle: {} }] }; },
+    async getAuthorityState() { return { epoch: 3, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+  };
+  const { svc } = makeStubService({ peerLinks, devices });
+  await svc.publishForPeer({ peerAccountId: "rez:acct:peer" });
+  assert.equal(peerLinks.calls.build.length, 1);
+  assert.equal(peerLinks.calls.build[0].accountDeviceSet.length, 2, "the aggregated set is threaded into the build");
+  assert.equal(peerLinks.calls.build[0].revision, 3, "the DeviceSetRecord revision = the authority epoch");
+});
+
+test("L8 publishForPeer: SINGLE-device fallback when the home has no bundle store (revision 1, no accountDeviceSet)", async () => {
+  const peerLinks = makeStubPeerLinks();
+  const devices = {
+    async getAccountDeviceSet() { const e = new Error("SERVICE_UNAVAILABLE"); throw e; },
+    async getAuthorityState() { const e = new Error("SERVICE_UNAVAILABLE"); throw e; },
+  };
+  const { svc } = makeStubService({ peerLinks, devices });
+  await svc.publishForPeer({ peerAccountId: "rez:acct:peer" });
+  assert.equal(peerLinks.calls.build[0].accountDeviceSet, null, "no aggregated set ⇒ single-device");
+  assert.equal(peerLinks.calls.build[0].revision, 1, "byte-compat default revision");
+});
+
+test("L8 publishOwnDeviceBundle self-publishes this device's bundle to the home", async () => {
+  const peerLinks = makeStubPeerLinks();
+  const published = [];
+  const devices = { async publishDeviceBundle({ bundle }) { published.push(bundle); return { deviceId: "rez:dev:self", prekeyVersion: 1, applied: true }; } };
+  const { svc } = makeStubService({ peerLinks, devices });
+  const res = await svc.publishOwnDeviceBundle({});
+  assert.equal(peerLinks.calls.bundle, 1, "built + retained this device's bundle");
+  assert.equal(published.length, 1, "published it to the home");
+  assert.equal(res.applied, true);
+});
+
+test("L8 republishToAllPeers publishes to each DISTINCT peer once", async () => {
+  const peerLinks = makeStubPeerLinks();
+  const devices = { async getAccountDeviceSet() { return { devices: [] }; }, async getAuthorityState() { return { epoch: 1 }; } };
+  const { svc } = makeStubService({ peerLinks, devices });
+  const res = await svc.republishToAllPeers();
+  assert.equal(res.published, 2, "two distinct peers (the duplicate p1 is deduped)");
+  assert.equal(peerLinks.calls.build.length, 2);
+});

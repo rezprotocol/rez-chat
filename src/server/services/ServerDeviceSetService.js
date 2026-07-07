@@ -52,6 +52,11 @@ export class ServerDeviceSetService extends BaseServerService {
       this.invalidate(payload && payload.peerAccountId);
       return { invalidated: true };
     });
+    // S12: self-publish this device's bundle to the home + (re)publish the
+    // account's multi-device set to every peer (driven by ServerRuntimeService
+    // once the E6 gate is known open, and by the account-mutation service).
+    this._register("device-set", "publishOwnBundle", (payload) => this.publishOwnDeviceBundle(payload || {}));
+    this._register("device-set", "republishToAllPeers", (payload) => this.republishToAllPeers(payload || {}));
   }
 
   #peerLinks() {
@@ -80,15 +85,97 @@ export class ServerDeviceSetService extends BaseServerService {
    * Publish this account's device set sealed to one peer onto the durable overlay.
    * @returns {Promise<{recordKind, recordId, publisherPublicKeyB64}|null>} null when disabled.
    */
-  async publishForPeer({ peerAccountId } = {}) {
+  async publishForPeer({ peerAccountId, revision } = {}) {
     if (!this.isEnabled()) return null;
     const durableRecords = this.#durableRecords();
     if (!durableRecords) {
       throw new Error("ServerDeviceSetService.publishForPeer requires sdk.durableRecords");
     }
-    const built = await this.#peerLinks().buildDeviceSetRecordForPeer({ peerAccountId, nowMs: this.#clock() });
+    // S12: when the home serves the account's aggregated device set, publish a
+    // MULTI-device record enumerating all active devices; otherwise (fs/desktop or
+    // an empty set) fall back to the byte-identical single-device path. The
+    // revision is the account's authority epoch (S11) so peers never see a rollback.
+    const accountDeviceSet = await this.#accountDeviceSetFromHome();
+    const rev = Number.isInteger(revision) && revision >= 1 ? revision : await this.#currentRevision();
+    const built = await this.#peerLinks().buildDeviceSetRecordForPeer({ peerAccountId, nowMs: this.#clock(), revision: rev, accountDeviceSet });
     await durableRecords.put({ record: built.record });
     return { recordKind: built.recordKind, recordId: built.recordId, publisherPublicKeyB64: built.publisherPublicKeyB64 };
+  }
+
+  /**
+   * Self-publish THIS device's DevicePrekeyBundleV1 to the account home (S12) so
+   * sibling devices can aggregate the account's full device set. No-op when
+   * disabled or the home has no bundle store (SERVICE_UNAVAILABLE).
+   * @returns {Promise<object|null>}
+   */
+  async publishOwnDeviceBundle({ nowMs } = {}) {
+    if (!this.isEnabled()) return null;
+    const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
+    const peerLinks = this.#peerLinks();
+    if (!sdk || !sdk.devices || typeof sdk.devices.publishDeviceBundle !== "function"
+        || typeof peerLinks.buildAndRetainAccountDeviceBundle !== "function") {
+      return null;
+    }
+    const bundle = await peerLinks.buildAndRetainAccountDeviceBundle({ nowMs: nowMs || this.#clock() });
+    return sdk.devices.publishDeviceBundle({ bundle });
+  }
+
+  /**
+   * (Re)publish the account's device set to EVERY peer (S12) — e.g. after this
+   * device's bundle changes or the E6 gate opens. Enumerates peer links by owner.
+   * @returns {Promise<{ published: number }>}
+   */
+  async republishToAllPeers() {
+    if (!this.isEnabled()) return { published: 0 };
+    const peerLinks = this.#peerLinks();
+    const owner = this.ownerAccountId || peerLinks.ownerAccountId;
+    const links = await peerLinks.peerLinkStorage.peerLinks.listByOwner(owner);
+    const seen = new Set();
+    let published = 0;
+    for (const link of links) {
+      const peer = link && typeof link.peerAccountId === "string" ? link.peerAccountId.trim() : "";
+      if (!peer || seen.has(peer)) continue;
+      seen.add(peer);
+      await this.publishForPeer({ peerAccountId: peer });
+      published += 1;
+    }
+    return { published };
+  }
+
+  // The account's home-aggregated active device set (all self-published bundles),
+  // or null when the home does not serve it (fs/desktop) or it is empty ⇒ the
+  // single-device publish path.
+  async #accountDeviceSetFromHome() {
+    const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
+    if (!sdk || !sdk.devices || typeof sdk.devices.getAccountDeviceSet !== "function") return null;
+    try {
+      const res = await sdk.devices.getAccountDeviceSet();
+      const devices = res && Array.isArray(res.devices) ? res.devices : [];
+      return devices.length > 0 ? devices : null;
+    } catch (err) {
+      // A non-durable home answers SERVICE_UNAVAILABLE — fall back to single-device.
+      if (this.logger && typeof this.logger.warn === "function") {
+        this.logger.warn("[ServerDeviceSetService] getAccountDeviceSet unavailable; single-device publish", err && err.message ? err.message : err);
+      }
+      return null;
+    }
+  }
+
+  // The account's current authority epoch (S11 revision), floored at 1 so the
+  // DeviceSetRecordV1 revision is always a positive integer. 1 when the home does
+  // not serve authority state (fs/desktop) — the byte-identical default.
+  async #currentRevision() {
+    const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
+    if (sdk && sdk.devices && typeof sdk.devices.getAuthorityState === "function") {
+      try {
+        const s = await sdk.devices.getAuthorityState();
+        const e = s && Number.isInteger(s.epoch) ? s.epoch : 0;
+        return Math.max(1, e);
+      } catch (err) {
+        return 1; // non-durable home ⇒ the single-device default revision
+      }
+    }
+    return 1;
   }
 
   /**

@@ -132,6 +132,13 @@ export class ServerRuntimeService extends BaseServerService {
       // node advertising `durableInbox` — a no-op against fs/DO-relay nodes, so
       // the shipped single-device path is byte-for-byte unchanged. E6 closed.
       await this.#registerDeviceBind();
+      // S2.5 S12: with the E6 fan-out gate OPEN, self-publish this device's bundle
+      // to the home and (re)publish the account's multi-device set to every peer,
+      // so senders can resolve it. Gate-closed / non-durable nodes never reach here
+      // (multiDeviceFanout false) — the shipped path is byte-for-byte unchanged.
+      if (this.bus.runtime.multiDeviceFanout === true) {
+        await this.#publishMultiDeviceSet();
+      }
     }
     // Single owner of the SDK's onMailboxDeposited subscription. Forwards
     // each push frame onto the chat bus so ServerEventService,
@@ -257,6 +264,21 @@ export class ServerRuntimeService extends BaseServerService {
       // fails instead of advertising a connection that cannot receive durable mail.
       if (gateOpen) throw err;
       // Gate CLOSED: best-effort backfill; the claim cursor already works.
+    }
+  }
+
+  // S2.5 S12: publish this device's bundle to the home + (re)publish the account's
+  // multi-device set to every peer, once the E6 gate is known open. Best-effort —
+  // a publish failure must not fail connect() (the account can still send/receive;
+  // the set republishes on the next device change or reconnect).
+  async #publishMultiDeviceSet() {
+    try {
+      await this._call("device-set", "publishOwnBundle", {});
+      await this._call("device-set", "republishToAllPeers", {});
+    } catch (err) {
+      this.logger.error("ServerRuntimeService.#publishMultiDeviceSet failed", {
+        message: err && err.message ? err.message : String(err),
+      });
     }
   }
 
