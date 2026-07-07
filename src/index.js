@@ -177,8 +177,19 @@ export async function startRezChat(options = {}) {
      */
     async startChatServer({ chatServerIdentity = null, deviceKey = null, allowChatServerIdentityRotation = false } = {}) {
       if (chatServerState) return chatServerState;
-      if (!chatServerIdentity || !chatServerIdentity.accountId || !chatServerIdentity.publicKeyB64 || !chatServerIdentity.privateKeyB64) {
-        throw new Error("startChatServer requires chatServerIdentity with accountId/publicKeyB64/privateKeyB64");
+      // S9 dual-mode gate: PRIMARY carries the account private key; DELEGATED
+      // (seedless, hasAdminRoot=false) carries the capability chain instead
+      // and MUST bring the device key C — its only signer.
+      const delegatedShape = Boolean(chatServerIdentity)
+        && chatServerIdentity.hasAdminRoot === false
+        && Array.isArray(chatServerIdentity.certChain)
+        && chatServerIdentity.certChain.length > 0;
+      if (!chatServerIdentity || !chatServerIdentity.accountId || !chatServerIdentity.publicKeyB64
+        || (!chatServerIdentity.privateKeyB64 && !delegatedShape)) {
+        throw new Error("startChatServer requires chatServerIdentity with accountId/publicKeyB64 and privateKeyB64 (primary) or hasAdminRoot=false + certChain (delegated)");
+      }
+      if (delegatedShape && (!deviceKey || !deviceKey.deviceKeyPair || !deviceKey.deviceId)) {
+        throw new Error("startChatServer: a delegated chat-server identity requires deviceKey (the device key C is its only signer)");
       }
       const bootstrapped = await bootstrapChatServer({
         nodeDataDir: config.node.storage.dataDir,

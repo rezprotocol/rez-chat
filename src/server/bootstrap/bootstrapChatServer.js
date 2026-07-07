@@ -22,10 +22,15 @@ import { InboxClaimant } from "../inbox/InboxClaimant.js";
  * of trust per chat-server. Multi-device invite signing later can layer a
  * delegation cap on top without changing this surface.
  */
-export function buildChatServerInviteAuthority({ accountId, identity, cryptoProvider }) {
+export function buildChatServerInviteAuthority({ accountId, identity, cryptoProvider, hasAdminRoot = true }) {
   const keyId = "invite-ed25519-v1";
   const alg = "ed25519";
-  const privateKey = base64ToBytes(identity.privateKeyB64);
+  // S9 delegated mode: a seedless device holds NO account private key. The
+  // verifier and signerRef are pub-only and identical in both modes; the SIGN
+  // function THROWS so any residual account-sign consumer (group consent,
+  // future callers) fails loud instead of silently missigning — the delegated
+  // paths sign with the device key C inside PeerLinkService, never here.
+  const privateKey = hasAdminRoot ? base64ToBytes(identity.privateKeyB64) : null;
   const publicKey = base64ToBytes(identity.publicKeyB64);
   const signerPublicKeyB64 = identity.publicKeyB64;
   return {
@@ -34,6 +39,9 @@ export function buildChatServerInviteAuthority({ accountId, identity, cryptoProv
         return { accountId, keyId, alg, signerPublicKeyB64 };
       },
       async sign(bytes) {
+        if (!hasAdminRoot) {
+          throw new Error("chat-server invite authority: this device is delegated and holds no account root key (B-sign) — account-level signing requires the primary device");
+        }
         return cryptoProvider.sign({ privateKey, msg: bytes });
       },
     },
@@ -78,7 +86,14 @@ export function buildChatServerInviteAuthority({ accountId, identity, cryptoProv
  * pubkey. Chat-server owns both keys (Shape A), so this is a synchronous
  * self-sign; no node ceremony needed.
  */
-export async function selfProvisionAccountBinding({ peerLinkService, identity, cryptoProvider }) {
+export async function selfProvisionAccountBinding({ peerLinkService, identity, cryptoProvider, hasAdminRoot = true }) {
+  // S9 delegated mode: the device holds no account key to self-sign with —
+  // the SDK produces the C-signed binding (the S8 dual-mode verifier accepts
+  // it via the cert chain riding in the invite envelope).
+  if (!hasAdminRoot) {
+    await peerLinkService.selfProvisionDelegatedAccountBinding({ ownerAccountId: identity.accountId });
+    return;
+  }
   const challenge = await peerLinkService.getOrCreateAccountBindingChallenge({
     ownerAccountId: identity.accountId,
   });
@@ -142,23 +157,52 @@ export async function bootstrapChatServer({
     throw new Error("bootstrapChatServer requires wsUrl");
   }
 
+  // S9: one mode switch for the whole bootstrap. An identity stamped
+  // hasAdminRoot=false is a DELEGATED (seedless) device — the account key B
+  // exists here as a PUBLIC key only; the device key C is the only signer.
+  const hasAdminRoot = !(expectedChatServerIdentity && expectedChatServerIdentity.hasAdminRoot === false);
+  if (!hasAdminRoot) {
+    if (!deviceKey || !deviceKey.deviceKeyPair || !deviceKey.deviceKeyPair.publicKeyB64
+      || !deviceKey.deviceKeyPair.privateKeyB64 || !deviceKey.deviceId) {
+      throw new Error("bootstrapChatServer: a delegated chat-server identity requires deviceKey (the device key C is its only signer)");
+    }
+    if (!Array.isArray(expectedChatServerIdentity.certChain) || expectedChatServerIdentity.certChain.length === 0) {
+      throw new Error("bootstrapChatServer: a delegated chat-server identity requires a non-empty certChain");
+    }
+  }
+
   const cryptoProvider = new NodeCryptoProvider();
   const chatStorageDir = path.join(nodeDataDir, "chat-server");
   const bootstrapProvider = new FsStorageProvider({ rootDir: chatStorageDir });
   const identity = await ensureChatServerIdentity({
     storageProvider: bootstrapProvider,
     cryptoProvider,
-    expectedIdentity: expectedChatServerIdentity,
+    // A delegated row persists the self-certifying deviceId of C.
+    expectedIdentity: hasAdminRoot
+      ? expectedChatServerIdentity
+      : { ...expectedChatServerIdentity, deviceId: deviceKey.deviceId },
     allowOverwrite: allowChatServerIdentityRotation,
   });
   const ownerAccountId = identity.accountId;
 
-  const privateKeyBytes = base64ToBytes(identity.privateKeyB64);
-  const storageEncKey = cryptoProvider.hkdfSha256(privateKeyBytes, {
-    salt: new TextEncoder().encode("rez:chat-server:storage:v1"),
-    info: new TextEncoder().encode("rez:chat-server:kv:aes256gcm"),
-    length: 32,
-  });
+  // Storage at-rest key: rooted in the account key on a primary (unchanged),
+  // in the DEVICE key on a delegated device — with a DISTINCT salt label
+  // (never reuse a derivation label across key domains).
+  let storageEncKey;
+  if (hasAdminRoot) {
+    const privateKeyBytes = base64ToBytes(identity.privateKeyB64);
+    storageEncKey = cryptoProvider.hkdfSha256(privateKeyBytes, {
+      salt: new TextEncoder().encode("rez:chat-server:storage:v1"),
+      info: new TextEncoder().encode("rez:chat-server:kv:aes256gcm"),
+      length: 32,
+    });
+  } else {
+    storageEncKey = cryptoProvider.hkdfSha256(base64ToBytes(deviceKey.deviceKeyPair.privateKeyB64), {
+      salt: new TextEncoder().encode("rez:chat-server:storage:delegated:v1"),
+      info: new TextEncoder().encode("rez:chat-server:kv:aes256gcm"),
+      length: 32,
+    });
+  }
   const storageProvider = new FsStorageProvider({
     rootDir: chatStorageDir,
     encryptionKey: storageEncKey,
@@ -173,16 +217,26 @@ export async function bootstrapChatServer({
   const inboxClaimant = await InboxClaimant.bootstrap({
     storageProvider,
     cryptoProvider,
-    identity: {
-      publicKeyB64: identity.publicKeyB64,
-      privateKeyB64: identity.privateKeyB64,
-    },
+    // Delegated: the device key C claims the inbox (deterministic, keystore-
+    // persisted). The claimant is deliberately NOT the account identity —
+    // claimant/account unlinkability is the standing blindness primitive — so
+    // keying it on C changes nothing the node can see.
+    identity: hasAdminRoot
+      ? {
+          publicKeyB64: identity.publicKeyB64,
+          privateKeyB64: identity.privateKeyB64,
+        }
+      : {
+          publicKeyB64: deviceKey.deviceKeyPair.publicKeyB64,
+          privateKeyB64: deviceKey.deviceKeyPair.privateKeyB64,
+        },
   });
 
   const inviteAuthority = buildChatServerInviteAuthority({
     accountId: ownerAccountId,
     identity,
     cryptoProvider,
+    hasAdminRoot,
   });
   const peerLinkService = new PeerLinkService({
     storageProvider,
@@ -214,12 +268,19 @@ export async function bootstrapChatServer({
     accountIdentityDhKeyPair: expectedChatServerIdentity && expectedChatServerIdentity.accountIdentityDhKeyPair
       ? expectedChatServerIdentity.accountIdentityDhKeyPair
       : null,
+    // S9: cert-mode invite/device-set signing on a delegated device. The chain
+    // is vault-supplied at every boot (never persisted chat-server-side);
+    // hasAdminRoot is passed EXPLICITLY so a contradiction between the flag
+    // and the material fails loud in the PeerLinkService constructor.
+    accountCapabilityCertChain: hasAdminRoot ? null : expectedChatServerIdentity.certChain,
+    hasAdminRoot,
   });
 
   await selfProvisionAccountBinding({
     peerLinkService,
     identity,
     cryptoProvider,
+    hasAdminRoot,
   });
 
   const chatServer = new ChatServerApp({
@@ -232,11 +293,14 @@ export async function bootstrapChatServer({
       // SessionHello.deviceId is set from this field (AuthStateMachine).
       deviceId: deviceKey && deviceKey.deviceId ? deviceKey.deviceId : identity.deviceId,
       publicKeyB64: identity.publicKeyB64,
-      privateKeyB64: identity.privateKeyB64,
+      // Delegated: NO account private key exists — the SDK's AuthStateMachine
+      // signs the session challenge with C and attaches the chain (S7).
+      privateKeyB64: hasAdminRoot ? identity.privateKeyB64 : null,
       // The device keypair (C) so the SDK's IdentityCapability can build the
       // device-signed DeviceInboxBindingV1 + account-signed DeviceRegistrationV1
       // for `device.bind`. Null on a legacy keystore.
       deviceKey: deviceKey && deviceKey.deviceKeyPair ? deviceKey.deviceKeyPair : null,
+      ...(hasAdminRoot ? {} : { certChain: expectedChatServerIdentity.certChain }),
     },
     uplinks: [wsUrl],
     storageProvider,

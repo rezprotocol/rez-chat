@@ -80,6 +80,29 @@ export async function ensureChatServerIdentity({
     const expectedAccountId = String(expectedIdentity.accountId || "").trim();
     const expectedPub = String(expectedIdentity.publicKeyB64 || "").trim();
     const expectedPriv = String(expectedIdentity.privateKeyB64 || "").trim();
+    // S9 delegated branch: a seedless device holds NO account private key —
+    // its row persists the account PUBLIC key + the self-certifying deviceId
+    // of the device key C. A delegated identity that DOES carry a private key
+    // is a contradiction (someone parked admin-root material on a device that
+    // must not have it) — fail loud rather than persist it.
+    if (expectedIdentity.hasAdminRoot === false) {
+      if (expectedPriv) {
+        throw new Error("ensureChatServerIdentity: a delegated expectedIdentity must not carry privateKeyB64");
+      }
+      const delegatedDeviceId = String(expectedIdentity.deviceId || "").trim();
+      if (!expectedAccountId || !expectedPub || !delegatedDeviceId) {
+        throw new Error("ensureChatServerIdentity: a delegated expectedIdentity must include accountId, publicKeyB64, deviceId");
+      }
+      const record = new StoredServerIdentity({
+        accountId: expectedAccountId,
+        deviceId: delegatedDeviceId,
+        publicKeyB64: expectedPub,
+        privateKeyB64: "",
+        hasAdminRoot: false,
+      });
+      await kv.set(STORE_KEY, record.toJSON());
+      return record;
+    }
     if (!expectedAccountId || !expectedPub || !expectedPriv) {
       throw new Error("ensureChatServerIdentity: expectedIdentity must include accountId, publicKeyB64, privateKeyB64");
     }
