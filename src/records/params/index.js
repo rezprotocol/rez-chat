@@ -47,3 +47,7 @@ export { ContactsRequestConnectParams } from "./ContactsRequestConnectParams.js"
 export { ContactsApproveConnectParams } from "./ContactsApproveConnectParams.js";
 export { ContactsDenyConnectParams } from "./ContactsDenyConnectParams.js";
 export { ContactsListConnectRequestsParams } from "./ContactsListConnectRequestsParams.js";
+export { DeviceLinkStartParams } from "./DeviceLinkStartParams.js";
+export { DeviceLinkStatusParams } from "./DeviceLinkStatusParams.js";
+export { DeviceLinkApproveParams } from "./DeviceLinkApproveParams.js";
+export { DeviceLinkCancelParams } from "./DeviceLinkCancelParams.js";

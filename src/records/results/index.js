@@ -47,3 +47,7 @@ export { ContactsRequestConnectResult } from "./ContactsRequestConnectResult.js"
 export { ContactsApproveConnectResult } from "./ContactsApproveConnectResult.js";
 export { ContactsDenyConnectResult } from "./ContactsDenyConnectResult.js";
 export { ContactsListConnectRequestsResult } from "./ContactsListConnectRequestsResult.js";
+export { DeviceLinkStartResult } from "./DeviceLinkStartResult.js";
+export { DeviceLinkStatusResult } from "./DeviceLinkStatusResult.js";
+export { DeviceLinkApproveResult } from "./DeviceLinkApproveResult.js";
+export { DeviceLinkCancelResult } from "./DeviceLinkCancelResult.js";

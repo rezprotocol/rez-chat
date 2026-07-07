@@ -311,6 +311,12 @@ export async function bootstrapChatServer({
     // REZ-2: same account-key authority used for invite envelopes, reused to
     // sign + verify group membership-consent proofs.
     accountAuthority: inviteAuthority,
+    // S10: B-dh for the device-link approver (the delegation bundle ships the
+    // PAIR). Same source as the PeerLinkService wiring above; null on a
+    // pre-migration vault (deviceLink.start then fails loud).
+    accountIdentityDhKeyPair: expectedChatServerIdentity && expectedChatServerIdentity.accountIdentityDhKeyPair
+      ? expectedChatServerIdentity.accountIdentityDhKeyPair
+      : null,
     logger,
   });
 

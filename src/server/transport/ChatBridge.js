@@ -116,6 +116,15 @@ import {
   ChannelUpsertedEvent,
   ChannelRemovedEvent,
   ConnectRequestUpdatedEvent,
+  DeviceLinkStartParams,
+  DeviceLinkStatusParams,
+  DeviceLinkApproveParams,
+  DeviceLinkCancelParams,
+  DeviceLinkStartResult,
+  DeviceLinkStatusResult,
+  DeviceLinkApproveResult,
+  DeviceLinkCancelResult,
+  DeviceLinkUpdatedEvent,
 } from "../../records/index.js";
 
 export const CHAT_BRIDGE_SPEC = {
@@ -171,6 +180,10 @@ export const CHAT_BRIDGE_SPEC = {
     "profile.broadcast": { params: ProfileBroadcastParams, result: ProfileBroadcastResult },
     "profile.getOwn": { params: ProfileGetOwnParams, result: ProfileGetOwnResult },
     "links.unfurl": { params: LinksUnfurlParams, result: LinksUnfurlResult },
+    "deviceLink.start": { params: DeviceLinkStartParams, result: DeviceLinkStartResult },
+    "deviceLink.status": { params: DeviceLinkStatusParams, result: DeviceLinkStatusResult },
+    "deviceLink.approve": { params: DeviceLinkApproveParams, result: DeviceLinkApproveResult },
+    "deviceLink.cancel": { params: DeviceLinkCancelParams, result: DeviceLinkCancelResult },
   },
   events: {
     "message.deposited": MessageDepositedEvent,
@@ -193,6 +206,7 @@ export const CHAT_BRIDGE_SPEC = {
     "channel.upserted": ChannelUpsertedEvent,
     "channel.removed": ChannelRemovedEvent,
     "connectRequest.updated": ConnectRequestUpdatedEvent,
+    "deviceLink.updated": DeviceLinkUpdatedEvent,
   },
 };
 
@@ -247,6 +261,10 @@ export const CHAT_BRIDGE_METHOD_BINDINGS = Object.freeze({
   "profile.broadcast": { namespace: "profile", name: "broadcastUpdate", result: ProfileBroadcastResult },
   "profile.getOwn": { namespace: "profile", name: "getOwn", result: ProfileGetOwnResult },
   "links.unfurl": { namespace: "links", name: "unfurl", result: LinksUnfurlResult },
+  "deviceLink.start": { namespace: "deviceLink", name: "start", result: DeviceLinkStartResult },
+  "deviceLink.status": { namespace: "deviceLink", name: "status", result: DeviceLinkStatusResult },
+  "deviceLink.approve": { namespace: "deviceLink", name: "approve", result: DeviceLinkApproveResult },
+  "deviceLink.cancel": { namespace: "deviceLink", name: "cancel", result: DeviceLinkCancelResult },
 });
 
 export class ChatBridge {

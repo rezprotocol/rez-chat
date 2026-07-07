@@ -189,6 +189,12 @@ test("direct regression: a primary identity boots exactly as before (admin root,
   assert.equal(bootstrapped.identity.hasAdminRoot, true);
   assert.equal(bootstrapped.identity.privateKeyB64, identity.privateKeyB64);
   assert.equal(bootstrapped.peerLinkService.hasAdminRoot, true);
+  // S10: the device-link approver reads B-dh off the bus runtime.
+  assert.deepEqual(
+    bootstrapped.chatServer.bus.runtime.accountIdentityDhKeyPair,
+    identity.accountIdentityDhKeyPair,
+    "bootstrap threads B-dh onto bus.runtime for deviceLink.start",
+  );
   const bound = await bootstrapped.peerLinkService._requireBoundX3dhIdentity(identity.accountId);
   assert.equal("accountBindingSignerPublicKeyB64" in bound.accountBinding, false, "a direct binding gains NO signer field");
 

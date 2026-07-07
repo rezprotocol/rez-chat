@@ -17,6 +17,7 @@ import {
   ServerEventService,
   ServerPeerLinkProtocolService,
   ServerDeviceSetService,
+  ServerDeviceLinkService,
   ServerFileTransferService,
   ServerProfileService,
   ServerLinksService,
@@ -43,6 +44,7 @@ export class ChatServerApp {
     inboxClaimant = null,
     expectedNodePublicKeyB64 = "",
     accountAuthority = null,
+    accountIdentityDhKeyPair = null,
     logger = console,
   } = {}) {
     if (!Array.isArray(uplinks) || uplinks.length === 0) {
@@ -72,6 +74,11 @@ export class ChatServerApp {
     // ops. bootstrapChatServer passes the real authority; tests that drive the
     // group services directly install a double on bus.runtime.accountAuthority.
     this.bus.runtime.accountAuthority = accountAuthority;
+    // S10: the account identity-DH keypair (B-dh) — the delegation bundle a
+    // device-link ceremony seals must ship the PAIR. Primary boots thread it
+    // from the vault via bootstrapChatServer; null on legacy/web vaults
+    // (deviceLink.start fails loud with a typed error).
+    this.bus.runtime.accountIdentityDhKeyPair = accountIdentityDhKeyPair;
     this.#createServices({ identity, uplinks, clock, sdk, peerLinkService, inboxClaimant, expectedNodePublicKeyB64, logger });
     this.#bridge = new ChatBridge({
       bus: this.bus,
@@ -309,6 +316,14 @@ export class ChatServerApp {
       // desktop with a v2 keystore). The E6 fan-out gate lives in the sender
       // (ServerMessagesService), not here.
       deviceSet: new ServerDeviceSetService({
+        bus: this.bus,
+        ownerAccountId: this.#ownerAccountId,
+        clock,
+        logger,
+      }),
+      // S10: the PSK device-link approver flow (primary side). Directives
+      // fail loud with typed errors on delegated / pre-migration boots.
+      deviceLink: new ServerDeviceLinkService({
         bus: this.bus,
         ownerAccountId: this.#ownerAccountId,
         clock,
