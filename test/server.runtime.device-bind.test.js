@@ -79,13 +79,13 @@ function makeSdk({ durable = true, deviceKeyPub = "device-pub", bindImpl = null,
   return { sdk, calls, REGISTRATION };
 }
 
-function makeService({ sdk }) {
+function makeService({ sdk, identity = null }) {
   const bus = makeBus();
   const errors = [];
   const logger = { error: (...a) => errors.push(a), warn() {}, info() {}, log() {} };
   const svc = new ServerRuntimeService({
     bus,
-    identity: { accountId: "rez:acct:chat", deviceId: "rez:dev:self-cert", publicKeyB64: "p", privateKeyB64: "s" },
+    identity: identity || { accountId: "rez:acct:chat", deviceId: "rez:dev:self-cert", publicKeyB64: "p", privateKeyB64: "s" },
     uplinks: ["ws://node"],
     sdk,
     inboxClaimant: makeInboxClaimant(),
@@ -93,6 +93,17 @@ function makeService({ sdk }) {
   });
   return { svc, errors, bus };
 }
+
+// The S10 delegated identity shape: NO account private key; device key +
+// cert chain instead (the session cert chain IS the registration).
+const DELEGATED_IDENTITY = {
+  accountId: "rez:acct:chat",
+  deviceId: "rez:dev:self-cert",
+  publicKeyB64: "p",
+  privateKeyB64: null,
+  deviceKey: { publicKeyB64: "device-pub", privateKeyB64: "device-priv" },
+  certChain: [{ certId: "rez:cap:stub" }],
+};
 
 test("durable node + device key: device.bind is called once with the built records, bound to the claimed inbox", async () => {
   const { sdk, calls, REGISTRATION } = makeSdk({ durable: true, deviceKeyPub: "device-pub" });
@@ -181,4 +192,36 @@ test("gate OPEN + no device key: connect throws (cannot prove a device for a cur
   await assert.rejects(() => svc.connect(), /no device key/);
   assert.equal(svc.connected, false);
   assert.equal(calls.bind.length, 0, "bind not attempted without a device key");
+});
+
+// --- S10: a DELEGATED identity binds with the deviceInboxBinding ONLY — its
+// session cert chain IS the registration (S8 node dual-mode). Building the
+// account-signed DeviceRegistrationV1 needs B, which a delegated device does
+// not hold, so buildDeviceRegistration must never be invoked.
+
+test("S10 delegated + gate OPEN: bind sends a NULL registration and never builds one; connect is ready", async () => {
+  const { sdk, calls } = makeSdk({ durable: true, gateOpen: true, deviceKeyPub: "device-pub" });
+  const { svc } = makeService({ sdk, identity: DELEGATED_IDENTITY });
+  await svc.connect();
+  assert.equal(svc.connected, true);
+  assert.equal(calls.bind.length, 1, "device.bind called");
+  assert.equal(calls.buildReg, 0, "buildDeviceRegistration never invoked on a delegated identity");
+  assert.equal(calls.bind[0].deviceRegistration, null, "binding-only bind");
+  assert.deepEqual(calls.bind[0].deviceInboxBinding, { __kind: "DeviceInboxBindingV1", inboxId: INBOX });
+});
+
+test("S10 delegated + gate CLOSED: same binding-only call, best-effort semantics preserved", async () => {
+  const { sdk, calls } = makeSdk({
+    durable: true,
+    gateOpen: false,
+    deviceKeyPub: "device-pub",
+    bindImpl: () => { throw Object.assign(new Error("boom"), { code: "SERVICE_UNAVAILABLE" }); },
+  });
+  const { svc, errors } = makeService({ sdk, identity: DELEGATED_IDENTITY });
+  await svc.connect();
+  assert.equal(svc.connected, true, "gate closed: a bind failure never breaks connect");
+  assert.equal(calls.buildReg, 0);
+  assert.equal(calls.bind.length, 1);
+  assert.equal(calls.bind[0].deviceRegistration, null);
+  assert.equal(errors.length, 1, "logged, not swallowed");
 });

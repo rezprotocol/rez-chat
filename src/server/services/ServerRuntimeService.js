@@ -31,6 +31,11 @@ export class ServerRuntimeService extends BaseServerService {
 
   #inboxClaimant;
 
+  // S10: whether this identity holds the account root (B-sign private key).
+  // A DELEGATED identity binds with its device-signed inbox binding only —
+  // the session cert chain is its registration.
+  #hasAccountKey;
+
   constructor({
     bus,
     identity,
@@ -52,6 +57,7 @@ export class ServerRuntimeService extends BaseServerService {
     this.#lastStatus = "";
     this.#offState = null;
     this.#offMailboxPushBridge = null;
+    this.#hasAccountKey = Boolean(identity.privateKeyB64);
     // Tests inject a fake `sdk`; production wires via createRezClient.
     // peerLinkService is injected by ChatServerApp so the SDK can encrypt
     // outbound messages locally (Shape A) — see docs/CAPABILITY_MODEL.md.
@@ -232,7 +238,13 @@ export class ServerRuntimeService extends BaseServerService {
 
     const inboxId = this.#inboxClaimant.inboxId;
     try {
-      const deviceRegistration = await sdk.identity.buildDeviceRegistration();
+      // S10: a DELEGATED identity (no account private key) sends the binding
+      // ONLY — its session cert chain IS the registration (S8 node handler
+      // dual-mode). Building the account-signed DeviceRegistrationV1 requires
+      // B, so only a primary can (and must) attach it.
+      const deviceRegistration = this.#hasAccountKey
+        ? await sdk.identity.buildDeviceRegistration()
+        : null;
       const deviceInboxBinding = await sdk.identity.buildDeviceInboxBinding({ inboxId });
       await sdk.devices.bind({ deviceRegistration, deviceInboxBinding });
     } catch (err) {
