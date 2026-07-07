@@ -163,7 +163,7 @@ test("listAccounts marks the row delegated with recovery deliberately off", asyn
   vault.close();
 });
 
-test("mnemonic-rooted methods fail loud with the delegated message; changePassword defers to S10", async () => {
+test("mnemonic-rooted methods fail loud with the delegated message (recovery lives on the primary)", async () => {
   const vault = openVault();
   const d = makeDelegationInputs();
   await vault.createDelegatedAccount({
@@ -185,10 +185,57 @@ test("mnemonic-rooted methods fail loud with the delegated message; changePasswo
     () => vault.resetPasswordWithMnemonic({ accountId, mnemonic: "abandon ".repeat(23) + "art", newPassword: "another strong pw" }),
     /delegated device — the recovery phrase and backup live on the primary device/,
   );
+  vault.close();
+});
+
+test("S10 changePassword on a delegated row: payload-preserving re-seal, identical identity under the new password", async () => {
+  const vault = openVault();
+  const d = makeDelegationInputs();
+  await vault.createDelegatedAccount({
+    profileName: "Phone",
+    password: PASSWORD,
+    deviceKeyPair: d.deviceKeyPair,
+    delegationBundle: d.delegationBundle,
+  });
+  const before = vault.getChatServerIdentity();
+  const beforeDevice = vault.getActiveDeviceKey();
+  const NEW = "a whole new strong password";
+  const result = await vault.changePassword({ accountId: d.accountId, oldPassword: PASSWORD, newPassword: NEW });
+  assert.equal(result.accountId, d.accountId);
+  assert.equal(vault.status().locked, true, "re-seal auto-locks");
+
+  // The OLD password no longer unlocks; the NEW one does, with a byte-identical
+  // delegated identity (chain, B-dh, device key all preserved).
   await assert.rejects(
-    () => vault.changePassword({ accountId, oldPassword: PASSWORD, newPassword: "another strong pw" }),
-    /changePassword is not yet supported on a delegated device/,
+    () => vault.unlock({ accountId: d.accountId, password: PASSWORD }),
+    /decrypt|password|unlock|OperationError|integrity/i,
   );
+  await vault.unlock({ accountId: d.accountId, password: NEW });
+  const after = vault.getChatServerIdentity();
+  assert.equal(after.hasAdminRoot, false);
+  assert.equal(after.publicKeyB64, before.publicKeyB64);
+  assert.deepEqual(after.certChain, before.certChain);
+  assert.deepEqual(after.accountIdentityDhKeyPair, before.accountIdentityDhKeyPair);
+  assert.deepEqual(vault.getActiveDeviceKey().deviceKeyPair, beforeDevice.deviceKeyPair);
+  vault.close();
+});
+
+test("S10 delegated changePassword with the wrong old password does not mutate the row", async () => {
+  const vault = openVault();
+  const d = makeDelegationInputs();
+  await vault.createDelegatedAccount({
+    profileName: "Phone",
+    password: PASSWORD,
+    deviceKeyPair: d.deviceKeyPair,
+    delegationBundle: d.delegationBundle,
+  });
+  await assert.rejects(
+    () => vault.changePassword({ accountId: d.accountId, oldPassword: "wrong password", newPassword: "another strong pw" }),
+    /decrypt|password|unlock|OperationError|integrity/i,
+  );
+  // The original password still unlocks — nothing was half-written.
+  await vault.unlock({ accountId: d.accountId, password: PASSWORD });
+  assert.equal(vault.getChatServerIdentity().hasAdminRoot, false);
   vault.close();
 });
 

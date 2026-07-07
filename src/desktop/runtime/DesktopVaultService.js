@@ -1071,11 +1071,12 @@ export class DesktopVaultService {
     if (oldPwd === newPwd) throw new Error("vault.changePassword: new password matches old password");
     const row = this.#loadAccountRow(accountId);
     if (!row) throw new Error("No vault account found");
-    // S9: the change path rebuilds the keystore from identityKeyPair, which a
-    // v3 (delegated) row does not have. S10 adds an atomic delegated re-seal;
-    // fail loud until then rather than risk a half-written keystore.
+    // S10: a delegated (v3) row has no identityKeyPair to rebuild the keystore
+    // from, so it takes a payload-PRESERVING re-seal path (decrypt the sealed
+    // v3 payload with the old KEK, re-encrypt the SAME bytes under a fresh
+    // new-password KEK). Version-agnostic and row-atomic.
     if (row.hasAdminRoot === 0) {
-      throw new Error("vault.changePassword is not yet supported on a delegated device");
+      return this.#resealDelegatedKeystore({ row, oldPwd, newPwd });
     }
 
     // Verify old by running the full unlock chain end-to-end. This also yields
@@ -1144,6 +1145,88 @@ export class DesktopVaultService {
       // collected on GC. Keeping the mnemonic as bytes end-to-end is a v1
       // architectural follow-up, not a code-line fix.
       appDataKeyBytes.fill(0);
+    }
+  }
+
+  /**
+   * S10 — change the password on a DELEGATED (v3) row without an identity
+   * keypair. Payload-preserving: verify the old password (unlock validates
+   * the whole chain), decrypt the sealed keystore payload with the old KEK,
+   * re-encrypt the SAME bytes under a fresh-salt new-password KEK, re-wrap the
+   * appDataKey, and commit both in ONE row UPDATE (row-atomic — no half-write).
+   * The mnemonic columns are NULL on a delegated row and stay untouched.
+   */
+  async #resealDelegatedKeystore({ row, oldPwd, newPwd }) {
+    // Verify the old password by running the full unlock (structural +
+    // anti-tamper validation of the v3 payload).
+    await unlockKeystoreAccount({
+      password: oldPwd,
+      keystoreStore: new MemoryKeystoreStore(JSON.parse(row.keystoreEnvelopeJson)),
+      cryptoProvider: this.#cryptoProvider,
+    });
+
+    const oldEnvelope = JSON.parse(row.keystoreEnvelopeJson);
+    const oldSalt = fromBase64(oldEnvelope.saltB64);
+    const oldUnlockKey = await deriveUnlockKey({
+      password: oldPwd,
+      saltBytes: oldSalt,
+      kdfParams: oldEnvelope.kdfParams,
+      cryptoProvider: this.#cryptoProvider,
+    });
+    const payloadBytes = await decryptKeystore({
+      unlockKeyBytes: oldUnlockKey,
+      envelope: oldEnvelope,
+      cryptoProvider: this.#cryptoProvider,
+    });
+
+    const appDataKeyBytes = await this.#decryptAppDataKey({
+      password: oldPwd,
+      appKeyEnvelope: JSON.parse(row.appKeyEnvelopeJson),
+      safeWrappedAppKeyB64: row.safeWrappedAppKeyB64,
+    });
+    try {
+      const newSalt = randomBytes(16, this.#cryptoProvider);
+      const newKdfParams = getDefaultKdfParams(this.#cryptoProvider);
+      const newUnlockKey = await deriveUnlockKey({
+        password: newPwd,
+        saltBytes: newSalt,
+        kdfParams: newKdfParams,
+        cryptoProvider: this.#cryptoProvider,
+      });
+      const { ciphertextBytes } = await encryptKeystore({
+        unlockKeyBytes: newUnlockKey,
+        plaintextJsonBytes: payloadBytes,
+        cryptoProvider: this.#cryptoProvider,
+      });
+      const now = this.#clock();
+      const newEnvelope = createKeystoreEnvelope({
+        kdfParams: newKdfParams,
+        saltB64: toBase64(newSalt),
+        ciphertextB64: toBase64(ciphertextBytes),
+        createdAtMs: Number(oldEnvelope.createdAtMs) || now,
+        updatedAtMs: now,
+      });
+      const newAppKeyEnvelope = await this.#encryptAppDataKey({ password: newPwd, appDataKeyBytes });
+      const newSafeWrappedAppKeyB64 = await this.#safeWrapAppDataKey(appDataKeyBytes);
+      this.#requireDb().prepare(`
+        UPDATE vault_accounts SET
+          keystoreEnvelopeJson = ?,
+          appKeyEnvelopeJson = ?,
+          safeWrappedAppKeyB64 = ?,
+          safeWrappedPasswordB64 = NULL,
+          updatedAtMs = ?
+        WHERE accountId = ?
+      `).run(
+        JSON.stringify(newEnvelope),
+        JSON.stringify(newAppKeyEnvelope),
+        newSafeWrappedAppKeyB64,
+        now,
+        row.accountId,
+      );
+      this.lock();
+      return { accountId: row.accountId, deviceUnlockEnabled: false };
+    } finally {
+      if (appDataKeyBytes instanceof Uint8Array) appDataKeyBytes.fill(0);
     }
   }
 
