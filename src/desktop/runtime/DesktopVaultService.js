@@ -5,6 +5,7 @@ import { scrypt as nodeScrypt, createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import {
   createKeystoreAccount,
+  createDelegatedKeystoreAccount,
   unlockKeystoreAccount,
   createKeystoreEnvelope,
   getDefaultKdfParams,
@@ -217,7 +218,7 @@ export class DesktopVaultService {
   listAccounts() {
     const db = this.#requireDb();
     const rows = db.prepare(`
-      SELECT accountId, profileNameHint, safeWrappedPasswordB64, mnemonicEnvelopeJson, createdAtMs, updatedAtMs FROM vault_accounts
+      SELECT accountId, profileNameHint, safeWrappedPasswordB64, mnemonicEnvelopeJson, hasAdminRoot, createdAtMs, updatedAtMs FROM vault_accounts
       ORDER BY updatedAtMs DESC, accountId ASC
     `).all();
     return rows.map((row) => ({
@@ -230,6 +231,10 @@ export class DesktopVaultService {
       // The lock screen uses this to route them through the Phase 6 re-create
       // migration instead of an unlock form that would fail at connect().
       recoveryEnabled: typeof row.mnemonicEnvelopeJson === "string" && row.mnemonicEnvelopeJson.length > 0,
+      // S9: a DELEGATED (seedless) row — deliberately no recovery phrase (it
+      // lives on the primary device). Distinguishes it from a pre-BIP39
+      // "please re-create" row, which also has recoveryEnabled false.
+      delegated: row.hasAdminRoot === 0,
       createdAtMs: Number(row.createdAtMs) || null,
       updatedAtMs: Number(row.updatedAtMs) || null,
     }));
@@ -309,6 +314,81 @@ export class DesktopVaultService {
     }
   }
 
+  /**
+   * S9 — create a DELEGATED (seedless) vault account from a delegation bundle.
+   * No mnemonic exists: the account signing key lives ONLY on the primary
+   * device; this row seals the account PUBLIC key, the account X25519 DH key,
+   * the device key C (minted by the CALLER before the cert was granted — the
+   * chain's leaf grantee is fixed), the capability chain, and an optional
+   * cached device set into a keystore payload v3. The S10 PSK ceremony is the
+   * production source of `delegationBundle`; S9 tests build it locally.
+   */
+  async createDelegatedAccount({ profileName = "", password = "", deviceKeyPair = null, delegationBundle = null } = {}) {
+    const name = normalizeString(profileName);
+    const pwd = String(password || "");
+    if (!name) throw new Error("vault.createDelegatedAccount requires profileName");
+    if (pwd.length < 8) throw new Error("vault.createDelegatedAccount requires password length >= 8");
+    if (!deviceKeyPair || !deviceKeyPair.publicKeyB64 || !deviceKeyPair.privateKeyB64) {
+      throw new Error("vault.createDelegatedAccount requires deviceKeyPair (the device key C, minted before the cert was granted)");
+    }
+    const bundle = delegationBundle && typeof delegationBundle === "object" ? delegationBundle : null;
+    if (!bundle) throw new Error("vault.createDelegatedAccount requires delegationBundle");
+    if (!bundle.accountSignPublicKeyB64) {
+      throw new Error("vault.createDelegatedAccount requires delegationBundle.accountSignPublicKeyB64");
+    }
+    if (!bundle.accountDhKeyPair || !bundle.accountDhKeyPair.publicKeyB64 || !bundle.accountDhKeyPair.privateKeyB64) {
+      throw new Error("vault.createDelegatedAccount requires delegationBundle.accountDhKeyPair");
+    }
+    if (!Array.isArray(bundle.certChain) || bundle.certChain.length === 0) {
+      throw new Error("vault.createDelegatedAccount requires a non-empty delegationBundle.certChain");
+    }
+
+    let appDataKeyBytes = null;
+    try {
+      const keystoreStore = new MemoryKeystoreStore();
+      // The keystore does the heavy structural validation (chain anchoring/
+      // linkage/grantee binding, seedless invariants, anti-tamper ids).
+      const created = await createDelegatedKeystoreAccount({
+        password: pwd,
+        profileName: name,
+        keystoreStore,
+        cryptoProvider: this.#cryptoProvider,
+        delegation: {
+          accountSignPublicKeyB64: bundle.accountSignPublicKeyB64,
+          accountDhKeyPair: bundle.accountDhKeyPair,
+          deviceKeyPair,
+          certChain: bundle.certChain,
+          cachedDeviceSet: bundle.cachedDeviceSet === undefined ? null : bundle.cachedDeviceSet,
+        },
+      });
+      const envelope = await keystoreStore.getKeystoreEnvelope();
+      appDataKeyBytes = randomBytes(32, this.#cryptoProvider);
+      const appKeyEnvelope = await this.#encryptAppDataKey({ password: pwd, appDataKeyBytes });
+      const safeWrappedAppKeyB64 = await this.#safeWrapAppDataKey(appDataKeyBytes);
+      const now = this.#clock();
+      // NO mnemonicEnvelopeJson, NO seedFingerprintB64 — there is no seed.
+      this.#requireDb().prepare(`
+        INSERT INTO vault_accounts (
+          accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64,
+          mnemonicEnvelopeJson, seedFingerprintB64, hasAdminRoot, createdAtMs, updatedAtMs
+        ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?)
+      `).run(
+        created.accountId,
+        name,
+        JSON.stringify(envelope),
+        JSON.stringify(appKeyEnvelope),
+        safeWrappedAppKeyB64,
+        now,
+        now,
+      );
+      // unlock() rebuilds the delegated chat-server identity straight from the
+      // v3 keystore payload — no pending stash needed.
+      return this.unlock({ accountId: created.accountId, password: pwd });
+    } finally {
+      if (appDataKeyBytes instanceof Uint8Array) appDataKeyBytes.fill(0);
+    }
+  }
+
   async unlock({ accountId = null, password = "", enableDeviceUnlock = false } = {}) {
     const pwd = String(password || "");
     if (!pwd) throw new Error("vault.unlock requires password");
@@ -337,6 +417,8 @@ export class DesktopVaultService {
     const seedName = normalizeString(unlocked.profileName);
     const resolvedName = hintName && hintName !== "Account" ? hintName : seedName;
     // Resolve the chat-server identity. Order of preference:
+    //   0. DELEGATED (v3 keystore): built straight from the unlocked payload —
+    //      account PUBLIC key + chain + B-dh, NO private key, no mnemonic step.
     //   1. The just-derived identity stashed by createAccount() (avoids a
     //      redundant scrypt+HKDF round on the create→unlock chain).
     //   2. Re-derive from the mnemonic stored in the vault row.
@@ -344,7 +426,17 @@ export class DesktopVaultService {
     //      proceed in that state with a "please re-create" prompt; this code
     //      just hands back null so the caller can detect and prompt).
     let chatServerIdentity = null;
-    if (this.#pendingChatServerIdentity && this.#pendingChatServerIdentity.accountId) {
+    if (unlocked.hasAdminRoot === false) {
+      chatServerIdentity = {
+        accountId: unlocked.accountId,
+        publicKeyB64: unlocked.identityPublicKey,
+        privateKeyB64: null,
+        hasAdminRoot: false,
+        certChain: cloneJson(unlocked.certChain),
+        accountIdentityDhKeyPair: cloneJson(unlocked.accountIdentityDhKeyPair),
+      };
+      this.#pendingChatServerIdentity = null;
+    } else if (this.#pendingChatServerIdentity && this.#pendingChatServerIdentity.accountId) {
       chatServerIdentity = this.#pendingChatServerIdentity;
       this.#pendingChatServerIdentity = null;
     } else if (typeof row.mnemonicEnvelopeJson === "string" && row.mnemonicEnvelopeJson.length > 0) {
@@ -598,13 +690,20 @@ export class DesktopVaultService {
     if (!this.#activeAccount) return null;
     const ident = this.#activeAccount.chatServerIdentity;
     if (!ident || !ident.accountId) return null;
+    // S9: hasAdminRoot false = a DELEGATED (seedless) device — privateKeyB64
+    // is null and the vault-held capability chain rides along (the vault is
+    // the chain's SSOT; bootstrapChatServer consumes it every boot).
+    const delegated = ident.hasAdminRoot === false;
     return {
       accountId: ident.accountId,
       publicKeyB64: ident.publicKeyB64,
-      privateKeyB64: ident.privateKeyB64,
-      // Seed-derived account identity-DH key (X25519), shared across all of the
-      // account's devices — threaded into PeerLinkService for the device-set
-      // peer-scoped seal (Audit P1). Null on a pre-migration vault.
+      privateKeyB64: delegated ? null : ident.privateKeyB64,
+      hasAdminRoot: delegated ? false : true,
+      ...(delegated ? { certChain: cloneJson(ident.certChain) } : {}),
+      // Account identity-DH key (X25519), shared across all of the account's
+      // devices — threaded into PeerLinkService for the device-set peer-scoped
+      // seal (Audit P1). Seed-derived on a primary, bundle-carried on a
+      // delegated device. Null on a pre-migration vault.
       accountIdentityDhKeyPair: ident.accountIdentityDhKeyPair
         ? { publicKeyB64: ident.accountIdentityDhKeyPair.publicKeyB64, privateKeyB64: ident.accountIdentityDhKeyPair.privateKeyB64 }
         : null,
@@ -640,6 +739,9 @@ export class DesktopVaultService {
     if (!pwd) throw new Error("vault.revealMnemonic requires password");
     const row = this.#loadAccountRow(accountId);
     if (!row) throw new Error("No vault account found");
+    if (row.hasAdminRoot === 0) {
+      throw new Error("This is a delegated device — the recovery phrase and backup live on the primary device");
+    }
     if (typeof row.mnemonicEnvelopeJson !== "string" || row.mnemonicEnvelopeJson.length === 0) {
       throw new Error("Account has no recovery phrase (pre-BIP39 schema)");
     }
@@ -677,6 +779,9 @@ export class DesktopVaultService {
     if (newPwd.length < 8) throw new Error("vault.resetPasswordWithMnemonic requires newPassword length >= 8");
     const row = this.#loadAccountRow(accountId);
     if (!row) throw new Error("No vault account found");
+    if (row.hasAdminRoot === 0) {
+      throw new Error("This is a delegated device — the recovery phrase and backup live on the primary device");
+    }
     if (typeof row.seedFingerprintB64 !== "string" || row.seedFingerprintB64.length === 0) {
       throw new Error("Account has no recovery fingerprint (pre-BIP39 schema)");
     }
@@ -768,6 +873,9 @@ export class DesktopVaultService {
     if (!pwd) throw new Error("vault.exportBackup requires password");
     const row = this.#loadAccountRow(accountId);
     if (!row) throw new Error("No vault account found");
+    if (row.hasAdminRoot === 0) {
+      throw new Error("This is a delegated device — the recovery phrase and backup live on the primary device");
+    }
     if (typeof row.mnemonicEnvelopeJson !== "string" || row.mnemonicEnvelopeJson.length === 0
       || typeof row.seedFingerprintB64 !== "string" || row.seedFingerprintB64.length === 0) {
       throw new Error("Account has no recovery phrase (pre-BIP39 schema)");
@@ -963,6 +1071,12 @@ export class DesktopVaultService {
     if (oldPwd === newPwd) throw new Error("vault.changePassword: new password matches old password");
     const row = this.#loadAccountRow(accountId);
     if (!row) throw new Error("No vault account found");
+    // S9: the change path rebuilds the keystore from identityKeyPair, which a
+    // v3 (delegated) row does not have. S10 adds an atomic delegated re-seal;
+    // fail loud until then rather than risk a half-written keystore.
+    if (row.hasAdminRoot === 0) {
+      throw new Error("vault.changePassword is not yet supported on a delegated device");
+    }
 
     // Verify old by running the full unlock chain end-to-end. This also yields
     // the plaintext appDataKey we need to re-encrypt under the new KEK.
@@ -1211,12 +1325,12 @@ export class DesktopVaultService {
     const id = normalizeString(accountId);
     if (id) {
       return db.prepare(`
-        SELECT accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64, safeWrappedPasswordB64, avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64
+        SELECT accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64, safeWrappedPasswordB64, avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64, hasAdminRoot
         FROM vault_accounts WHERE accountId = ?
       `).get(id);
     }
     return db.prepare(`
-      SELECT accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64, safeWrappedPasswordB64, avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64
+      SELECT accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64, safeWrappedPasswordB64, avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64, hasAdminRoot
       FROM vault_accounts ORDER BY updatedAtMs DESC, accountId ASC LIMIT 1
     `).get();
   }
@@ -1400,6 +1514,12 @@ export class DesktopVaultService {
     const hasSeedFp = columns.some((c) => c.name === "seedFingerprintB64");
     if (!hasSeedFp) {
       db.exec(`ALTER TABLE vault_accounts ADD COLUMN seedFingerprintB64 TEXT`);
+    }
+    // S9: NULL = legacy/primary (admin-root) row; 0 = DELEGATED (seedless) row
+    // — no mnemonic, no seed fingerprint, keystore payload v3.
+    const hasAdminRootCol = columns.some((c) => c.name === "hasAdminRoot");
+    if (!hasAdminRootCol) {
+      db.exec(`ALTER TABLE vault_accounts ADD COLUMN hasAdminRoot INTEGER`);
     }
   }
 
