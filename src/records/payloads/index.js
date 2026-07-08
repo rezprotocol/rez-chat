@@ -32,6 +32,7 @@ import { ChatAvatarPayloadV1, AVATAR_KIND } from "./ChatAvatarPayloadV1.js";
 import { ChatSystemEventPayloadV1, SYSTEM_EVENT_KIND } from "./ChatSystemEventPayloadV1.js";
 import { ConnectRequestPayloadV1, CONNECT_REQUEST_KIND } from "./ConnectRequestPayloadV1.js";
 import { ChatConnectAcceptedPayloadV1, CONNECT_ACCEPTED_KIND } from "./ChatConnectAcceptedPayloadV1.js";
+import { AccountStateEventPayloadV1, ACCOUNT_STATE_EVENT_KIND } from "./AccountStateEventPayloadV1.js";
 import { FileManifestV1, FileChunkV1 } from "@rezprotocol/sdk/filetransfer";
 import { ProfilePayloadV1 } from "@rezprotocol/sdk/profile";
 
@@ -50,6 +51,8 @@ export {
   ChatSystemEventPayloadV1,
   ConnectRequestPayloadV1,
   ChatConnectAcceptedPayloadV1,
+  AccountStateEventPayloadV1,
+  ACCOUNT_STATE_EVENT_KIND,
   FileManifestV1,
   FileChunkV1,
   ProfilePayloadV1,
@@ -148,6 +151,22 @@ const ENTRIES = [
         groupId: ctx && typeof ctx.groupId === "string" ? ctx.groupId : "",
       });
       return Boolean(consumed);
+    },
+  },
+  {
+    kind: ACCOUNT_STATE_EVENT_KIND,
+    recordClass: AccountStateEventPayloadV1,
+    // S14: a self account-state event fanned to us by a sibling device. It
+    // decrypted via the account-state key (ServerPeerLinkProtocolService) — only
+    // our own account's devices can produce it — so it carries no peer sender and
+    // is ALWAYS consumed (never falls through to the message-persist path), whether
+    // or not it applied (a stale/self replay is consumed too).
+    async dispatch(record, _ctx, services) {
+      const sync = services && services.accountStateSync;
+      if (sync && typeof sync.applyInbound === "function") {
+        await sync.applyInbound(record);
+      }
+      return true;
     },
   },
   {
