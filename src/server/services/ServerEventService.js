@@ -143,6 +143,12 @@ export class ServerEventService extends BaseServerService {
           this.logger.error("[ServerEventService] contact ensure failed", err && err.message ? err.message : err);
           this._emit("app.error", { source: "ServerEventService", message: "contact ensure failed", severity: "warn", err });
         });
+        // S14: replicate the newly-materialized DIRECT relationship to our SIBLING
+        // devices (rich delta — contact + peer-link relationship + thread) so a
+        // sibling that never took part in this invite surfaces (and can reply to)
+        // this peer's fanned-out messages. Best-effort; a sibling fan-out failure
+        // never blocks the local materialization.
+        this.#replicateContactRelationship({ peerAccountId, remoteDisplayName, peerInboxId, peerLinkId, threadId });
       }
       if (peerAccountId && this.bus.services.profile && typeof this.bus.services.profile.sendProfileToPeer === "function") {
         this.bus.services.profile.sendProfileToPeer({
@@ -563,6 +569,25 @@ export class ServerEventService extends BaseServerService {
         senderAccountId,
       },
     });
+  }
+
+  // S14: fan the account-state delta for a materialized direct relationship out to
+  // our SIBLING devices. Fire-and-forget + best-effort — never blocks the local
+  // materialization path. No-op when the sync service is disabled (single-device).
+  #replicateContactRelationship({ peerAccountId, remoteDisplayName, peerInboxId, peerLinkId, threadId }) {
+    const sync = this.bus.services && this.bus.services.accountStateSync ? this.bus.services.accountStateSync : null;
+    if (!sync || typeof sync.replicate !== "function") return;
+    sync.replicate({
+      op: "contact.upsert",
+      payload: {
+        accountId: peerAccountId,
+        relationshipState: "active",
+        displayName: typeof remoteDisplayName === "string" ? remoteDisplayName : "",
+        peerInboxId: typeof peerInboxId === "string" ? peerInboxId : "",
+        peerLinkId: typeof peerLinkId === "string" ? peerLinkId : "",
+        threadId: typeof threadId === "string" ? threadId : "",
+      },
+    }).catch((err) => this.logger.warn("[ServerEventService] account-state replicate failed", err && err.message ? err.message : err));
   }
 
   /**

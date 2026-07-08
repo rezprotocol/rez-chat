@@ -32,7 +32,7 @@ function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:d
     directThreadIdForPeerLink: (plId, peer) => "th_" + plId,
   };
   const bus = {
-    runtime: { sdk, peerLinks: { deviceId } },
+    runtime: { sdk, peerLinks: { deviceId }, multiDeviceFanout: true },
     services: { contacts, threads },
     on() { return () => {}; }, emit() {}, registerFunction() {}, call() { return Promise.resolve(null); },
   };

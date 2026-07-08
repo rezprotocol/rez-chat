@@ -58,12 +58,17 @@ export class ServerAccountStateSyncService extends BaseServerService {
     return pl && typeof pl.deviceId === "string" ? pl.deviceId.trim() : "";
   }
 
-  // True when this account can FAN OUT self-events (per-device sessions + the SDK
-  // self-deposit primitives). applyInbound has a lighter bar (see below).
+  // True when this account can FAN OUT self-events: the node advertises
+  // multi-device fan-out (so siblings actually exist on a shared home) AND this
+  // account runs per-device sessions with the SDK self-deposit primitives. Gated
+  // on multiDeviceFanout like the sender fan-out, so single-device/fs/legacy nodes
+  // are byte-identical (no emit, no getAccountDeviceSet call). applyInbound has a
+  // lighter bar — a sibling always applies a self-event it received + decrypted.
   isEnabled() {
     const sdk = this.#sdk();
     return Boolean(
-      this.#deviceId()
+      this.bus.runtime && this.bus.runtime.multiDeviceFanout === true
+        && this.#deviceId()
         && sdk
         && typeof sdk.buildAccountStateDeposit === "function"
         && typeof sdk.listSiblingDeviceInboxes === "function"

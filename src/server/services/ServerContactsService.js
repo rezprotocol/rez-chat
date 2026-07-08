@@ -209,6 +209,13 @@ export class ServerContactsService extends BaseServerService {
     // its local store. The thread teardown above fires its own thread.removed.
     if (result && result.deleted === true) {
       this.#emitContactRemoved(params.accountId);
+      // S14: replicate the removal to our SIBLING devices so they drop the contact
+      // + its thread too. Best-effort; never blocks the local delete.
+      const sync = this.bus.services && this.bus.services.accountStateSync ? this.bus.services.accountStateSync : null;
+      if (sync && typeof sync.replicate === "function") {
+        sync.replicate({ op: "contact.remove", payload: { accountId: params.accountId } })
+          .catch((err) => this.logger.warn("[ServerContactsService] account-state replicate (remove) failed", err && err.message ? err.message : err));
+      }
     }
     return new ContactsDeleteResult({ deleted: result && result.deleted === true });
   }
