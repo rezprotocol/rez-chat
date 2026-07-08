@@ -13,7 +13,7 @@ function makeKv() {
 }
 
 function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:dev:sib", inboxId: "inbox:sib" }], withSdk = true, kv = makeKv() } = {}) {
-  const calls = { dispatch: [], deposits: [], ensureActive: [], ensureKnown: [], deleteContact: [], ensureThread: [] };
+  const calls = { dispatch: [], deposits: [], ensureActive: [], ensureKnown: [], deleteContact: [], ensureThread: [], upsertRelationship: [] };
   const sdk = withSdk ? {
     listSiblingDeviceInboxes: async () => siblings,
     buildAccountStateDeposit: async ({ deliverInboxId, plaintextBodyBytes }) => {
@@ -31,8 +31,12 @@ function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:d
     ensureDirectThread: async (a) => { calls.ensureThread.push(a); },
     directThreadIdForPeerLink: (plId, peer) => "th_" + plId,
   };
+  const peerLinks = {
+    deviceId,
+    upsertPeerRelationship: async (a) => { calls.upsertRelationship.push(a); },
+  };
   const bus = {
-    runtime: { sdk, peerLinks: { deviceId }, multiDeviceFanout: true },
+    runtime: { sdk, peerLinks, multiDeviceFanout: true },
     services: { contacts, threads },
     on() { return () => {}; }, emit() {}, registerFunction() {}, call() { return Promise.resolve(null); },
   };
@@ -42,7 +46,11 @@ function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:d
 
 const CONTACT_UPSERT = {
   op: "contact.upsert",
-  payload: { accountId: "rez:acct:carol", relationshipState: "active", displayName: "Carol", peerInboxId: "inbox:carol", peerLinkId: "pl_1", threadId: "th_carol" },
+  payload: {
+    accountId: "rez:acct:carol", relationshipState: "active", displayName: "Carol",
+    peerInboxId: "inbox:carol", peerLinkId: "pl_1", threadId: "th_carol",
+    remoteAccountIdentityPublicKeyB64: "carolBpub", remoteIdentityDhPublicKeyB64: "carolDHpub",
+  },
 };
 
 test("replicate fans a contact.upsert to sibling inboxes with a monotonic lamport", async () => {
@@ -69,15 +77,30 @@ test("replicate is a no-op with no siblings and when the SDK is absent", async (
   assert.deepEqual(await noSdk.svc.replicate(CONTACT_UPSERT), { fannedOut: 0 });
 });
 
-test("applyInbound contact.upsert (active) makes the contact active AND materializes the thread", async () => {
+test("applyInbound contact.upsert (active) makes the contact active, records the peer-link relationship, AND materializes the thread", async () => {
   const { svc, calls } = makeHarness();
   const res = await svc.applyInbound({ ...CONTACT_UPSERT, lamport: 5, originDeviceId: "rez:dev:sib", issuedAtMs: 1000 });
   assert.deepEqual(res, { applied: true });
   assert.equal(calls.ensureActive.length, 1);
   assert.equal(calls.ensureActive[0].accountId, "rez:acct:carol");
+  // The peer-link relationship (identity + routing, no ratchet) is recorded so the
+  // sibling can complete its own device session + reply.
+  assert.equal(calls.upsertRelationship.length, 1);
+  assert.equal(calls.upsertRelationship[0].peerAccountId, "rez:acct:carol");
+  assert.equal(calls.upsertRelationship[0].peerLinkId, "pl_1");
+  assert.equal(calls.upsertRelationship[0].remoteAccountIdentityPublicKeyB64, "carolBpub");
+  assert.equal(calls.upsertRelationship[0].remoteIdentityDhPublicKeyB64, "carolDHpub");
   assert.equal(calls.ensureThread.length, 1);
   assert.equal(calls.ensureThread[0].threadId, "th_carol");
   assert.equal(calls.ensureThread[0].peerInboxId, "inbox:carol");
+});
+
+test("applyInbound skips the peer-link relationship when identity fields are absent (contact-only delta)", async () => {
+  const { svc, calls } = makeHarness();
+  await svc.applyInbound({ op: "contact.upsert", payload: { accountId: "rez:acct:carol", relationshipState: "active", displayName: "Carol" }, lamport: 2, originDeviceId: "rez:dev:sib", issuedAtMs: 1000 });
+  assert.equal(calls.ensureActive.length, 1);
+  assert.equal(calls.upsertRelationship.length, 0);
+  assert.equal(calls.ensureThread.length, 0, "no thread without peer-link fields");
 });
 
 test("applyInbound is idempotent: replays and older lamports for the same origin are ignored", async () => {

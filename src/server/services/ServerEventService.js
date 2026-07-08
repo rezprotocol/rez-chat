@@ -574,20 +574,44 @@ export class ServerEventService extends BaseServerService {
   // S14: fan the account-state delta for a materialized direct relationship out to
   // our SIBLING devices. Fire-and-forget + best-effort — never blocks the local
   // materialization path. No-op when the sync service is disabled (single-device).
+  // Fetches the peer's replicable IDENTITY (account + identity-DH pubkeys) from our
+  // peer-link record so a sibling can build its own relationship record + device
+  // sessions (never our ratchet). Fully self-contained: never throws/rejects.
   #replicateContactRelationship({ peerAccountId, remoteDisplayName, peerInboxId, peerLinkId, threadId }) {
     const sync = this.bus.services && this.bus.services.accountStateSync ? this.bus.services.accountStateSync : null;
     if (!sync || typeof sync.replicate !== "function") return;
-    sync.replicate({
-      op: "contact.upsert",
-      payload: {
-        accountId: peerAccountId,
-        relationshipState: "active",
-        displayName: typeof remoteDisplayName === "string" ? remoteDisplayName : "",
-        peerInboxId: typeof peerInboxId === "string" ? peerInboxId : "",
-        peerLinkId: typeof peerLinkId === "string" ? peerLinkId : "",
-        threadId: typeof threadId === "string" ? threadId : "",
-      },
-    }).catch((err) => this.logger.warn("[ServerEventService] account-state replicate failed", err && err.message ? err.message : err));
+    const run = async () => {
+      let remoteAccountIdentityPublicKeyB64 = "";
+      let remoteIdentityDhPublicKeyB64 = "";
+      let resolvedInboxId = typeof peerInboxId === "string" ? peerInboxId : "";
+      let resolvedLinkId = typeof peerLinkId === "string" ? peerLinkId : "";
+      const peerLinks = this.bus.runtime && this.bus.runtime.peerLinks ? this.bus.runtime.peerLinks : null;
+      const store = peerLinks && peerLinks.peerLinkStorage && peerLinks.peerLinkStorage.peerLinks
+        ? peerLinks.peerLinkStorage.peerLinks : null;
+      if (store && this.ownerAccountId) {
+        const rec = await store.getByPair(this.ownerAccountId, peerAccountId);
+        if (rec && typeof rec === "object") {
+          remoteAccountIdentityPublicKeyB64 = typeof rec.remoteAccountIdentityPublicKeyB64 === "string" ? rec.remoteAccountIdentityPublicKeyB64 : "";
+          remoteIdentityDhPublicKeyB64 = typeof rec.remoteIdentityDhPublicKeyB64 === "string" ? rec.remoteIdentityDhPublicKeyB64 : "";
+          if (!resolvedInboxId && typeof rec.peerInboxId === "string") resolvedInboxId = rec.peerInboxId;
+          if (!resolvedLinkId && typeof rec.peerLinkId === "string") resolvedLinkId = rec.peerLinkId;
+        }
+      }
+      await sync.replicate({
+        op: "contact.upsert",
+        payload: {
+          accountId: peerAccountId,
+          relationshipState: "active",
+          displayName: typeof remoteDisplayName === "string" ? remoteDisplayName : "",
+          peerInboxId: resolvedInboxId,
+          peerLinkId: resolvedLinkId,
+          threadId: typeof threadId === "string" ? threadId : "",
+          remoteAccountIdentityPublicKeyB64,
+          remoteIdentityDhPublicKeyB64,
+        },
+      });
+    };
+    run().catch((err) => this.logger.warn("[ServerEventService] account-state replicate failed", err && err.message ? err.message : err));
   }
 
   /**

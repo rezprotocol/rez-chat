@@ -199,11 +199,34 @@ export class ServerAccountStateSyncService extends BaseServerService {
           await contacts.ensureKnownAccount({ accountId: p.accountId, displayName: p.displayName || "" });
         }
       }
-      // Materialize the direct thread so the sibling has somewhere to surface the
-      // peer's message. The peer-link RELATIONSHIP (so the sibling can also REPLY)
-      // is applied by the peer-link relationship apply (S14 L8).
+      // Record the peer-link RELATIONSHIP metadata (peer identity + routing, NO
+      // ratchet) so the sibling can complete its OWN responder device session (and
+      // thus DECRYPT this peer's fanned-out message) and later RESOLVE the peer's
+      // device set to REPLY. The peerLinkId is the origin device's, so the derived
+      // thread id matches across devices.
       const peerLinkId = typeof p.peerLinkId === "string" ? p.peerLinkId.trim() : "";
       const peerInboxId = typeof p.peerInboxId === "string" ? p.peerInboxId.trim() : "";
+      const remoteAccountIdentityPublicKeyB64 = typeof p.remoteAccountIdentityPublicKeyB64 === "string" ? p.remoteAccountIdentityPublicKeyB64.trim() : "";
+      const remoteIdentityDhPublicKeyB64 = typeof p.remoteIdentityDhPublicKeyB64 === "string" ? p.remoteIdentityDhPublicKeyB64.trim() : "";
+      const peerLinks = this.#peerLinks();
+      if (peerLinks && typeof peerLinks.upsertPeerRelationship === "function"
+          && peerLinkId && peerInboxId && remoteAccountIdentityPublicKeyB64 && remoteIdentityDhPublicKeyB64) {
+        try {
+          await peerLinks.upsertPeerRelationship({
+            peerAccountId: p.accountId,
+            peerLinkId,
+            peerInboxId,
+            remoteAccountIdentityPublicKeyB64,
+            remoteIdentityDhPublicKeyB64,
+            nowMs: now,
+          });
+        } catch (err) {
+          this.logger.warn("[ServerAccountStateSyncService] upsertPeerRelationship failed",
+            err && err.message ? err.message : err);
+        }
+      }
+      // Materialize the direct thread so the sibling has somewhere to surface the
+      // peer's message.
       if (threads && peerLinkId && peerInboxId && typeof threads.ensureDirectThread === "function") {
         const threadId = typeof p.threadId === "string" && p.threadId.trim()
           ? p.threadId.trim()
