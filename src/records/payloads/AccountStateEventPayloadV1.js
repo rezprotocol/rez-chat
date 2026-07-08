@@ -25,28 +25,31 @@ import { WirePayloadRecord } from "../WirePayloadRecord.js";
  * the highest lamport seen per originDeviceId and ignores replays/older events
  * (last-writer-wins per origin device — no cross-device merge beyond that).
  *
- * `op` is the delta verb; `payload` is op-tagged (validated per op below):
- *   contact.upsert  → { accountId, relationshipState, displayName? }
- *   contact.remove  → { accountId }
- *   peerlink.upsert → { peerAccountId, peerInboxId, peerLinkId }
- *   thread.upsert   → { threadId, peerAccountId, peerLinkId }
+ * `op` is the delta verb; `payload` is op-tagged. `contact.upsert` is the workhorse:
+ * a single atomic event that carries the whole direct relationship, so a sibling
+ * materializes contact + peer-link relationship + thread with NO cross-event
+ * ordering fragility. It covers add / rename / block via relationshipState +
+ * displayName; `contact.remove` covers delete.
+ *   contact.upsert → { accountId, relationshipState, displayName?,
+ *                      peerInboxId?, peerLinkId?, threadId? }
+ *                    (the optional peerInboxId+peerLinkId+threadId let the sibling
+ *                     record the peer-link RELATIONSHIP metadata — not the ratchet —
+ *                     so it can also REPLY, and materialize the direct thread)
+ *   contact.remove → { accountId }
  */
 export const ACCOUNT_STATE_EVENT_KIND = "rez.account.state.v1";
 
 export const ACCOUNT_STATE_OPS = Object.freeze([
   "contact.upsert",
   "contact.remove",
-  "peerlink.upsert",
-  "thread.upsert",
 ]);
 
 // The op-tagged payload's required string fields. Keeps the record honest without
-// duplicating the graph model — the sync service interprets the values.
+// duplicating the graph model — the sync service interprets the values. The
+// relationship fields on contact.upsert are OPTIONAL (a rename carries only a name).
 const OP_REQUIRED_FIELDS = Object.freeze({
   "contact.upsert": ["accountId", "relationshipState"],
   "contact.remove": ["accountId"],
-  "peerlink.upsert": ["peerAccountId", "peerInboxId", "peerLinkId"],
-  "thread.upsert": ["threadId", "peerAccountId", "peerLinkId"],
 });
 
 const MAX_PAYLOAD_JSON_BYTES = 4096;

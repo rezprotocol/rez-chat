@@ -19,6 +19,7 @@ import {
   ServerDeviceSetService,
   ServerAccountMutationService,
   ServerDeviceLinkService,
+  ServerAccountStateSyncService,
   ServerFileTransferService,
   ServerProfileService,
   ServerLinksService,
@@ -334,6 +335,17 @@ export class ChatServerApp {
       // fail loud with typed errors on delegated / pre-migration boots.
       deviceLink: new ServerDeviceLinkService({
         bus: this.bus,
+        ownerAccountId: this.#ownerAccountId,
+        clock,
+        logger,
+      }),
+      // S14: cross-device account-state sync. Fans relationship-graph deltas
+      // (contacts, direct threads) to sibling device inboxes so a sibling that
+      // never took part in an invite surfaces (and can reply to) a peer's
+      // fanned-out message. No-op unless this account runs per-device sessions.
+      accountStateSync: new ServerAccountStateSyncService({
+        bus: this.bus,
+        storageProvider: this.#storageProvider,
         ownerAccountId: this.#ownerAccountId,
         clock,
         logger,

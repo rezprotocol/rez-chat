@@ -12,6 +12,7 @@ export { ServerPeerLinkProtocolService } from "./ServerPeerLinkProtocolService.j
 export { ServerDeviceSetService } from "./ServerDeviceSetService.js";
 export { ServerAccountMutationService } from "./ServerAccountMutationService.js";
 export { ServerDeviceLinkService } from "./ServerDeviceLinkService.js";
+export { ServerAccountStateSyncService } from "./ServerAccountStateSyncService.js";
 export { InboxCatchupService } from "./InboxCatchupService.js";
 export { GlobalGroupLookup } from "./GlobalGroupLookup.js";
 export { ServerFileTransferService } from "./ServerFileTransferService.js";

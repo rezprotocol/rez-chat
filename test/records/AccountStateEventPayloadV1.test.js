@@ -14,10 +14,9 @@ const BASE = Object.freeze({
 
 test("builds + round-trips each op through toJSON", () => {
   const cases = {
-    "contact.upsert": { accountId: "rez:acct:carol", relationshipState: "active", displayName: "Carol" },
+    // The rich contact.upsert carries the whole relationship atomically.
+    "contact.upsert": { accountId: "rez:acct:carol", relationshipState: "active", displayName: "Carol", peerInboxId: "inbox:carol", peerLinkId: "pl_1", threadId: "th_1" },
     "contact.remove": { accountId: "rez:acct:carol" },
-    "peerlink.upsert": { peerAccountId: "rez:acct:carol", peerInboxId: "inbox:carol", peerLinkId: "pl_1" },
-    "thread.upsert": { threadId: "th_1", peerAccountId: "rez:acct:carol", peerLinkId: "pl_1" },
   };
   for (const [op, payload] of Object.entries(cases)) {
     const e = new AccountStateEventPayloadV1({ ...BASE, op, payload });
@@ -47,9 +46,13 @@ test("rejects an unknown op", () => {
 });
 
 test("rejects a missing required op-payload field", () => {
-  // peerlink.upsert requires peerInboxId
+  // contact.upsert requires relationshipState
   assert.throws(() => new AccountStateEventPayloadV1({
-    ...BASE, op: "peerlink.upsert", payload: { peerAccountId: "rez:acct:carol", peerLinkId: "pl_1" },
+    ...BASE, op: "contact.upsert", payload: { accountId: "rez:acct:carol" },
+  }));
+  // contact.remove requires accountId
+  assert.throws(() => new AccountStateEventPayloadV1({
+    ...BASE, op: "contact.remove", payload: {},
   }));
 });
 
@@ -60,5 +63,5 @@ test("rejects a non-rez:dev originDeviceId and a non-positive lamport", () => {
 });
 
 test("ACCOUNT_STATE_OPS is the exact op vocabulary", () => {
-  assert.deepEqual([...ACCOUNT_STATE_OPS], ["contact.upsert", "contact.remove", "peerlink.upsert", "thread.upsert"]);
+  assert.deepEqual([...ACCOUNT_STATE_OPS], ["contact.upsert", "contact.remove"]);
 });
