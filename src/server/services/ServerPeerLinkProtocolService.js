@@ -1,4 +1,5 @@
 import { base64ToBytes, buildInboxAddress, bytesToBase64 } from "@rezprotocol/sdk/client";
+import { isAccountStateEnvelope } from "@rezprotocol/sdk/peer-link";
 import { BaseServerService } from "../base/BaseServerService.js";
 
 // Minimum gap between recovery-invite triggers for the SAME peer. The inbound
@@ -210,6 +211,45 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
 
     const peerLinks = this._peerLinkService();
     if (!peerLinks) return;
+
+    // S14: a self account-state event fanned to us by a SIBLING device of our own
+    // account. Open it with the account-state key (only our account's devices can
+    // produce a deposit that opens) and surface it as a user message so the
+    // kind-registry dispatch (rez.account.state.v1 → ServerAccountStateSyncService)
+    // applies it. It carries NO peer sender/thread, so it bypasses the
+    // isActiveContact direct-content gate by design.
+    if (isAccountStateEnvelope(bodyObj)) {
+      if (typeof peerLinks.openAccountStateEvent !== "function") {
+        return { consumed: false, decryptOk: false, reason: "account-state-unsupported" };
+      }
+      let openedBytes;
+      try {
+        openedBytes = await peerLinks.openAccountStateEvent({ nonceB64: bodyObj.nonceB64, ciphertextB64: bodyObj.ciphertextB64 });
+      } catch (asErr) {
+        // A foreign account cannot produce a deposit our account-state key opens;
+        // tampering fails AEAD auth. The key is stable (not a ratchet), so a failure
+        // now will not open later — consume it rather than retry forever.
+        this.logger.warn("[ServerPeerLinkProtocolService] account-state event failed to open; dropping",
+          asErr && asErr.message ? asErr.message : asErr);
+        return { consumed: true, decryptOk: false, reason: "account-state-open-failed" };
+      }
+      if (!(openedBytes instanceof Uint8Array) || openedBytes.length === 0) {
+        return { consumed: true, decryptOk: false, reason: "account-state-empty" };
+      }
+      return {
+        consumed: true,
+        decryptOk: true,
+        userMessage: {
+          mailboxId,
+          eventId,
+          plaintextB64: bytesToBase64(openedBytes),
+          // A self-event has NO peer sender — null keeps it out of the peer
+          // direct-content gate; the kind-registry handler is the applier.
+          senderAccountId: null,
+          snapshot: null,
+        },
+      };
+    }
 
     // Regular peer-link handshake — ALSO the response leg of a recovery invite
     // (the inviter completes the re-invite here, identical to a first accept).
