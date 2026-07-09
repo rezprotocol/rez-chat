@@ -75,6 +75,50 @@ test("multiple messages buffered before the handshake all deliver, in order", as
   assert.deepEqual(applied.sort(), ["M1", "M2"], "both buffered messages deliver after the handshake");
 });
 
+test("the periodic sweep re-delivers a buffered deposit when NO further deposit arrives (quiet inbox)", async () => {
+  let sessionReady = false;
+  const applied = [];
+  const peerLinkProtocol = {
+    async processDeposit(frame) {
+      const body = frame && frame.body ? frame.body : {};
+      if (!sessionReady) return { consumed: false, decryptOk: false, reason: "no-session" };
+      return { consumed: true, decryptOk: true, userMessage: { eventId: body.eventId, mailboxId: body.mailboxId } };
+    },
+  };
+  const events = { async applyUserMessage(m) { applied.push(m.eventId); }, async processDeposit() {} };
+  // Fast sweep for the test.
+  const pipeline = new InboundDepositPipeline({ peerLinkProtocol, events, processedLog: new ProcessedDepositLog({ kvStore: new MemKv() }), logger: silent, sweepIntervalMs: 15 });
+  pipeline.start();
+  try {
+    // Message arrives before its session; buffered. NO further deposit will come.
+    const m = await pipeline.submit(msgFrame("M1"));
+    assert.equal(m.consumed, false);
+    assert.deepEqual(applied, [], "not delivered yet");
+
+    // The session becomes ready with NO new deposit to trigger the event-driven
+    // re-drain — only the periodic sweep can rescue it.
+    sessionReady = true;
+    await new Promise((r) => setTimeout(r, 120));
+    assert.deepEqual(applied, ["M1"], "the periodic sweep re-delivered the buffered message");
+  } finally {
+    pipeline.stop();
+  }
+});
+
+test("the sweep is a no-op (no re-drain) while the buffer is empty", async () => {
+  let processCalls = 0;
+  const peerLinkProtocol = { async processDeposit() { processCalls += 1; return { consumed: true, decryptOk: true }; } };
+  const events = { async applyUserMessage() {}, async processDeposit() {} };
+  const pipeline = new InboundDepositPipeline({ peerLinkProtocol, events, logger: silent, sweepIntervalMs: 10 });
+  pipeline.start();
+  try {
+    await new Promise((r) => setTimeout(r, 60)); // several ticks, nothing buffered
+    assert.equal(processCalls, 0, "no deposits processed by an idle sweep");
+  } finally {
+    pipeline.stop();
+  }
+});
+
 test("a permanently-undecryptable buffered deposit is dropped after the re-attempt cap (no wedge)", async () => {
   const calls = new Map();
   const peerLinkProtocol = {

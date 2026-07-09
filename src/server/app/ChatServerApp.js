@@ -386,7 +386,11 @@ export class ChatServerApp {
         logger,
       });
     }
-    Object.assign(this.bus.services, services, { inboundPipeline });
+    // Register the pipeline as a lifecycle participant so its periodic retry-sweep
+    // timer starts/stops with the app (start() after the live-push subscribers,
+    // stop() clears the timer on shutdown).
+    services.inboundPipeline = inboundPipeline;
+    Object.assign(this.bus.services, services);
     this.#services = Object.values(services);
   }
 }

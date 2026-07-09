@@ -50,8 +50,10 @@ export class InboundDepositPipeline {
   #redraining;
   #maxPending;
   #maxRetainAttempts;
+  #sweepIntervalMs;
+  #sweepTimer;
 
-  constructor({ peerLinkProtocol, events, processedLog = null, outbox = null, logger = console, maxPending = 256, maxRetainAttempts = 12 } = {}) {
+  constructor({ peerLinkProtocol, events, processedLog = null, outbox = null, logger = console, maxPending = 256, maxRetainAttempts = 12, sweepIntervalMs = 10_000 } = {}) {
     if (!peerLinkProtocol || typeof peerLinkProtocol.processDeposit !== "function") {
       throw new Error("InboundDepositPipeline requires peerLinkProtocol.processDeposit");
     }
@@ -81,6 +83,41 @@ export class InboundDepositPipeline {
     this.#redraining = false;
     this.#maxPending = Number.isInteger(maxPending) && maxPending > 0 ? maxPending : 256;
     this.#maxRetainAttempts = Number.isInteger(maxRetainAttempts) && maxRetainAttempts > 0 ? maxRetainAttempts : 12;
+    this.#sweepIntervalMs = Number.isInteger(sweepIntervalMs) && sweepIntervalMs > 0 ? sweepIntervalMs : 10_000;
+    this.#sweepTimer = null;
+  }
+
+  /**
+   * Start the periodic retry sweep. Re-drains BUFFERED deposits (those that could
+   * not be decrypted on arrival — e.g. a reply that beat its reverse-direction
+   * session) even when NO further deposit arrives to trigger the event-driven
+   * re-drain. This is NOT busy-waiting: the tick is a cheap no-op whenever the
+   * buffer is empty (the common case), and each real re-drain still counts against
+   * #maxRetainAttempts so a poison frame is bounded. The timer is unref'd so it
+   * never keeps the process alive.
+   */
+  start() {
+    if (this.#sweepTimer) return;
+    this.#sweepTimer = setInterval(() => this.#sweep(), this.#sweepIntervalMs);
+    if (this.#sweepTimer && typeof this.#sweepTimer.unref === "function") this.#sweepTimer.unref();
+  }
+
+  stop() {
+    if (this.#sweepTimer) {
+      clearInterval(this.#sweepTimer);
+      this.#sweepTimer = null;
+    }
+  }
+
+  // One sweep tick: if anything is buffered and no re-drain is in flight, chain a
+  // re-drain onto the serialized queue (behind any in-flight submit) so it never
+  // races the live path. No-op when the buffer is empty.
+  #sweep() {
+    if (this.#pending.size === 0 || this.#redraining) return;
+    this.#tail = this.#tail.then(() => {
+      if (this.#pending.size === 0 || this.#redraining) return undefined;
+      return this.#redrainPending();
+    }).then(() => undefined, () => undefined);
   }
 
   /**
