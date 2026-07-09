@@ -26,6 +26,8 @@ import { AccountStateEventPayloadV1 } from "../../records/payloads/AccountStateE
  */
 const LAMPORT_KEY_PREFIX = "app:account-state/lamport/"; // + ownerAccountId
 const SEEN_KEY_PREFIX = "app:account-state/seen/"; // + originDeviceId
+const PENDING_KEY_PREFIX = "app:account-state/pending/"; // + inboxId + ":" + lamport
+const MAX_SEND_ATTEMPTS = 8;
 
 export class ServerAccountStateSyncService extends BaseServerService {
   #clock;
@@ -43,6 +45,8 @@ export class ServerAccountStateSyncService extends BaseServerService {
     this.#lamportChain = Promise.resolve();
     this._register("account-state", "replicate", (payload) => this.replicate(payload || {}));
     this._register("account-state", "applyInbound", (payload) => this.applyInbound(payload || {}));
+    // AF6b: retry account-state sends that failed to dispatch (sender was offline).
+    this._register("account-state", "flushPending", () => this.flushPending());
   }
 
   #sdk() {
@@ -141,6 +145,7 @@ export class ServerAccountStateSyncService extends BaseServerService {
     }
     const plaintextBodyBytes = new TextEncoder().encode(JSON.stringify(event.toJSON()));
 
+    const eventJson = event.toJSON();
     let fannedOut = 0;
     for (const sibling of siblings) {
       const inboxId = sibling && typeof sibling.inboxId === "string" ? sibling.inboxId : "";
@@ -150,11 +155,71 @@ export class ServerAccountStateSyncService extends BaseServerService {
         await sdk.mesh.dispatch(deposit.object, deposit.address);
         fannedOut += 1;
       } catch (err) {
-        this.logger.warn("[ServerAccountStateSyncService] account-state fan-out to sibling failed",
+        // AF6b/Finding 3: a failed dispatch (e.g. sender offline) is not silently
+        // lost — persist it for retry on reconnect. Re-dispatching the SAME signed
+        // event is idempotent at the sibling (verified sig + highest-lamport-wins).
+        this.logger.warn("[ServerAccountStateSyncService] account-state fan-out to sibling failed; queued for retry",
           err && err.message ? err.message : err);
+        await this.#stashPending(inboxId, eventJson);
       }
     }
     return { fannedOut };
+  }
+
+  async #stashPending(inboxId, eventJson) {
+    if (!this.#kv) return;
+    const key = PENDING_KEY_PREFIX + inboxId + ":" + eventJson.lamport;
+    try {
+      await this.#kv.set(key, { inboxId, eventJson, attempts: 0 });
+    } catch (err) {
+      this.logger.error("[ServerAccountStateSyncService] failed to persist pending account-state send",
+        err && err.message ? err.message : err);
+    }
+  }
+
+  /**
+   * Retry account-state sends that previously failed to dispatch (the sender was
+   * offline when the delta was minted). Called on (re)connect. Each retry re-seals +
+   * re-dispatches the SAME signed event — idempotent at the sibling. Drops an entry
+   * after MAX_SEND_ATTEMPTS (poison bound) with a loud log. @returns {Promise<{flushed, dropped}>}
+   */
+  async flushPending() {
+    if (!this.isEnabled() || !this.#kv) return { flushed: 0, dropped: 0 };
+    const sdk = this.#sdk();
+    let keys;
+    try {
+      keys = await this.#kv.keys(PENDING_KEY_PREFIX);
+    } catch (err) {
+      this.logger.warn("[ServerAccountStateSyncService] flushPending: keys() failed", err && err.message ? err.message : err);
+      return { flushed: 0, dropped: 0 };
+    }
+    let flushed = 0;
+    let dropped = 0;
+    for (const key of keys) {
+      const rec = await this.#kv.get(key);
+      if (!rec || typeof rec !== "object" || !rec.inboxId || !rec.eventJson) {
+        await this.#kv.delete(key);
+        continue;
+      }
+      try {
+        const bytes = new TextEncoder().encode(JSON.stringify(rec.eventJson));
+        const deposit = await sdk.buildAccountStateDeposit({ deliverInboxId: rec.inboxId, plaintextBodyBytes: bytes });
+        await sdk.mesh.dispatch(deposit.object, deposit.address);
+        await this.#kv.delete(key);
+        flushed += 1;
+      } catch (err) {
+        const attempts = (Number.isInteger(rec.attempts) ? rec.attempts : 0) + 1;
+        if (attempts >= MAX_SEND_ATTEMPTS) {
+          await this.#kv.delete(key);
+          dropped += 1;
+          this.logger.error("[ServerAccountStateSyncService] dropping undeliverable account-state send after "
+            + MAX_SEND_ATTEMPTS + " attempts (inbox " + rec.inboxId + ")", err && err.message ? err.message : err);
+        } else {
+          await this.#kv.set(key, { ...rec, attempts });
+        }
+      }
+    }
+    return { flushed, dropped };
   }
 
   /**

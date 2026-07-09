@@ -275,6 +275,9 @@ export class ServerRuntimeService extends BaseServerService {
     try {
       await this._call("device-set", "publishOwnBundle", {});
       await this._call("device-set", "republishToAllPeers", {});
+      // AF6b: retry any cross-device account-state deltas that failed to dispatch
+      // while this device was offline (idempotent at the sibling).
+      await this._call("account-state", "flushPending", {});
     } catch (err) {
       this.logger.error("ServerRuntimeService.#publishMultiDeviceSet failed", {
         message: err && err.message ? err.message : String(err),

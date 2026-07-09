@@ -14,13 +14,14 @@ function makeKv() {
 
 function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:dev:sib", inboxId: "inbox:sib" }], withSdk = true, kv = makeKv(), relationshipThrows = false, sigValid = true } = {}) {
   const calls = { dispatch: [], deposits: [], ensureActive: [], ensureKnown: [], deleteContact: [], ensureThread: [], upsertRelationship: [] };
+  const state = { failDispatch: false };
   const sdk = withSdk ? {
     listSiblingDeviceInboxes: async () => siblings,
     buildAccountStateDeposit: async ({ deliverInboxId, plaintextBodyBytes }) => {
       calls.deposits.push({ deliverInboxId, event: JSON.parse(new TextDecoder().decode(plaintextBodyBytes)) });
       return { object: { payloadBytes: plaintextBodyBytes }, address: { inboxId: deliverInboxId } };
     },
-    mesh: { dispatch: async (object, address) => { calls.dispatch.push({ object, address }); } },
+    mesh: { dispatch: async (object, address) => { calls.dispatch.push({ object, address }); if (state.failDispatch) throw new Error("dispatch offline"); } },
   } : null;
   const contacts = {
     ensureActiveContact: async (a) => { calls.ensureActive.push(a); },
@@ -47,7 +48,7 @@ function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:d
     on() { return () => {}; }, emit() {}, registerFunction() {}, call() { return Promise.resolve(null); },
   };
   const svc = new ServerAccountStateSyncService({ bus, storageProvider: { getKeyValueStore: () => kv }, ownerAccountId: "rez:acct:alice", clock: () => 1000 });
-  return { svc, calls, kv };
+  return { svc, calls, kv, state };
 }
 
 const CONTACT_UPSERT = {
@@ -72,6 +73,35 @@ test("replicate fans a contact.upsert to sibling inboxes with a monotonic lampor
   const r2 = await svc.replicate(CONTACT_UPSERT);
   assert.equal(r2.fannedOut, 1);
   assert.equal(calls.deposits[1].event.lamport, 2, "lamport is monotonic across calls");
+});
+
+test("AF6b: a failed dispatch is persisted and re-sent by flushPending (no silent loss)", async () => {
+  const { svc, calls, kv, state } = makeHarness();
+  state.failDispatch = true;
+  const r = await svc.replicate(CONTACT_UPSERT);
+  assert.equal(r.fannedOut, 0, "dispatch failed");
+  const pendingKeys = await kv.keys("app:account-state/pending/");
+  assert.equal(pendingKeys.length, 1, "the failed send is persisted for retry");
+
+  // Reconnect: dispatch works now → flushPending re-sends + clears the pending entry.
+  state.failDispatch = false;
+  const dispatchesBefore = calls.dispatch.length;
+  const flush = await svc.flushPending();
+  assert.equal(flush.flushed, 1);
+  assert.equal(flush.dropped, 0);
+  assert.equal(calls.dispatch.length, dispatchesBefore + 1, "the queued event was re-dispatched");
+  assert.equal((await kv.keys("app:account-state/pending/")).length, 0, "cleared once delivered");
+});
+
+test("AF6b: flushPending drops an entry after the attempt bound (poison-safe)", async () => {
+  const { svc, kv, state } = makeHarness();
+  state.failDispatch = true;
+  await svc.replicate(CONTACT_UPSERT);
+  // Keep failing across many flushes — must eventually drop, never loop forever.
+  let lastDropped = 0;
+  for (let i = 0; i < 10; i += 1) lastDropped += (await svc.flushPending()).dropped;
+  assert.equal(lastDropped, 1, "exactly one entry was dropped after the bound");
+  assert.equal((await kv.keys("app:account-state/pending/")).length, 0, "no wedged pending entries");
 });
 
 test("replicate is a no-op with no siblings and when the SDK is absent", async () => {
