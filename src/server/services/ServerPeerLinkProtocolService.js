@@ -1,5 +1,5 @@
 import { base64ToBytes, buildInboxAddress, bytesToBase64 } from "@rezprotocol/sdk/client";
-import { isAccountStateEnvelope } from "@rezprotocol/sdk/peer-link";
+import { isAccountStateEnvelope, accountStateAad } from "@rezprotocol/sdk/peer-link";
 import { BaseServerService } from "../base/BaseServerService.js";
 
 // Minimum gap between recovery-invite triggers for the SAME peer. The inbound
@@ -224,7 +224,9 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       }
       let openedBytes;
       try {
-        openedBytes = await peerLinks.openAccountStateEvent({ nonceB64: bodyObj.nonceB64, ciphertextB64: bodyObj.ciphertextB64 });
+        // AAD binds the ciphertext to THIS inbox (the one it was deposited to) —
+        // a relocated deposit from another inbox fails AEAD auth (audit F3).
+        openedBytes = await peerLinks.openAccountStateEvent({ nonceB64: bodyObj.nonceB64, ciphertextB64: bodyObj.ciphertextB64, aad: accountStateAad(mailboxId) });
       } catch (asErr) {
         // A foreign account cannot produce a deposit our account-state key opens;
         // tampering fails AEAD auth. The key is stable (not a ratchet), so a failure
