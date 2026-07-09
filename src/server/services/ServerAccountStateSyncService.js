@@ -28,6 +28,8 @@ const LAMPORT_KEY_PREFIX = "app:account-state/lamport/"; // + ownerAccountId
 const SEEN_KEY_PREFIX = "app:account-state/seen/"; // + originDeviceId
 const PENDING_KEY_PREFIX = "app:account-state/pending/"; // + inboxId + ":" + lamport
 const MAX_SEND_ATTEMPTS = 8;
+const RECONCILE_AT_KEY = "app:account-state/reconcile-at";
+const RECONCILE_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
 export class ServerAccountStateSyncService extends BaseServerService {
   #clock;
@@ -47,6 +49,9 @@ export class ServerAccountStateSyncService extends BaseServerService {
     this._register("account-state", "applyInbound", (payload) => this.applyInbound(payload || {}));
     // AF6b: retry account-state sends that failed to dispatch (sender was offline).
     this._register("account-state", "flushPending", () => this.flushPending());
+    // FU4: full-state anti-entropy — re-replicate all active contacts to siblings
+    // (throttled) so a sibling that missed deltas entirely converges.
+    this._register("account-state", "reconcile", () => this.reconcileToSiblings());
   }
 
   #sdk() {
@@ -220,6 +225,69 @@ export class ServerAccountStateSyncService extends BaseServerService {
       }
     }
     return { flushed, dropped };
+  }
+
+  /**
+   * FU4 (anti-entropy): re-replicate ALL active contacts (rich contact.upsert) to
+   * siblings so a sibling that missed deltas entirely — offline past the durable
+   * home's retention, or freshly recovered — converges. Idempotent at the sibling
+   * (higher lamport re-applies the same state). Throttled (RECONCILE_MIN_INTERVAL_MS)
+   * since it re-signs + re-fans every active contact. @returns {Promise<{reconciled}>}
+   */
+  async reconcileToSiblings() {
+    if (!this.isEnabled()) return { reconciled: 0 };
+    const now = this.#clock();
+    if (this.#kv) {
+      const at = await this.#kv.get(RECONCILE_AT_KEY);
+      // Throttle ONLY when a prior reconcile ran recently — a first-ever reconcile
+      // (no record) always runs.
+      if (at && Number.isInteger(at.atMs) && now - at.atMs < RECONCILE_MIN_INTERVAL_MS) {
+        return { reconciled: 0, throttled: true };
+      }
+    }
+    const services = this.bus.services || {};
+    const contacts = services.contacts || null;
+    const threads = services.threads || null;
+    const peerLinks = this.#peerLinks();
+    if (!contacts || typeof contacts.listContacts !== "function" || !peerLinks) return { reconciled: 0 };
+    let list;
+    try {
+      list = await contacts.listContacts({});
+    } catch (err) {
+      this.logger.warn("[ServerAccountStateSyncService] reconcile: listContacts failed", err && err.message ? err.message : err);
+      return { reconciled: 0 };
+    }
+    const items = list && Array.isArray(list.items) ? list.items : (list && Array.isArray(list.contacts) ? list.contacts : []);
+    const store = peerLinks.peerLinkStorage && peerLinks.peerLinkStorage.peerLinks ? peerLinks.peerLinkStorage.peerLinks : null;
+    let reconciled = 0;
+    for (const c of items) {
+      const accountId = c && typeof c.accountId === "string" ? c.accountId : "";
+      const rel = c && typeof c.relationshipState === "string" ? c.relationshipState.trim().toLowerCase() : "";
+      if (!accountId || rel !== "active") continue;
+      const payload = { accountId, relationshipState: "active", displayName: c.displayName || "" };
+      if (store) {
+        let rec = null;
+        try {
+          rec = await store.getByPair(this.ownerAccountId, accountId);
+        } catch (err) {
+          this.logger.warn("[ServerAccountStateSyncService] reconcile: getByPair failed for " + accountId, err && err.message ? err.message : err);
+          rec = null;
+        }
+        if (rec && typeof rec === "object") {
+          payload.peerInboxId = typeof rec.peerInboxId === "string" ? rec.peerInboxId : "";
+          payload.peerLinkId = typeof rec.peerLinkId === "string" ? rec.peerLinkId : "";
+          payload.remoteAccountIdentityPublicKeyB64 = typeof rec.remoteAccountIdentityPublicKeyB64 === "string" ? rec.remoteAccountIdentityPublicKeyB64 : "";
+          payload.remoteIdentityDhPublicKeyB64 = typeof rec.remoteIdentityDhPublicKeyB64 === "string" ? rec.remoteIdentityDhPublicKeyB64 : "";
+          if (threads && typeof threads.directThreadIdForPeerLink === "function" && payload.peerLinkId) {
+            payload.threadId = threads.directThreadIdForPeerLink(payload.peerLinkId, accountId);
+          }
+        }
+      }
+      await this.replicate({ op: "contact.upsert", payload });
+      reconciled += 1;
+    }
+    if (this.#kv) await this.#kv.set(RECONCILE_AT_KEY, { atMs: now });
+    return { reconciled };
   }
 
   /**

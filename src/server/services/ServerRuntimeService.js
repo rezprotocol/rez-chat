@@ -278,6 +278,9 @@ export class ServerRuntimeService extends BaseServerService {
       // AF6b: retry any cross-device account-state deltas that failed to dispatch
       // while this device was offline (idempotent at the sibling).
       await this._call("account-state", "flushPending", {});
+      // FU4: throttled full-state anti-entropy so a sibling that missed deltas
+      // entirely (offline past home retention) converges on (re)connect.
+      await this._call("account-state", "reconcile", {});
     } catch (err) {
       this.logger.error("ServerRuntimeService.#publishMultiDeviceSet failed", {
         message: err && err.message ? err.message : String(err),

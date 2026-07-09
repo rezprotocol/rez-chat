@@ -27,6 +27,10 @@ function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:d
     ensureActiveContact: async (a) => { calls.ensureActive.push(a); },
     ensureKnownAccount: async (a) => { calls.ensureKnown.push(a); },
     deleteContact: async (a) => { calls.deleteContact.push(a); },
+    listContacts: async () => ({ items: [
+      { accountId: "rez:acct:carol", relationshipState: "active", displayName: "Carol" },
+      { accountId: "rez:acct:bob", relationshipState: "known", displayName: "Bob" },
+    ] }),
   };
   const threads = {
     ensureDirectThread: async (a) => { calls.ensureThread.push(a); },
@@ -35,6 +39,7 @@ function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:d
   const peerLinks = {
     deviceId,
     devicePublicKeyB64: "selfPubB64",
+    peerLinkStorage: { peerLinks: { getByPair: async (owner, peer) => ({ peerLinkId: "pl_" + peer, peerInboxId: "inbox_" + peer, remoteAccountIdentityPublicKeyB64: "B_" + peer, remoteIdentityDhPublicKeyB64: "DH_" + peer }) } },
     signAccountStateEvent: async () => ({ originDeviceId: deviceId, originDevicePublicKeyB64: "selfPubB64", sigB64: "sig-" + deviceId }),
     verifyAccountStateEventSig: async () => sigValid,
     upsertPeerRelationship: async (a) => {
@@ -102,6 +107,23 @@ test("AF6b: flushPending drops an entry after the attempt bound (poison-safe)", 
   for (let i = 0; i < 10; i += 1) lastDropped += (await svc.flushPending()).dropped;
   assert.equal(lastDropped, 1, "exactly one entry was dropped after the bound");
   assert.equal((await kv.keys("app:account-state/pending/")).length, 0, "no wedged pending entries");
+});
+
+test("FU4: reconcileToSiblings re-replicates ACTIVE contacts (with relationship data) and throttles", async () => {
+  const { svc, calls } = makeHarness();
+  const r = await svc.reconcileToSiblings();
+  assert.equal(r.reconciled, 1, "only the active contact (carol) is reconciled, not the known one");
+  // The reconciled event carries the peer-link relationship fetched from getByPair.
+  const ev = calls.deposits[0].event;
+  assert.equal(ev.op, "contact.upsert");
+  assert.equal(ev.payload.accountId, "rez:acct:carol");
+  assert.equal(ev.payload.peerLinkId, "pl_rez:acct:carol");
+  assert.equal(ev.payload.remoteAccountIdentityPublicKeyB64, "B_rez:acct:carol");
+
+  // A second reconcile within the throttle window does nothing (fixed clock).
+  const r2 = await svc.reconcileToSiblings();
+  assert.equal(r2.reconciled, 0);
+  assert.equal(r2.throttled, true);
 });
 
 test("replicate is a no-op with no siblings and when the SDK is absent", async () => {
