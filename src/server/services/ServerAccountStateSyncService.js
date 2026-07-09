@@ -167,12 +167,26 @@ export class ServerAccountStateSyncService extends BaseServerService {
       return { applied: false, reason: "stale" };
     }
 
-    await this.#applyOp(event);
+    const applied = await this.#applyOp(event);
 
+    // Advance the idempotency cursor ONLY on a FULL apply. A partial apply (e.g. the
+    // load-bearing peer-link relationship write faulted) must NOT advance seen — else
+    // the sibling is stranded with an active contact but no way to decrypt the peer's
+    // message, and the event can never be re-applied. Leaving seen put lets a
+    // re-materialization (a fresh, higher-lamport delta) heal it.
+    if (!applied) {
+      return { applied: false, reason: "apply-incomplete" };
+    }
     if (this.#kv) await this.#kv.set(seenKey, { lamport: event.lamport });
     return { applied: true };
   }
 
+  // Apply an event's op. Returns true only when EVERY load-bearing step succeeded
+  // (so applyInbound can gate the seen-cursor on it). The peer-link relationship is
+  // load-bearing (without it the sibling cannot complete a responder session to
+  // decrypt the peer's message), so it is written FIRST and a failure aborts BEFORE
+  // the contact is activated — never open the isActiveContact gate for a message we
+  // then cannot decrypt.
   async #applyOp(event) {
     const p = event.payload && typeof event.payload === "object" ? event.payload : {};
     const services = this.bus.services || {};
@@ -184,33 +198,23 @@ export class ServerAccountStateSyncService extends BaseServerService {
       if (contacts && typeof contacts.deleteContact === "function") {
         await contacts.deleteContact({ accountId: p.accountId });
       }
-      return;
+      return true;
     }
 
-    // contact.upsert — the workhorse. Materialize the contact row first (flips the
-    // isActiveContact gate so a fanned-out peer message is accepted), then the
-    // direct thread if the relationship fields are present.
     if (event.op === "contact.upsert") {
-      const rel = typeof p.relationshipState === "string" ? p.relationshipState.trim().toLowerCase() : "";
-      if (contacts) {
-        if (rel === "active" && typeof contacts.ensureActiveContact === "function") {
-          await contacts.ensureActiveContact({ accountId: p.accountId, displayName: p.displayName || "", lastSeenAtMs: now });
-        } else if (typeof contacts.ensureKnownAccount === "function") {
-          await contacts.ensureKnownAccount({ accountId: p.accountId, displayName: p.displayName || "" });
-        }
-      }
-      // Record the peer-link RELATIONSHIP metadata (peer identity + routing, NO
-      // ratchet) so the sibling can complete its OWN responder device session (and
-      // thus DECRYPT this peer's fanned-out message) and later RESOLVE the peer's
-      // device set to REPLY. The peerLinkId is the origin device's, so the derived
-      // thread id matches across devices.
+      // 1) Peer-link RELATIONSHIP metadata FIRST (peer identity + routing, NO ratchet)
+      // so the sibling can complete its OWN responder device session (and thus DECRYPT
+      // this peer's fanned-out message) and later RESOLVE the peer's device set to
+      // REPLY. The peerLinkId is the origin device's, so the derived thread id matches
+      // across devices. A failure here fails LOUD and aborts the whole apply (seen is
+      // not advanced), rather than the old swallow-and-advance that stranded the sibling.
       const peerLinkId = typeof p.peerLinkId === "string" ? p.peerLinkId.trim() : "";
       const peerInboxId = typeof p.peerInboxId === "string" ? p.peerInboxId.trim() : "";
       const remoteAccountIdentityPublicKeyB64 = typeof p.remoteAccountIdentityPublicKeyB64 === "string" ? p.remoteAccountIdentityPublicKeyB64.trim() : "";
       const remoteIdentityDhPublicKeyB64 = typeof p.remoteIdentityDhPublicKeyB64 === "string" ? p.remoteIdentityDhPublicKeyB64.trim() : "";
       const peerLinks = this.#peerLinks();
-      if (peerLinks && typeof peerLinks.upsertPeerRelationship === "function"
-          && peerLinkId && peerInboxId && remoteAccountIdentityPublicKeyB64 && remoteIdentityDhPublicKeyB64) {
+      const hasRelationship = peerLinkId && peerInboxId && remoteAccountIdentityPublicKeyB64 && remoteIdentityDhPublicKeyB64;
+      if (peerLinks && typeof peerLinks.upsertPeerRelationship === "function" && hasRelationship) {
         try {
           await peerLinks.upsertPeerRelationship({
             peerAccountId: p.accountId,
@@ -221,14 +225,29 @@ export class ServerAccountStateSyncService extends BaseServerService {
             nowMs: now,
           });
         } catch (err) {
-          this.logger.warn("[ServerAccountStateSyncService] upsertPeerRelationship failed",
+          // Load-bearing: without the relationship the sibling cannot decrypt the
+          // peer's message. Fail the whole apply (seen not advanced) so it is not
+          // silently dropped; do NOT open the contact gate below.
+          this.logger.error("[ServerAccountStateSyncService] peer-link relationship write failed; aborting apply (will heal on re-materialization)",
             err && err.message ? err.message : err);
+          return false;
         }
       }
-      // Materialize the direct thread so the sibling has somewhere to surface the
-      // peer's message — the thread RECORD plus its conversation-list index row
-      // (mirroring the inviter-side materialization in #handlePeerLinkUpdated, so
-      // the thread shows before any message arrives).
+
+      // 2) Now the contact row (flips the isActiveContact gate) — only reached once
+      // the relationship the decrypt depends on is in place.
+      const rel = typeof p.relationshipState === "string" ? p.relationshipState.trim().toLowerCase() : "";
+      if (contacts) {
+        if (rel === "active" && typeof contacts.ensureActiveContact === "function") {
+          await contacts.ensureActiveContact({ accountId: p.accountId, displayName: p.displayName || "", lastSeenAtMs: now });
+        } else if (typeof contacts.ensureKnownAccount === "function") {
+          await contacts.ensureKnownAccount({ accountId: p.accountId, displayName: p.displayName || "" });
+        }
+      }
+      // 3) The direct thread (record + conversation-list index row) so the sibling
+      // has somewhere to surface the peer's message — mirroring the inviter-side
+      // materialization in #handlePeerLinkUpdated, so the thread shows before any
+      // message arrives.
       if (threads && peerLinkId && peerInboxId && typeof threads.ensureDirectThread === "function") {
         const threadId = typeof p.threadId === "string" && p.threadId.trim()
           ? p.threadId.trim()
@@ -243,9 +262,10 @@ export class ServerAccountStateSyncService extends BaseServerService {
           }
         }
       }
-      return;
+      return true;
     }
 
     this.logger.warn("[ServerAccountStateSyncService] unknown account-state op " + event.op);
+    return false;
   }
 }

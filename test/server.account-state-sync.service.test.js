@@ -12,7 +12,7 @@ function makeKv() {
   };
 }
 
-function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:dev:sib", inboxId: "inbox:sib" }], withSdk = true, kv = makeKv() } = {}) {
+function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:dev:sib", inboxId: "inbox:sib" }], withSdk = true, kv = makeKv(), relationshipThrows = false } = {}) {
   const calls = { dispatch: [], deposits: [], ensureActive: [], ensureKnown: [], deleteContact: [], ensureThread: [], upsertRelationship: [] };
   const sdk = withSdk ? {
     listSiblingDeviceInboxes: async () => siblings,
@@ -33,7 +33,10 @@ function makeHarness({ deviceId = "rez:dev:self", siblings = [{ deviceId: "rez:d
   };
   const peerLinks = {
     deviceId,
-    upsertPeerRelationship: async (a) => { calls.upsertRelationship.push(a); },
+    upsertPeerRelationship: async (a) => {
+      calls.upsertRelationship.push(a);
+      if (relationshipThrows) throw new Error("simulated relationship write fault");
+    },
   };
   const bus = {
     runtime: { sdk, peerLinks, multiDeviceFanout: true },
@@ -101,6 +104,25 @@ test("applyInbound skips the peer-link relationship when identity fields are abs
   assert.equal(calls.ensureActive.length, 1);
   assert.equal(calls.upsertRelationship.length, 0);
   assert.equal(calls.ensureThread.length, 0, "no thread without peer-link fields");
+});
+
+test("AF1: a relationship-write failure aborts the apply — contact NOT activated, seen NOT advanced (retryable)", async () => {
+  const kv = makeKv();
+  const h = makeHarness({ kv, relationshipThrows: true });
+  const res = await h.svc.applyInbound({ ...CONTACT_UPSERT, lamport: 7, originDeviceId: "rez:dev:sib", issuedAtMs: 1000 });
+  assert.equal(res.applied, false);
+  assert.equal(res.reason, "apply-incomplete");
+  // The relationship was attempted (and failed); the contact gate was NOT opened,
+  // and no thread was created — no stranded half-state.
+  assert.equal(h.calls.upsertRelationship.length, 1);
+  assert.equal(h.calls.ensureActive.length, 0, "contact NOT activated when the relationship write failed");
+  assert.equal(h.calls.ensureThread.length, 0);
+
+  // seen was NOT advanced → a later (healthy) re-delivery of the SAME event re-applies.
+  const h2 = makeHarness({ kv, relationshipThrows: false });
+  const res2 = await h2.svc.applyInbound({ ...CONTACT_UPSERT, lamport: 7, originDeviceId: "rez:dev:sib", issuedAtMs: 1000 });
+  assert.equal(res2.applied, true, "the same event re-applies once the fault clears (seen was not poisoned)");
+  assert.equal(h2.calls.ensureActive.length, 1);
 });
 
 test("applyInbound is idempotent: replays and older lamports for the same origin are ignored", async () => {
