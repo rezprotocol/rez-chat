@@ -9,7 +9,9 @@ import {
 const BASE = Object.freeze({
   lamport: 1,
   originDeviceId: "rez:dev:" + "a".repeat(64),
+  originDevicePublicKeyB64: "devPubB64",
   issuedAtMs: 1_700_000_000_000,
+  sig: "sigB64",
 });
 
 test("builds + round-trips each op through toJSON", () => {

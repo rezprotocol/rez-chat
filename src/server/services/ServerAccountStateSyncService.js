@@ -111,10 +111,29 @@ export class ServerAccountStateSyncService extends BaseServerService {
     }
     if (!Array.isArray(siblings) || siblings.length === 0) return { fannedOut: 0 };
 
+    const peerLinks = this.#peerLinks();
+    const originDevicePublicKeyB64 = peerLinks && typeof peerLinks.devicePublicKeyB64 === "string" ? peerLinks.devicePublicKeyB64 : "";
+    if (!originDevicePublicKeyB64 || typeof peerLinks.signAccountStateEvent !== "function") {
+      this.logger.warn("[ServerAccountStateSyncService] no device key to sign the account-state event; skip replicate");
+      return { fannedOut: 0 };
+    }
     const lamport = await this.#nextLamport();
+    const issuedAtMs = this.#clock();
+    // AF5/F2: sign the event body with THIS device's key so a sibling can verify
+    // WHICH origin device authored it (the AEAD only proves SOME account device did).
+    let sig;
+    try {
+      const signable = AccountStateEventPayloadV1.signableBytes({ op, lamport, originDeviceId, originDevicePublicKeyB64, payload, issuedAtMs });
+      const signed = await peerLinks.signAccountStateEvent(signable);
+      sig = signed && typeof signed.sigB64 === "string" ? signed.sigB64 : "";
+    } catch (err) {
+      this.logger.error("[ServerAccountStateSyncService] account-state event signing failed; not replicated",
+        err && err.message ? err.message : err);
+      return { fannedOut: 0 };
+    }
     let event;
     try {
-      event = new AccountStateEventPayloadV1({ op, lamport, originDeviceId, payload, issuedAtMs: this.#clock() });
+      event = new AccountStateEventPayloadV1({ op, lamport, originDeviceId, originDevicePublicKeyB64, payload, issuedAtMs, sig });
     } catch (err) {
       this.logger.error("[ServerAccountStateSyncService] invalid account-state delta; not replicated",
         err && err.message ? err.message : err);
@@ -150,6 +169,30 @@ export class ServerAccountStateSyncService extends BaseServerService {
       this.logger.warn("[ServerAccountStateSyncService] invalid inbound account-state event; dropping",
         err && err.message ? err.message : err);
       return { applied: false, reason: "invalid" };
+    }
+
+    // AF5/F2: verify the ORIGIN-DEVICE signature BEFORE trusting originDeviceId or
+    // lamport. The AEAD only proves SOME account device authored this; the signature
+    // (self-cert deviceId + sig over the body) proves WHICH one — so a single
+    // compromised sibling cannot forge an event attributed to an honest origin device
+    // (and thus cannot poison that origin's lamport stream or impersonate it).
+    // Fail-closed: no verifier, or a bad signature, drops the event.
+    const peerLinks = this.#peerLinks();
+    if (!peerLinks || typeof peerLinks.verifyAccountStateEventSig !== "function") {
+      this.logger.error("[ServerAccountStateSyncService] cannot verify account-state signature (no verifier); dropping");
+      return { applied: false, reason: "unverifiable" };
+    }
+    const signable = AccountStateEventPayloadV1.signableBytes({
+      op: event.op, lamport: event.lamport, originDeviceId: event.originDeviceId,
+      originDevicePublicKeyB64: event.originDevicePublicKeyB64, payload: event.payload, issuedAtMs: event.issuedAtMs,
+    });
+    const sigOk = await peerLinks.verifyAccountStateEventSig({
+      signableBytes: signable, originDeviceId: event.originDeviceId,
+      originDevicePublicKeyB64: event.originDevicePublicKeyB64, sigB64: event.sig,
+    });
+    if (!sigOk) {
+      this.logger.warn("[ServerAccountStateSyncService] account-state event failed origin-device signature; dropping");
+      return { applied: false, reason: "bad-signature" };
     }
 
     // A device never applies its OWN emit (loop guard) — the fan-out excludes self,

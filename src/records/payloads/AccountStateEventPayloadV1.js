@@ -1,3 +1,4 @@
+import { canonicalJSONStringify } from "@rezprotocol/sdk/client";
 import { WirePayloadRecord } from "../WirePayloadRecord.js";
 
 /**
@@ -62,10 +63,25 @@ export class AccountStateEventPayloadV1 extends WirePayloadRecord {
     lamport: { type: "int", required: true },
     // The self-cert deviceId of the device that ORIGINATED this delta.
     originDeviceId: { type: "string", required: true, trim: true },
+    // The origin device's public key — self-certifies originDeviceId
+    // (deviceIdFor(pub)===originDeviceId) and verifies `sig` (S14 audit AF5/F2).
+    originDevicePublicKeyB64: { type: "string", required: true, trim: true },
     // Op-tagged delta content (see class doc). Bounded to keep self-fan-out cheap.
     payload: { type: "object", required: true, maxJsonBytes: MAX_PAYLOAD_JSON_BYTES },
     issuedAtMs: { type: "int", required: true },
+    // The origin device's signature over signableBytes() — binds
+    // (originDeviceId, lamport, op, payload) to the AUTHORING device so a
+    // compromised sibling cannot forge/poison another origin's stream.
+    sig: { type: "string", required: true, trim: true },
   };
+
+  // The exact bytes the origin device signs and a receiver recomputes — the event
+  // body minus `sig`, canonicalized. Deterministic across devices.
+  static signableBytes({ op, lamport, originDeviceId, originDevicePublicKeyB64, payload, issuedAtMs } = {}) {
+    return new TextEncoder().encode(canonicalJSONStringify({
+      kind: ACCOUNT_STATE_EVENT_KIND, op, lamport, originDeviceId, originDevicePublicKeyB64, payload, issuedAtMs,
+    }));
+  }
 
   validate() {
     super.validate();
