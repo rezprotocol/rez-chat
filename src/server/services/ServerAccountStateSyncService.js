@@ -304,7 +304,9 @@ export class ServerAccountStateSyncService extends BaseServerService {
 
     if (event.op === "contact.remove") {
       if (contacts && typeof contacts.deleteContact === "function") {
-        await contacts.deleteContact({ accountId: p.accountId });
+        // fromSync: applying a replicated removal must NOT re-replicate (loop guard).
+        // The sibling runs its own demote-or-delete against its own co-membership view.
+        await contacts.deleteContact({ accountId: p.accountId, fromSync: true });
       }
       return true;
     }
@@ -321,8 +323,15 @@ export class ServerAccountStateSyncService extends BaseServerService {
       const remoteAccountIdentityPublicKeyB64 = typeof p.remoteAccountIdentityPublicKeyB64 === "string" ? p.remoteAccountIdentityPublicKeyB64.trim() : "";
       const remoteIdentityDhPublicKeyB64 = typeof p.remoteIdentityDhPublicKeyB64 === "string" ? p.remoteIdentityDhPublicKeyB64.trim() : "";
       const peerLinks = this.#peerLinks();
+      // FU3 (Finding 5): the peer-link relationship + direct thread are ONLY usable
+      // by a device that runs per-device sessions (has a device key). A device
+      // without one could open+apply an account-state event but could never decrypt
+      // the peer's message — so skip the relationship+thread it can't use and apply
+      // only the contact (name-only value). Normal device-bearing siblings are
+      // unaffected.
+      const hasDeviceSessions = Boolean(this.#deviceId());
       const hasRelationship = peerLinkId && peerInboxId && remoteAccountIdentityPublicKeyB64 && remoteIdentityDhPublicKeyB64;
-      if (peerLinks && typeof peerLinks.upsertPeerRelationship === "function" && hasRelationship) {
+      if (hasDeviceSessions && peerLinks && typeof peerLinks.upsertPeerRelationship === "function" && hasRelationship) {
         try {
           await peerLinks.upsertPeerRelationship({
             peerAccountId: p.accountId,
@@ -356,7 +365,7 @@ export class ServerAccountStateSyncService extends BaseServerService {
       // has somewhere to surface the peer's message — mirroring the inviter-side
       // materialization in #handlePeerLinkUpdated, so the thread shows before any
       // message arrives.
-      if (threads && peerLinkId && peerInboxId && typeof threads.ensureDirectThread === "function") {
+      if (hasDeviceSessions && threads && peerLinkId && peerInboxId && typeof threads.ensureDirectThread === "function") {
         const threadId = typeof p.threadId === "string" && p.threadId.trim()
           ? p.threadId.trim()
           : (typeof threads.directThreadIdForPeerLink === "function" ? threads.directThreadIdForPeerLink(peerLinkId, p.accountId) : null);

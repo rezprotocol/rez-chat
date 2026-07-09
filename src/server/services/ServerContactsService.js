@@ -156,6 +156,12 @@ export class ServerContactsService extends BaseServerService {
 
   async deleteContact(payload = {}) {
     const params = this._coerceParams(payload, ContactsDeleteParams);
+    // When the delete is itself the APPLICATION of a replicated sibling event
+    // (fromSync), do NOT re-replicate — else two devices would fan the same removal
+    // back and forth (the demote path always "succeeds", so it would never
+    // terminate on lamport idempotency). The sibling still runs its own
+    // demote-or-delete logic locally against its own co-membership view.
+    const fromSync = payload && payload.fromSync === true;
 
     // Tear down the 1:1 DM regardless of how we dispose of the contact row
     // below: a contact and its DM thread are one relationship, and removing the
@@ -197,6 +203,9 @@ export class ServerContactsService extends BaseServerService {
       // the shared group roster — one source of truth, preserved.
       const contact = demoted && demoted.contact ? demoted.contact : null;
       this.#emitContactUpdated(contact);
+      // FU2 (Finding 4): the co-member DEMOTE-to-known also converges siblings —
+      // replicate the removal so each sibling runs its own demote/delete locally.
+      if (!fromSync) this.#replicateRemoval(params.accountId);
       return new ContactsDeleteResult({ deleted: true });
     }
 
@@ -211,13 +220,19 @@ export class ServerContactsService extends BaseServerService {
       this.#emitContactRemoved(params.accountId);
       // S14: replicate the removal to our SIBLING devices so they drop the contact
       // + its thread too. Best-effort; never blocks the local delete.
-      const sync = this.bus.services && this.bus.services.accountStateSync ? this.bus.services.accountStateSync : null;
-      if (sync && typeof sync.replicate === "function") {
-        sync.replicate({ op: "contact.remove", payload: { accountId: params.accountId } })
-          .catch((err) => this.logger.warn("[ServerContactsService] account-state replicate (remove) failed", err && err.message ? err.message : err));
-      }
+      if (!fromSync) this.#replicateRemoval(params.accountId);
     }
     return new ContactsDeleteResult({ deleted: result && result.deleted === true });
+  }
+
+  // Fan a contact removal out to our SIBLING devices (S14). Best-effort +
+  // fire-and-forget; a sibling fan-out failure never blocks the local delete.
+  #replicateRemoval(accountId) {
+    const sync = this.bus.services && this.bus.services.accountStateSync ? this.bus.services.accountStateSync : null;
+    if (sync && typeof sync.replicate === "function") {
+      sync.replicate({ op: "contact.remove", payload: { accountId } })
+        .catch((err) => this.logger.warn("[ServerContactsService] account-state replicate (remove) failed", err && err.message ? err.message : err));
+    }
   }
 
   /**

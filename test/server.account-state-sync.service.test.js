@@ -210,6 +210,18 @@ test("applyInbound contact.remove deletes the contact", async () => {
   assert.deepEqual(res, { applied: true });
   assert.equal(calls.deleteContact.length, 1);
   assert.equal(calls.deleteContact[0].accountId, "rez:acct:carol");
+  // FU2 loop guard: a replicated removal is applied with fromSync so the sibling's
+  // own deleteContact does NOT re-replicate it back.
+  assert.equal(calls.deleteContact[0].fromSync, true);
+});
+
+test("FU3: a device with NO device sessions applies only the contact (no unusable relationship/thread)", async () => {
+  const { svc, calls } = makeHarness({ deviceId: "" });
+  const res = await svc.applyInbound({ ...CONTACT_UPSERT, lamport: 5, originDeviceId: "rez:dev:sib", issuedAtMs: 1000, originDevicePublicKeyB64: "p", sig: "s" });
+  assert.equal(res.applied, true);
+  assert.equal(calls.ensureActive.length, 1, "the contact (name-only value) is still applied");
+  assert.equal(calls.upsertRelationship.length, 0, "no peer-link relationship it can't use");
+  assert.equal(calls.ensureThread.length, 0, "no dangling thread that will never receive");
 });
 
 test("applyInbound rejects a malformed event", async () => {

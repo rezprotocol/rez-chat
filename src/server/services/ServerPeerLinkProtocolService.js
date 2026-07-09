@@ -77,8 +77,17 @@ const RECOVERY_MAP_MAX_ENTRIES = 4096;
  *     ServerEventService. A total decrypt miss (THREAD_NOT_READY) triggers a
  *     recovery invite for the single eligible candidate.
  */
+// FU1/F5: bound an account-state open FLOOD (a malicious node depositing junk shaped
+// like a self-event to burn AEAD attempts + log spam). Successful opens (legit
+// self-events) are NOT counted; only failed opens trip the per-window cap.
+const ACCOUNT_STATE_OPEN_FAILURE_WINDOW_MS = 10_000;
+const ACCOUNT_STATE_OPEN_FAILURE_MAX = 50;
+
 export class ServerPeerLinkProtocolService extends BaseServerService {
   #clock;
+  // FU1/F5: sliding-window failed-open counter for account-state deposits.
+  #accountStateOpenFailures = 0;
+  #accountStateOpenWindowStartMs = 0;
   // peerAccountId -> last recovery-invite trigger time (ms). Synchronous burst
   // gate AND the glare "outstanding invite" marker; see the consts above.
   #recoveryInviteAtMsByPeer = new Map();
@@ -222,6 +231,16 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       if (typeof peerLinks.openAccountStateEvent !== "function") {
         return { consumed: false, decryptOk: false, reason: "account-state-unsupported" };
       }
+      // FU1/F5: once the per-window failed-open cap is hit, drop further account-state
+      // deposits WITHOUT the AEAD attempt or a log — bounds a junk-deposit flood.
+      const nowMs = this.#clock();
+      if (nowMs - this.#accountStateOpenWindowStartMs > ACCOUNT_STATE_OPEN_FAILURE_WINDOW_MS) {
+        this.#accountStateOpenWindowStartMs = nowMs;
+        this.#accountStateOpenFailures = 0;
+      }
+      if (this.#accountStateOpenFailures >= ACCOUNT_STATE_OPEN_FAILURE_MAX) {
+        return { consumed: true, decryptOk: false, reason: "account-state-rate-limited" };
+      }
       let openedBytes;
       try {
         // AAD binds the ciphertext to THIS inbox (the one it was deposited to) —
@@ -231,8 +250,12 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         // A foreign account cannot produce a deposit our account-state key opens;
         // tampering fails AEAD auth. The key is stable (not a ratchet), so a failure
         // now will not open later — consume it rather than retry forever.
-        this.logger.warn("[ServerPeerLinkProtocolService] account-state event failed to open; dropping",
-          asErr && asErr.message ? asErr.message : asErr);
+        this.#accountStateOpenFailures += 1;
+        // Log only the first failure per window to bound log spam under a flood.
+        if (this.#accountStateOpenFailures === 1) {
+          this.logger.warn("[ServerPeerLinkProtocolService] account-state event failed to open; dropping",
+            asErr && asErr.message ? asErr.message : asErr);
+        }
         return { consumed: true, decryptOk: false, reason: "account-state-open-failed" };
       }
       if (!(openedBytes instanceof Uint8Array) || openedBytes.length === 0) {
