@@ -149,6 +149,13 @@ export class ServerEventService extends BaseServerService {
         // this peer's fanned-out messages. Best-effort; a sibling fan-out failure
         // never blocks the local materialization.
         this.#replicateContactRelationship({ peerAccountId, remoteDisplayName, peerInboxId, peerLinkId, threadId });
+        // FU5: publish OUR device set to the newly-linked peer so the peer can
+        // resolve our devices and fan out to us (both directions). Without this
+        // on-establish hook, neither side ever publishes to the other and
+        // multi-device fan-out — including a peer replying to us — silently falls
+        // back to the legacy single-device path. No-op unless multi-device is on.
+        this._call("device-set", "publishForPeer", { peerAccountId })
+          .catch((err) => this.logger.warn("[ServerEventService] device-set publishForPeer failed", err && err.message ? err.message : err));
       }
       if (peerAccountId && this.bus.services.profile && typeof this.bus.services.profile.sendProfileToPeer === "function") {
         this.bus.services.profile.sendProfileToPeer({

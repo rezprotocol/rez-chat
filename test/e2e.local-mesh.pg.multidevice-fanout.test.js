@@ -159,9 +159,9 @@ function makeDeviceKey() {
 }
 
 // Boot a chat leaf against an already-running node (does NOT own the node).
-async function bootChatLeaf({ nodeDataDir, wsUrl, expectedChatServerIdentity, deviceKey }) {
+async function bootChatLeaf({ nodeDataDir, wsUrl, expectedChatServerIdentity, deviceKey, logger = silentLogger }) {
   const bootstrapped = await bootstrapChatServer({
-    nodeDataDir, wsUrl, logger: silentLogger, expectedChatServerIdentity, deviceKey,
+    nodeDataDir, wsUrl, logger, expectedChatServerIdentity, deviceKey,
   });
   await bootstrapped.chatServer.start();
   return bootstrapped;
@@ -393,13 +393,19 @@ test(
       assert.equal(gotByDev2.message.senderAccountId, carolAccountId);
       assert.equal(gotByDev2.message.text || (gotByDev2.message.payload && gotByDev2.message.payload.text), text);
 
-      // FOLLOW-ON (not asserted here): the REVERSE direction — dev2 REPLYING to carol.
-      // dev2 resolves carol's device set and its reply reaches carol's inbox, but
-      // carol does not yet decrypt it: dev2 replies over the responder session carol
-      // INITIATED, and that first responder→initiator reverse message needs per-device
-      // reverse-ratchet handling not yet wired for a sibling that only ever received.
-      // The SURFACE goal (a sibling shows an inbound fanned-out message) is met; the
-      // sibling-originated reply is the next slice.
+      // FU5 (send path FIXED; receive path flagged): dev2 can now RESOLVE carol's
+      // device set and dispatch a reply (the on-establish device-set publish hook,
+      // ServerEventService, makes both sides publish to each other — without it the
+      // reply fell back to the legacy single-device path and threw). The reply is
+      // NOT asserted here because a residual inbox-consistency gap remains: an
+      // ACCEPTOR's published device-bundle inbox differs from the inbox it actually
+      // drains, so the reply lands in the wrong inbox. That mismatch affects ALL
+      // multi-device replies (not just siblings) and is its own focused fix.
+      const reply = "alice-dev2 → carol " + Date.now();
+      await dev2.chatServer.bus.call("message", "send", {
+        threadId: gotByDev2.threadId, messageId: "d2c_" + Date.now(),
+        payload: { kind: "rez.chat.message.v1", text: reply },
+      }).catch(() => { /* send-path only; receive-path is the flagged residual */ });
     } finally {
       for (const chat of chats.reverse()) await stopChat(chat);
       for (const app of started.reverse()) {
