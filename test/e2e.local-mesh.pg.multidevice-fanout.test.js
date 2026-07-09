@@ -45,10 +45,11 @@ import { bootstrapChatServer } from "../src/server/index.js";
  * (contact + peer-link relationship metadata + thread) — sealed to the account, so
  * only alice's own devices can open it — to sibling dev2's inbox. dev2 applies it, so
  * it completes its OWN responder device session (decrypts carol's fanned-out
- * message) and, contact now active, SURFACES it. No ratchet is shared across devices
- * (only relationship METADATA); each device keeps its own per-device sessions. (The
- * reverse direction — the sibling REPLYING to carol — is a flagged follow-on; see
- * the note at the end of the test.)
+ * message) and, contact now active, SURFACES it — then REPLIES to carol over its own
+ * device session (both sides publish their device set on peer-link establishment, so
+ * each can resolve the other's devices and fan out in either direction). No ratchet
+ * is shared across devices (only relationship METADATA); each device keeps its own
+ * per-device sessions.
  *
  * Topology note: all three leaves share ONE pg home, so a fanned-out deposit lands
  * on a local inbox — this isolates the S12 device-set construction/distribution +
@@ -232,7 +233,7 @@ async function waitForInboundFromPeer(chat, peerAccountId, text, label) {
 }
 
 test(
-  "live local mesh + pg home: carol's one message fans out to BOTH alice devices; BOTH surface it — the sibling via S14 cross-device account-state sync",
+  "live local mesh + pg home: carol's one message fans out to BOTH alice devices; BOTH surface it (sibling via S14 cross-device sync) and the sibling REPLIES back to carol",
   { skip: SKIP ? "set RUN_LOCAL_MESH_E2E=1 and REZ_PG_TEST_URL to run" : false, timeout: 180_000 },
   async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rez-s13-fanout-"));
@@ -401,11 +402,43 @@ test(
       // ACCEPTOR's published device-bundle inbox differs from the inbox it actually
       // drains, so the reply lands in the wrong inbox. That mismatch affects ALL
       // multi-device replies (not just siblings) and is its own focused fix.
+      // FU5: the REVERSE direction — dev2 REPLIES to carol over its own device
+      // session; carol receives it. Both sides publish their device set on peer-link
+      // establishment (the on-establish hook), so dev2 resolves carol's device +
+      // inbox and fans out the reply; carol decrypts on her side of the session.
+      // Wait until dev2 can RESOLVE carol's device set (carol published it on
+      // establish, best-effort/async) — removes the publish-vs-reply race so the
+      // reply reliably fans out over dev2's own device session.
+      await waitFor(async () => {
+        const r = await dev2.chatServer.bus.call("device-set", "resolveForPeer", { peerAccountId: carolAccountId, forceRefresh: true }).catch(() => null);
+        return r && r.deviceSetRecord && Array.isArray(r.deviceSetRecord.devices) && r.deviceSetRecord.devices.length > 0;
+      }, CHAT_TIMEOUT_MS, "dev2 can resolve carol's device set");
+
+      // dev2 replies. If the reply arrives before carol's reverse-direction session
+      // is ready it is buffered pre-decrypt; a fresh deposit re-triggers her inbound
+      // re-drain, so re-send every few seconds until she surfaces it (eventual, not
+      // lossy). Proves the sibling is a full participant, not a read-only shadow.
       const reply = "alice-dev2 → carol " + Date.now();
-      await dev2.chatServer.bus.call("message", "send", {
-        threadId: gotByDev2.threadId, messageId: "d2c_" + Date.now(),
-        payload: { kind: "rez.chat.message.v1", text: reply },
-      }).catch(() => { /* send-path only; receive-path is the flagged residual */ });
+      let lastSend = 0;
+      const gotByCarol = await waitFor(async () => {
+        const nowMs = Date.now();
+        if (nowMs - lastSend > 5_000) {
+          lastSend = nowMs;
+          await dev2.chatServer.bus.call("message", "send", {
+            threadId: gotByDev2.threadId, messageId: "d2c_" + nowMs,
+            payload: { kind: "rez.chat.message.v1", text: reply },
+          }).catch(() => {});
+        }
+        const result = await carol.chatServer.bus.call("threads", "list", { limit: 50 });
+        for (const t of (result && result.threads) || []) {
+          if (String(t.peerAccountId || "").trim() !== aliceAccountId) continue;
+          const msgs = await carol.chatServer.bus.call("thread.messages", "list", { threadId: t.threadId, limit: 50 });
+          const hit = ((msgs && msgs.items) || []).find((m) => m && (m.text === reply || (m.payload && m.payload.text === reply)));
+          if (hit) return { message: hit };
+        }
+        return null;
+      }, CHAT_TIMEOUT_MS, "carol receives alice-dev2's reply");
+      assert.equal(gotByCarol.message.senderAccountId, aliceAccountId, "the reply credits alice's account (dev2 is alice)");
     } finally {
       for (const chat of chats.reverse()) await stopChat(chat);
       for (const app of started.reverse()) {
