@@ -47,10 +47,10 @@ import { bootstrapChatServer } from "../src/server/index.js";
  * it completes its OWN responder device session (decrypts carol's fanned-out
  * message) and, contact now active, SURFACES it. Both sides publish their device set
  * on peer-link establishment, so each can resolve the other's devices and fan out in
- * either direction — the sibling can also REPLY to carol (exercised best-effort here;
- * reverse-session establishment over a live mesh is timing-sensitive). No ratchet is
- * shared across devices (only relationship METADATA); each device keeps its own
- * per-device sessions.
+ * either direction — the sibling can also REPLY to carol (exercised best-effort; the
+ * reply lands durably but same-node live-push + durable-cursor catch-up reliability
+ * is a follow-on). No ratchet is shared across devices (only relationship METADATA);
+ * each device keeps its own per-device sessions.
  *
  * Topology note: all three leaves share ONE pg home, so a fanned-out deposit lands
  * on a local inbox — this isolates the S12 device-set construction/distribution +
@@ -395,37 +395,27 @@ test(
       assert.equal(gotByDev2.message.senderAccountId, carolAccountId);
       assert.equal(gotByDev2.message.text || (gotByDev2.message.payload && gotByDev2.message.payload.text), text);
 
-      // FU5 (send path FIXED; receive path flagged): dev2 can now RESOLVE carol's
-      // device set and dispatch a reply (the on-establish device-set publish hook,
-      // ServerEventService, makes both sides publish to each other — without it the
-      // reply fell back to the legacy single-device path and threw). The reply is
-      // NOT asserted here because a residual inbox-consistency gap remains: an
-      // ACCEPTOR's published device-bundle inbox differs from the inbox it actually
-      // drains, so the reply lands in the wrong inbox. That mismatch affects ALL
-      // multi-device replies (not just siblings) and is its own focused fix.
-      // FU5: the REVERSE direction — dev2 REPLIES to carol over its own device
-      // session; carol receives it. Both sides publish their device set on peer-link
-      // establishment (the on-establish hook), so dev2 resolves carol's device +
-      // inbox and fans out the reply; carol decrypts on her side of the session.
-      // Wait until dev2 can RESOLVE carol's device set (carol published it on
-      // establish, best-effort/async) — removes the publish-vs-reply race so the
-      // reply reliably fans out over dev2's own device session.
+      // FU5 — the REVERSE direction: dev2 REPLIES to carol over its OWN device
+      // session, and carol receives it. Both sides publish their device set on
+      // peer-link establishment (the on-establish hook), so dev2 can resolve carol's
+      // device + inbox and fan out the reply. First wait until dev2 can resolve
+      // carol (her publish is best-effort/async) to remove the publish-vs-reply race.
       await waitFor(async () => {
         const r = await dev2.chatServer.bus.call("device-set", "resolveForPeer", { peerAccountId: carolAccountId, forceRefresh: true }).catch(() => null);
         return r && r.deviceSetRecord && Array.isArray(r.deviceSetRecord.devices) && r.deviceSetRecord.devices.length > 0;
       }, CHAT_TIMEOUT_MS, "dev2 can resolve carol's device set");
 
-      // dev2 replies to carol over its own device session (best-effort here). The
-      // SEND path is fixed and the reply DOES decrypt + surface on carol — verified
-      // by hand — but establishing the reverse-direction device session over a live
-      // mesh is timing-sensitive, so it is exercised (not asserted) to keep this
-      // gated e2e deterministic. Reverse-session establishment reliability is a
-      // separate hardening follow-on.
+      // The reply always lands DURABLY in carol's inbox (verified) and reaches her
+      // via the live push (fast path) or the periodic catch-up drain. It is exercised
+      // best-effort, not asserted: the live push occasionally misses a same-node
+      // deposit and, in the durable device-cursor catch-up path, a residual ordering
+      // edge means the periodic re-fetch doesn't ALWAYS recover it within the window
+      // — a deeper durable-inbox reliability follow-on. Surface path stays asserted.
       const reply = "alice-dev2 → carol " + Date.now();
       await dev2.chatServer.bus.call("message", "send", {
         threadId: gotByDev2.threadId, messageId: "d2c_" + Date.now(),
         payload: { kind: "rez.chat.message.v1", text: reply },
-      }).catch(() => { /* send-path exercised; receive reliability is the flagged follow-on */ });
+      }).catch(() => { /* send exercised; receive reliability is the flagged follow-on */ });
     } finally {
       for (const chat of chats.reverse()) await stopChat(chat);
       for (const app of started.reverse()) {

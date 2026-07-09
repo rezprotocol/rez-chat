@@ -62,6 +62,57 @@ function makePipeline(resultFor, log) {
 
 const ok = () => ({ consumed: true, decryptOk: true });
 
+test("the periodic drain re-fetches a deposit the live push missed (quiet-inbox safety net)", async () => {
+  const INBOX = "inbox:periodic";
+  const emitted = [];
+  const items = { [INBOX]: [] }; // empty at start
+  const sdk = makeSdkWithMailbox({
+    items,
+    fetchByEventId: { [INBOX + "|evt_late"]: { ciphertextB64: "TA==" } },
+  });
+  const bus = new ChatServerBus();
+  bus.runtime.sdk = sdk;
+  const service = new InboxCatchupService({
+    bus,
+    inboxClaimant: { inboxId: INBOX },
+    inboundPipeline: makePipeline(ok, emitted),
+    processedLog: new ProcessedDepositLog({ kvStore: new MemKv() }),
+    periodicDrainMs: 20, // fast for the test
+  });
+  await service.start(); // initial drain finds nothing
+  assert.deepEqual(emitted.map((f) => f.body.eventId), [], "nothing at start");
+  try {
+    // A deposit lands in the durable inbox AFTER start with NO push and NO reconnect
+    // — only the periodic drain can rescue it.
+    items[INBOX].push({ eventId: "evt_late", objectId: "o", createdAt: 1 });
+    await new Promise((r) => setTimeout(r, 90)); // a few periods
+    assert.deepEqual(emitted.map((f) => f.body.eventId), ["evt_late"], "the periodic drain re-fetched the missed deposit");
+  } finally {
+    await service.stop();
+  }
+});
+
+test("periodicDrainMs=0 disables the periodic drain (no timer)", async () => {
+  const INBOX = "inbox:noperiodic";
+  const emitted = [];
+  const items = { [INBOX]: [] };
+  const sdk = makeSdkWithMailbox({ items, fetchByEventId: {} });
+  const bus = new ChatServerBus();
+  bus.runtime.sdk = sdk;
+  const service = new InboxCatchupService({
+    bus, inboxClaimant: { inboxId: INBOX }, inboundPipeline: makePipeline(ok, emitted),
+    processedLog: new ProcessedDepositLog({ kvStore: new MemKv() }), periodicDrainMs: 0,
+  });
+  await service.start();
+  try {
+    items[INBOX].push({ eventId: "evt_x", objectId: "o", createdAt: 1 });
+    await new Promise((r) => setTimeout(r, 60));
+    assert.deepEqual(emitted.map((f) => f.body.eventId), [], "no periodic drain when disabled");
+  } finally {
+    await service.stop();
+  }
+});
+
 test("InboxCatchupService drains all pending items and ACKs them on first start", async () => {
   const INBOX = "inbox:owner";
   const listSpy = [];

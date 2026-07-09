@@ -62,11 +62,13 @@ export class InboxCatchupService extends BaseServerService {
   #processedLog;
   #maxQuarantineAgeMs;
   #clock;
+  #periodicDrainMs;
+  #periodicTimer;
   // REZ-11: eventId -> earliest ms at which a failed deposit may be re-attempted.
   // In-memory (per session); bounded by the mailbox buffer cap and pruned on ack.
   #decryptBackoffUntilMsByEvent = new Map();
 
-  constructor({ bus, inboxClaimant, inboundPipeline, processedLog = null, pageLimit = DEFAULT_PAGE_LIMIT, maxDecryptAttempts = DEFAULT_MAX_DECRYPT_ATTEMPTS, maxQuarantineAgeMs = DEFAULT_MAX_QUARANTINE_AGE_MS, clock = () => Date.now(), logger = console } = {}) {
+  constructor({ bus, inboxClaimant, inboundPipeline, processedLog = null, pageLimit = DEFAULT_PAGE_LIMIT, maxDecryptAttempts = DEFAULT_MAX_DECRYPT_ATTEMPTS, maxQuarantineAgeMs = DEFAULT_MAX_QUARANTINE_AGE_MS, periodicDrainMs = 30_000, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, logger });
     if (!inboxClaimant) {
       throw new Error("InboxCatchupService requires inboxClaimant");
@@ -87,6 +89,8 @@ export class InboxCatchupService extends BaseServerService {
       ? Number(maxQuarantineAgeMs)
       : DEFAULT_MAX_QUARANTINE_AGE_MS;
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
+    this.#periodicDrainMs = Number.isFinite(periodicDrainMs) && periodicDrainMs > 0 ? Number(periodicDrainMs) : 0;
+    this.#periodicTimer = null;
     this.#draining = false;
     this.#pending = false;
     this.#offReconnect = null;
@@ -102,10 +106,28 @@ export class InboxCatchupService extends BaseServerService {
         this.logger.error("[InboxCatchupService] reconnect drain failed: " + (err && err.message ? err.message : err));
       });
     });
+    // Periodic safety-net drain: the live push (MailboxPushBridge) is the primary,
+    // instant delivery path, but a push CAN be missed (a race, or no cross-node
+    // Redis liveness), leaving a deposit persisted in the durable home yet never fed
+    // to the pipeline until the next reconnect. A low-frequency re-drain re-fetches
+    // any such deposit from the cursor (cheap when nothing is new; coalesced with
+    // in-flight/reconnect drains) so a quiet inbox never strands a delivered message.
+    if (this.#periodicDrainMs > 0) {
+      this.#periodicTimer = setInterval(() => {
+        this.requestDrain().catch((err) => {
+          this.logger.error("[InboxCatchupService] periodic drain failed: " + (err && err.message ? err.message : err));
+        });
+      }, this.#periodicDrainMs);
+      if (this.#periodicTimer && typeof this.#periodicTimer.unref === "function") this.#periodicTimer.unref();
+    }
     await this.requestDrain();
   }
 
   async stop() {
+    if (this.#periodicTimer) {
+      clearInterval(this.#periodicTimer);
+      this.#periodicTimer = null;
+    }
     if (typeof this.#offReconnect === "function") {
       try {
         this.#offReconnect();
