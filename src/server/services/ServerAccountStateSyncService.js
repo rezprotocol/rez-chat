@@ -226,13 +226,21 @@ export class ServerAccountStateSyncService extends BaseServerService {
         }
       }
       // Materialize the direct thread so the sibling has somewhere to surface the
-      // peer's message.
+      // peer's message — the thread RECORD plus its conversation-list index row
+      // (mirroring the inviter-side materialization in #handlePeerLinkUpdated, so
+      // the thread shows before any message arrives).
       if (threads && peerLinkId && peerInboxId && typeof threads.ensureDirectThread === "function") {
         const threadId = typeof p.threadId === "string" && p.threadId.trim()
           ? p.threadId.trim()
           : (typeof threads.directThreadIdForPeerLink === "function" ? threads.directThreadIdForPeerLink(peerLinkId, p.accountId) : null);
         if (threadId) {
           await threads.ensureDirectThread({ threadId, peerAccountId: p.accountId, peerInboxId, createdAtMs: now });
+          const threadIndex = this.bus.stores && this.bus.stores.threadIndex ? this.bus.stores.threadIndex : null;
+          if (threadIndex && typeof threadIndex.upsertFromMessage === "function") {
+            const record = await threadIndex.upsertFromMessage({ threadId, messageId: null, ts: now, preview: "Connected" })
+              .catch((err) => { this.logger.warn("[ServerAccountStateSyncService] thread index upsert failed", err && err.message ? err.message : err); return null; });
+            if (record && typeof threads.emitThreadIndexUpdated === "function") threads.emitThreadIndexUpdated(record);
+          }
         }
       }
       return;

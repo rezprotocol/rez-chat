@@ -40,15 +40,15 @@ import { bootstrapChatServer } from "../src/server/index.js";
  *     durable home's `mailbox_events` gains a deposit for BOTH device inboxes.
  *   - the inviting device (alice-dev1, a real contact) drains + decrypts its copy.
  *
- * KNOWN GAP (pinned below, not yet built — the next slice): a SIBLING device that
- * never took part in the alice↔carol invite (alice-dev2) holds its own local chat
- * state and has NO contact record for carol, so `ServerEventService`'s
- * `isActiveContact` gate (ServerEventService.js ~L306, "dropped direct content from
- * non-contact") DROPS carol's fanned-out message even though it was delivered to
- * dev2's inbox. Surfacing it on dev2 needs cross-device account-state sync (the
- * shared home broadcasting contact/peer-link mutations to all of an account's
- * devices). The message IS delivered to dev2's inbox (asserted); it is not yet
- * SURFACED — this test pins that boundary so closing the gap trips it.
+ * S14 (cross-device account-state sync) CLOSES the sibling-receive gap: when carol's
+ * accept establishes the link on alice-dev1, dev1 replicates the DIRECT relationship
+ * (contact + peer-link relationship metadata + thread) — sealed to the account, so
+ * only alice's own devices can open it — to sibling dev2's inbox. dev2 applies it, so
+ * it completes its OWN responder device session (decrypts carol's fanned-out
+ * message) and, contact now active, SURFACES it. No ratchet is shared across devices
+ * (only relationship METADATA); each device keeps its own per-device sessions. (The
+ * reverse direction — the sibling REPLYING to carol — is a flagged follow-on; see
+ * the note at the end of the test.)
  *
  * Topology note: all three leaves share ONE pg home, so a fanned-out deposit lands
  * on a local inbox — this isolates the S12 device-set construction/distribution +
@@ -232,7 +232,7 @@ async function waitForInboundFromPeer(chat, peerAccountId, text, label) {
 }
 
 test(
-  "live local mesh + pg home: carol's one message fans out to BOTH alice device inboxes on the durable home; the contact device surfaces it (sibling-device surface pinned as the next gap)",
+  "live local mesh + pg home: carol's one message fans out to BOTH alice devices; BOTH surface it — the sibling via S14 cross-device account-state sync",
   { skip: SKIP ? "set RUN_LOCAL_MESH_E2E=1 and REZ_PG_TEST_URL to run" : false, timeout: 180_000 },
   async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rez-s13-fanout-"));
@@ -326,11 +326,19 @@ test(
       const carolThreadId = accepted.threadId;
 
       // --- Now that carol is a peer, alice republishes her AGGREGATED (2-device)
-      // device set sealed to carol. (No automatic on-establish publish hook exists;
-      // in production connect()/account-mutation drive it — here we drive it
-      // explicitly, the SSOT bus verb.) ---
+      // device set sealed to carol, and carol republishes HER device set to alice
+      // (so a sibling can later resolve carol's devices to REPLY). No automatic
+      // on-establish publish hook exists; in production connect()/account-mutation
+      // drive it — here we drive it explicitly, the SSOT bus verb. ---
       const republished = await dev1.chatServer.bus.call("device-set", "republishToAllPeers", {});
       assert.ok(republished && republished.published >= 1, "alice-dev1 republished the device set to carol");
+
+      // --- S14: when carol's accept established the link on alice-dev1, dev1
+      // replicated the DIRECT relationship (contact + peer-link relationship + thread)
+      // to its SIBLING dev2's inbox. Wait for dev2 to apply it — proof the
+      // cross-device account-state sync landed BEFORE carol's message arrives. This
+      // is what lets dev2 complete its own responder session + pass the gate below. ---
+      await waitForDirectThread(dev2.chatServer, carolAccountId, "alice-dev2 applied the replicated carol relationship (contact + peer-link + thread)");
 
       // --- Carol resolves alice's HOME-AGGREGATED 2-device set through the leaf and
       // establishes a per-device session for EACH device (the S12 distribution half
@@ -376,18 +384,22 @@ test(
       const gotByDev1 = await waitForInboundFromPeer(dev1.chatServer, carolAccountId, text, "alice-dev1 receives carol's message");
       assert.equal(gotByDev1.message.senderAccountId, carolAccountId);
 
-      // KNOWN GAP (pinned): the sibling device that never joined the invite has no
-      // contact record for carol, so ServerEventService's isActiveContact gate drops
-      // the delivered message. It reached dev2's INBOX (asserted above) but is not
-      // yet SURFACED. When cross-device account-state sync lands, dev2 WILL surface
-      // it and this assertion trips — upgrade it to assert delivery then.
-      await sleep(3_000);
-      const dev2Threads = await dev2.chatServer.bus.call("threads", "list", { limit: 50 });
-      const dev2ThreadList = dev2Threads && Array.isArray(dev2Threads.threads) ? dev2Threads.threads : [];
-      assert.equal(
-        dev2ThreadList.length, 0,
-        "BOUNDARY: alice-dev2 does not yet surface carol's message (no sibling-device contact sync) — see file header",
-      );
+      // S14 HEADLINE: the SIBLING device that never took part in the invite now
+      // SURFACES carol's fanned-out message — it holds the replicated relationship
+      // (contact + peer-link + thread), completed its OWN responder device session,
+      // decrypted, and (contact now active) passed the isActiveContact gate. This is
+      // the exact boundary S13 pinned as a gap, now CLOSED.
+      const gotByDev2 = await waitForInboundFromPeer(dev2.chatServer, carolAccountId, text, "alice-dev2 SURFACES carol's fanned-out message");
+      assert.equal(gotByDev2.message.senderAccountId, carolAccountId);
+      assert.equal(gotByDev2.message.text || (gotByDev2.message.payload && gotByDev2.message.payload.text), text);
+
+      // FOLLOW-ON (not asserted here): the REVERSE direction — dev2 REPLYING to carol.
+      // dev2 resolves carol's device set and its reply reaches carol's inbox, but
+      // carol does not yet decrypt it: dev2 replies over the responder session carol
+      // INITIATED, and that first responder→initiator reverse message needs per-device
+      // reverse-ratchet handling not yet wired for a sibling that only ever received.
+      // The SURFACE goal (a sibling shows an inbound fanned-out message) is met; the
+      // sibling-originated reply is the next slice.
     } finally {
       for (const chat of chats.reverse()) await stopChat(chat);
       for (const app of started.reverse()) {
