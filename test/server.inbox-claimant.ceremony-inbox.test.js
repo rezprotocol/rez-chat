@@ -64,6 +64,6 @@ test("legacy / primary boot (no ceremony inbox) still mints a fresh canonical in
   const claimant = await InboxClaimant.bootstrap({
     storageProvider, cryptoProvider: CRYPTO, identity: deviceIdentity(), delegatedInboxId: null,
   });
-  assert.match(claimant.inboxId, /^inbox:[0-9a-f]{16,}$/, "a fresh canonical inbox");
+  assert.match(claimant.inboxId, /^inbox:[0-9a-f]{24}$/, "a fresh canonical inbox (exactly 24 hex)");
   assert.notEqual(claimant.inboxId, A);
 });
