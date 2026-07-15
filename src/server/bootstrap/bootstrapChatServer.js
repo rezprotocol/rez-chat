@@ -230,6 +230,13 @@ export async function bootstrapChatServer({
           publicKeyB64: deviceKey.deviceKeyPair.publicKeyB64,
           privateKeyB64: deviceKey.deviceKeyPair.privateKeyB64,
         },
+    // P1#2 L3.5: for a delegated (device-linked) chat server, claim the EXACT inbox the
+    // device-link ceremony pre-registered (device.add), persisted in the delegated keystore
+    // and surfaced on the identity — never a freshly-minted one. Primary/legacy (no inbox) →
+    // null → the unchanged fresh-claim path.
+    delegatedInboxId: !hasAdminRoot && expectedChatServerIdentity && typeof expectedChatServerIdentity.inboxId === "string"
+      ? expectedChatServerIdentity.inboxId
+      : null,
   });
 
   const inviteAuthority = buildChatServerInviteAuthority({

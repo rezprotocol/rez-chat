@@ -25,7 +25,7 @@ export class InboxClaimant {
   #cryptoProvider;
   #kvStore;
 
-  static async bootstrap({ storageProvider, cryptoProvider, identity = null } = {}) {
+  static async bootstrap({ storageProvider, cryptoProvider, identity = null, delegatedInboxId = null } = {}) {
     if (!storageProvider || typeof storageProvider.getKeyValueStore !== "function") {
       throw new Error("InboxClaimant.bootstrap requires storageProvider");
     }
@@ -36,17 +36,33 @@ export class InboxClaimant {
     await claimStore.hydrate();
     const kvStore = storageProvider.getKeyValueStore(null);
 
-    let primaryInboxId = await kvStore.get(PRIMARY_INBOX_KEY);
-    let claim = null;
-    if (typeof primaryInboxId === "string" && primaryInboxId.trim().length > 0) {
-      claim = claimStore.get(primaryInboxId.trim());
+    const storedRaw = await kvStore.get(PRIMARY_INBOX_KEY);
+    const stored = typeof storedRaw === "string" && storedRaw.trim().length > 0 ? storedRaw.trim() : null;
+    // P1#2 L3.5: a delegated device linked via the device-link ceremony must claim the EXACT
+    // inbox the ceremony pre-registered (device.add) — the one persisted in its keystore —
+    // never a freshly-minted one (else device.add(A)+device.bind(B) → ACCOUNT_DEVICE_CONFLICT).
+    const ceremony = typeof delegatedInboxId === "string" && delegatedInboxId.trim().length > 0
+      ? delegatedInboxId.trim()
+      : null;
+    // A restart keeps the already-persisted inbox; a keystore naming a DIFFERENT inbox than the
+    // one already claimed is a hard inconsistency (two identities for one device) — fail loud.
+    if (stored && ceremony && stored !== ceremony) {
+      throw new Error(
+        "InboxClaimant.bootstrap: persisted primary inbox (" + stored
+          + ") does not match the delegated keystore's ceremony inbox (" + ceremony + ")",
+      );
     }
+    // stored wins on restart; the ceremony inbox seeds a fresh delegated boot; null = the
+    // legacy fresh-claim path (primary account or a delegated keystore without an inbox).
+    const target = stored || ceremony;
+    let claim = target ? claimStore.get(target) : null;
     if (!claim) {
       // When an identity is supplied, the claimant keypair IS the chat-server's
       // session identity — one keypair authenticates the WS session and owns
       // the inbox, so routing/lookups stay symmetric and don't need a separate
-      // account-identity → claimant-identity mapping.
-      const fresh = await claimStore.createClaim({ identity });
+      // account-identity → claimant-identity mapping. `inboxId: target` claims the exact
+      // ceremony inbox when set; null mints a fresh one (unchanged legacy behavior).
+      const fresh = await claimStore.createClaim({ identity, inboxId: target });
       claim = await claimStore.persist(fresh);
       await kvStore.set(PRIMARY_INBOX_KEY, claim.inboxId);
     }

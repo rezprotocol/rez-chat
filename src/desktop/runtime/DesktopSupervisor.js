@@ -200,6 +200,10 @@ export class DesktopSupervisor {
         certChain: result.delegation.certChain,
         cachedDeviceSet: result.delegation.cachedDeviceSet,
       },
+      // P1#2 L3.5: the EXACT inbox the ceremony pre-registered (device.add). Persisting it
+      // here (instead of letting first boot mint a fresh one) is what stops the
+      // device.add(A)+device.bind(B) ACCOUNT_DEVICE_CONFLICT.
+      inboxId: result.inboxId,
     });
   }
 

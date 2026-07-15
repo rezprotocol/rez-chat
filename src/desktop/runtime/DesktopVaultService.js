@@ -323,7 +323,7 @@ export class DesktopVaultService {
    * cached device set into a keystore payload v3. The S10 PSK ceremony is the
    * production source of `delegationBundle`; S9 tests build it locally.
    */
-  async createDelegatedAccount({ profileName = "", password = "", deviceKeyPair = null, delegationBundle = null } = {}) {
+  async createDelegatedAccount({ profileName = "", password = "", deviceKeyPair = null, delegationBundle = null, inboxId = null } = {}) {
     const name = normalizeString(profileName);
     const pwd = String(password || "");
     if (!name) throw new Error("vault.createDelegatedAccount requires profileName");
@@ -359,6 +359,9 @@ export class DesktopVaultService {
           deviceKeyPair,
           certChain: bundle.certChain,
           cachedDeviceSet: bundle.cachedDeviceSet === undefined ? null : bundle.cachedDeviceSet,
+          // P1#2 L3.5: persist the device-link ceremony's pre-registered home inbox so the
+          // delegated device claims exactly it on boot (the keystore validates canonicality).
+          inboxId: inboxId === undefined ? null : inboxId,
         },
       });
       const envelope = await keystoreStore.getKeystoreEnvelope();
@@ -434,6 +437,9 @@ export class DesktopVaultService {
         hasAdminRoot: false,
         certChain: cloneJson(unlocked.certChain),
         accountIdentityDhKeyPair: cloneJson(unlocked.accountIdentityDhKeyPair),
+        // P1#2 L3.5: the device-link ceremony's pre-registered home inbox (null for a legacy
+        // delegated keystore) — bootstrap claims exactly this inbox instead of minting one.
+        inboxId: unlocked.inboxId === undefined ? null : unlocked.inboxId,
       };
       this.#pendingChatServerIdentity = null;
     } else if (this.#pendingChatServerIdentity && this.#pendingChatServerIdentity.accountId) {
