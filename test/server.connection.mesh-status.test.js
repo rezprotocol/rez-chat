@@ -4,11 +4,15 @@ import assert from "node:assert/strict";
 import { ChatServerBus } from "../src/server/app/ChatServerBus.js";
 import { ServerConnectionService } from "../src/server/services/ServerConnectionService.js";
 
-test("ServerConnectionService normalizes sdk node meshStatus wrapper payloads", async () => {
+// The payload shape below is exactly what MeshStatusHandler sends for node.status:
+// { node, mesh, peers }. This test used to stub a `meshStatus()` method instead — a method no
+// NodeCapability has ever exposed — which kept an unreachable branch in the service alive. The
+// subject was always meshFromStatus normalization, so it now exercises the real op.
+test("ServerConnectionService normalizes the node.status mesh payload", async () => {
   const bus = new ChatServerBus({});
   bus.runtime.sdk = {
     node: {
-      async meshStatus() {
+      async status() {
         return {
           node: {
             accountId: "acct_test",
