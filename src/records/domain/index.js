@@ -8,4 +8,5 @@ export { ChatGroupMember } from "./ChatGroupMember.js";
 export { ChatChannel, sortChannelsAlpha } from "./ChatChannel.js";
 export { LinkPreview } from "./LinkPreview.js";
 export { DeviceFanoutCacheEntryV1 } from "./DeviceFanoutCacheEntryV1.js";
+export { PendingCeremonyRecordV1, PENDING_CEREMONY_STATES, isAllowedCeremonyTransition } from "./PendingCeremonyRecordV1.js";
 export * from "./coerce.js";
