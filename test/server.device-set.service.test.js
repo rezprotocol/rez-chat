@@ -298,9 +298,9 @@ function makeStubPeerLinks() {
   };
 }
 
-function makeStubService({ peerLinks, devices = {} } = {}) {
+function makeStubService({ peerLinks, devices = {}, multiDeviceFanout = false } = {}) {
   const puts = [];
-  const bus = makeBus({ peerLinks, sdk: { durableRecords: { async put(x) { puts.push(x); }, async get() { return null; } }, devices } });
+  const bus = makeBus({ peerLinks, sdk: { durableRecords: { async put(x) { puts.push(x); }, async get() { return null; } }, devices }, multiDeviceFanout });
   const svc = new ServerDeviceSetService({ bus, ownerAccountId: "rez:acct:self", clock: () => 5000 });
   return { svc, puts, bus };
 }
@@ -412,4 +412,35 @@ test("F1: no published revocations ⇒ null revocationState threaded (byte-compa
   const svc = new ServerDeviceSetService({ bus, ownerAccountId: "rez:acct:self" });
   await svc.resolveForPeer({ peerAccountId: "rez:acct:peer" });
   assert.equal(ingestArgs[0].revocationState, null);
+});
+
+// ---- P1#4 (publish side): our OWN device set must not silently shrink to one ----
+
+test("gate OPEN: an unreadable own device set THROWS rather than publishing a single-device set", async () => {
+  // Publishing a single-device set for ourselves tells every peer we have one device, and their
+  // sends then reach only that one. It is the same silent downgrade as the send-side fallback,
+  // just self-inflicted — and with fan-out on, the home is durable, so this error is real rather
+  // than the fs/desktop shape the fallback was written for.
+  const peerLinks = makeStubPeerLinks();
+  const devices = {
+    async getAccountDeviceSet() { throw new Error("SERVICE_UNAVAILABLE"); },
+    async getAuthorityState() { return { epoch: 3, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+  };
+  const { svc } = makeStubService({ peerLinks, devices, multiDeviceFanout: true });
+  await assert.rejects(
+    () => svc.publishForPeer({ peerAccountId: "rez:acct:peer" }),
+    /refusing to publish a single-device set: SERVICE_UNAVAILABLE/,
+  );
+  assert.equal(peerLinks.calls.build.length, 0, "nothing was published");
+});
+
+test("gate CLOSED: the same failure still falls back to a single-device publish (unchanged)", async () => {
+  const peerLinks = makeStubPeerLinks();
+  const devices = {
+    async getAccountDeviceSet() { throw new Error("SERVICE_UNAVAILABLE"); },
+    async getAuthorityState() { return { epoch: 3, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+  };
+  const { svc } = makeStubService({ peerLinks, devices, multiDeviceFanout: false });
+  await svc.publishForPeer({ peerAccountId: "rez:acct:peer" });
+  assert.equal(peerLinks.calls.build[0].accountDeviceSet, null, "single-device publish on the shipped default path");
 });

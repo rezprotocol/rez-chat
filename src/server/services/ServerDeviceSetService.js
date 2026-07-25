@@ -153,7 +153,20 @@ export class ServerDeviceSetService extends BaseServerService {
       const devices = res && Array.isArray(res.devices) ? res.devices : [];
       return devices.length > 0 ? devices : null;
     } catch (err) {
-      // A non-durable home answers SERVICE_UNAVAILABLE — fall back to single-device.
+      // P1#4: with fan-out OPEN this account's home IS durable (fan-out requires the pg backend),
+      // so a failure here is a real fault, not the fs/desktop shape this fallback was written for.
+      // Publishing a SINGLE-device set for ourselves in that case tells every peer we have one
+      // device, and their sends then reach only that one — a silent, self-inflicted downgrade that
+      // no one observes. Fail instead and let the caller retry.
+      if (this.bus.runtime && this.bus.runtime.multiDeviceFanout === true) {
+        const reason = err && err.message ? err.message : String(err);
+        throw new Error(
+          "ServerDeviceSetService: cannot read this account's device set while fan-out is enabled —"
+            + " refusing to publish a single-device set: " + reason,
+        );
+      }
+      // Gate CLOSED: a non-durable home answers SERVICE_UNAVAILABLE — fall back to single-device,
+      // unchanged.
       if (this.logger && typeof this.logger.warn === "function") {
         this.logger.warn("[ServerDeviceSetService] getAccountDeviceSet unavailable; single-device publish", err && err.message ? err.message : err);
       }

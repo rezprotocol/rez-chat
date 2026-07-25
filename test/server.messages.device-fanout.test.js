@@ -30,7 +30,7 @@ const OWNER = "rez:acct:owner";
 const PEER = "rez:acct:peer";
 const THREAD_ID = "th_owner_peer_direct";
 
-function makeHarness({ multiDeviceFanout = false, deviceSet = null, storageProvider = makeStorageProvider() } = {}) {
+function makeHarness({ multiDeviceFanout = false, deviceSet = null, storageProvider = makeStorageProvider(), resolveThrows = null, omitFanoutSdk = false } = {}) {
   const calls = { sealForPeer: [], sealForPeerDevice: [], dispatch: [] };
   const sdk = {
     getIdentity: () => ({ localInboxId: "inbox:owner" }),
@@ -46,6 +46,7 @@ function makeHarness({ multiDeviceFanout = false, deviceSet = null, storageProvi
     },
     mesh: { dispatch: async (object, address) => { calls.dispatch.push({ object, address }); return { queued: false }; } },
   };
+  if (omitFanoutSdk) delete sdk.sealForPeerDevice;
   const threadStore = {
     async recordOutboundDeposit() {},
     async setMessageStatus() {},
@@ -60,7 +61,10 @@ function makeHarness({ multiDeviceFanout = false, deviceSet = null, storageProvi
     emit() {},
     registerFunction() {},
     call(ns, name) {
-      if (ns === "device-set" && name === "resolveForPeer") return Promise.resolve(deviceSet);
+      if (ns === "device-set" && name === "resolveForPeer") {
+        if (resolveThrows) return Promise.reject(new Error(resolveThrows));
+        return Promise.resolve(deviceSet);
+      }
       return Promise.resolve(null);
     },
   };
@@ -209,4 +213,60 @@ test("Audit R3 #4: a retry AFTER a sender RESTART replays the cached ciphertext 
   const dev2After = h2.calls.dispatch.filter((d) => d.address && d.address.inboxId === "inbox:dev2").length;
   assert.equal(dev1After, 0, "the already-delivered device is skipped after restart (persisted deliveredOk)");
   assert.equal(dev2After, 1, "only the previously-failed device is re-dispatched, replaying its cached ciphertext");
+});
+
+// ---- P1#4: with the gate OPEN, an UNKNOWN device set must never downgrade ----
+//
+// A silent downgrade here delivers to ONE device while the peer has several: every other device
+// shows nothing, the sender is told it succeeded, and no one observes the loss. So the ONLY
+// legitimate single-device fallback is a peer that published no device set at all (pinned above);
+// every other uncertainty fails loudly so the caller can retry or queue.
+
+test("gate OPEN: a FAILED device-set resolve throws instead of falling back", async () => {
+  const { svc, calls } = makeHarness({ multiDeviceFanout: true, resolveThrows: "home unreachable" });
+  await assert.rejects(
+    () => svc.sendMessage({ threadId: THREAD_ID, payload: { text: "hello" } }),
+    /refusing to downgrade to a single-device send: home unreachable/,
+  );
+  assert.equal(calls.sealForPeer.length, 0, "no legacy send slipped out");
+  assert.equal(calls.dispatch.length, 0, "nothing was dispatched");
+});
+
+test("gate OPEN: a resolved-but-EMPTY device set throws instead of falling back", async () => {
+  // Self-contradictory: the peer published a set that names no device to deliver to. Guessing
+  // which single device that meant is exactly the downgrade this forbids.
+  const { svc, calls } = makeHarness({
+    multiDeviceFanout: true,
+    deviceSet: { deviceSetRecord: { devices: [] }, established: [], revision: 3 },
+  });
+  await assert.rejects(
+    () => svc.sendMessage({ threadId: THREAD_ID, payload: { text: "hello" } }),
+    /resolved to a device set with no devices/,
+  );
+  assert.equal(calls.sealForPeer.length, 0);
+});
+
+test("gate OPEN: an SDK that cannot seal per-device throws instead of falling back", async () => {
+  const { svc, calls } = makeHarness({ multiDeviceFanout: true, omitFanoutSdk: true, deviceSet: null });
+  await assert.rejects(
+    () => svc.sendMessage({ threadId: THREAD_ID, payload: { text: "hello" } }),
+    /SDK cannot seal per-device/,
+  );
+  assert.equal(calls.sealForPeer.length, 0, "a misconfigured runtime must not quietly send single-device");
+});
+
+test("gate CLOSED: every one of those conditions still takes the legacy path unchanged", async () => {
+  // The failure modes above are gate-scoped. With fan-out off, this service must behave exactly
+  // as it always has — no new throws on the shipped default path.
+  const a = makeHarness({ multiDeviceFanout: false, resolveThrows: "home unreachable" });
+  await a.svc.sendMessage({ threadId: THREAD_ID, payload: { text: "hello" } });
+  assert.equal(a.calls.sealForPeer.length, 1);
+
+  const b = makeHarness({ multiDeviceFanout: false, deviceSet: { deviceSetRecord: { devices: [] }, established: [], revision: 3 } });
+  await b.svc.sendMessage({ threadId: THREAD_ID, payload: { text: "hello" } });
+  assert.equal(b.calls.sealForPeer.length, 1);
+
+  const c = makeHarness({ multiDeviceFanout: false, omitFanoutSdk: true });
+  await c.svc.sendMessage({ threadId: THREAD_ID, payload: { text: "hello" } });
+  assert.equal(c.calls.sealForPeer.length, 1);
 });

@@ -642,22 +642,53 @@ export class ServerMessagesService extends BaseServerService {
    * @returns {Promise<{sentCount, queuedCount, queuedInboxIds, deviceCount}|null>}
    */
   async #fanOutToPeerDevices({ sdk, peerAccountId, plaintextBodyBytes, localInboxId, messageId = "" } = {}) {
+    // Gate CLOSED (the default) — every exit below is `return null`, i.e. the legacy
+    // single-device path, byte-for-byte unchanged.
     if (!this.bus.runtime || this.bus.runtime.multiDeviceFanout !== true) return null;
-    if (!sdk || typeof sdk.sealForPeerDevice !== "function" || !sdk.mesh) return null;
+
+    // Gate OPEN (P1#4). From here a `return null` means "deliver to ONE device", and doing that
+    // when the peer actually has several silently drops the message for every other device — the
+    // recipient sees nothing on the device they happen to be using and no one is told. So an
+    // UNKNOWN device set must FAIL, loudly, and let the caller retry or queue. Only one thing
+    // still legitimately falls back: a peer that has published no device set at all.
+    if (!sdk || typeof sdk.sealForPeerDevice !== "function" || !sdk.mesh) {
+      throw new Error(
+        "ServerMessagesService: multi-device fan-out is enabled but the SDK cannot seal per-device"
+          + " (sealForPeerDevice/mesh missing) — refusing to downgrade to a single-device send",
+      );
+    }
     const peer = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
-    if (!peer) return null;
+    if (!peer) {
+      throw new Error("ServerMessagesService: multi-device fan-out requires a resolved peerAccountId");
+    }
 
     let resolved = null;
     try {
       resolved = await this._call("device-set", "resolveForPeer", { peerAccountId: peer });
     } catch (err) {
-      this.logger.error("[ServerMessagesService] device-set resolve failed", err && err.message ? err.message : err);
-      return null;
+      // We do not know the peer's device set. That is precisely when a downgrade is unsafe.
+      const reason = err && err.message ? err.message : String(err);
+      this.logger.error("[ServerMessagesService] device-set resolve failed for " + peer + ": " + reason);
+      throw new Error(
+        "ServerMessagesService: device-set resolution failed for " + peer
+          + " while fan-out is enabled — refusing to downgrade to a single-device send: " + reason,
+      );
     }
-    const devices = resolved && resolved.deviceSetRecord && Array.isArray(resolved.deviceSetRecord.devices)
+    // null = the peer has published NO device set (a single-device or pre-multi-device peer).
+    // That is a real answer, not a failure: the legacy path is the correct delivery for them.
+    if (resolved === null || resolved === undefined) return null;
+
+    const devices = resolved.deviceSetRecord && Array.isArray(resolved.deviceSetRecord.devices)
       ? resolved.deviceSetRecord.devices
-      : [];
-    if (devices.length === 0) return null;
+      : null;
+    if (devices === null || devices.length === 0) {
+      // A resolved-but-empty set is self-contradictory: the peer published a device set that
+      // names no device to deliver to. Never guess which single device that meant.
+      throw new Error(
+        "ServerMessagesService: peer " + peer + " resolved to a device set with no devices"
+          + " while fan-out is enabled — refusing to downgrade to a single-device send",
+      );
+    }
 
     const handshakeByDevice = new Map();
     if (resolved && Array.isArray(resolved.established)) {
