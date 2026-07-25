@@ -6,12 +6,18 @@ import { BaseServerService } from "../base/BaseServerService.js";
  *
  * On `submit` it: reads the home's current authority epoch, builds + submits a
  * signed AccountDeviceMutationV1 (retrying on an optimistic-concurrency miss),
- * then PROPAGATES the result — republishing this account's device set to every
- * peer at the NEW revision (so peers converge on the new device set + reject the
- * old one as a rollback), publishing the signed AccountAuthorityStateV1 once (a
- * public DurableRecordV2 owned by B, so OFF-home peers learn revocations they
- * cannot otherwise), and dropping each peer's cached set so the next resolve
- * re-ingests at the higher revision.
+ * then PROPAGATES the result — first discharging the DURABLE authority-state
+ * publication obligation the home enqueued inside the mutation's own transaction
+ * (P1#3; the signed AccountAuthorityStateV1 is a public DurableRecordV2 owned by
+ * B, so OFF-home peers learn revocations they cannot otherwise), then republishing
+ * this account's device set to every peer at the NEW revision (so peers converge
+ * on the new device set + reject the old one as a rollback) and dropping each
+ * peer's cached set so the next resolve re-ingests at the higher revision.
+ *
+ * The authority-state publication is no longer built and put inline here — it is
+ * drained through `authority-publication`/`drain` under a cluster-wide lease. The
+ * per-peer device-set republish is still a best-effort inline loop; giving it its
+ * own durable per-peer queue is a separate slice.
  *
  * `peerRevocationState` is the READER side: it fetches a peer's published
  * authority state (bounded-staleness cached) and projects it to the
@@ -113,9 +119,17 @@ export class ServerAccountMutationService extends BaseServerService {
     return result;
   }
 
-  // Republish the device set to every peer at the new revision + drop caches, and
-  // publish the account authority-state record once.
+  // Publish the account authority-state record (now via the home's durable outbox), then
+  // republish the device set to every peer at the new revision + drop caches.
+  //
+  // ORDER MATTERS (P1#3). The authority-state record is how OFF-HOME peers learn about a
+  // revocation; the per-peer device-set republish is a convergence optimization. This used to run
+  // peers FIRST and publish authority state last, so a single peer write failure threw before the
+  // revocation was ever published — after the home revoke had already committed. Authority state
+  // now goes first AND is durable, so neither a peer failure nor a crash here can lose it.
   async #propagate(result) {
+    await this.#publishAuthorityState();
+
     const durableRecords = this.#durableRecords();
     const peerLinks = this.#peerLinks();
     if (!durableRecords) {
@@ -138,16 +152,60 @@ export class ServerAccountMutationService extends BaseServerService {
       this._call("device-set", "invalidate", { peerAccountId: peer });
     }
 
-    const authorityState = result.authorityState && typeof result.authorityState === "object" ? result.authorityState : null;
-    if (authorityState) {
-      const rec = await peerLinks.buildAccountAuthorityStateRecord({
-        epoch: Number.isInteger(authorityState.epoch) ? authorityState.epoch : revision,
-        revokedCertIds: Array.isArray(authorityState.revokedCertIds) ? authorityState.revokedCertIds : [],
-        minValidIssuedAtMs: Number.isFinite(Number(authorityState.minValidIssuedAtMs)) ? Number(authorityState.minValidIssuedAtMs) : 0,
-        nowMs: this.#clock(),
-      });
-      await durableRecords.put({ record: rec.record });
+  }
+
+  /**
+   * Discharge the authority-state publication obligation the home enqueued INSIDE this mutation's
+   * own transaction (P1#3 leaf 5c). Replaces the former inline build-and-put here.
+   *
+   * The inline publish was fire-and-forget: if this process died, or the put failed, or a peer
+   * write threw first, the revocation simply never reached off-home peers and nothing remembered
+   * that it should have. The obligation is now a durable row the home enqueues atomically with the
+   * fold, and this drains it under a cluster-wide lease.
+   *
+   * A drain failure does NOT fail the mutation. The mutation has COMMITTED at the home and the
+   * obligation is durable — reporting failure here would tell the caller a committed revocation
+   * did not happen, which is both false and the exact misreporting shape the P1#2 audit flagged.
+   * It is logged instead, at a severity matching what it means, and a later drain retries it.
+   */
+  async #publishAuthorityState() {
+    let outcome;
+    try {
+      outcome = await this._call("authority-publication", "drain", {});
+    } catch (err) {
+      this.logger.error(
+        "[ServerAccountMutationService] authority-state publication FAILED after the home mutation"
+          + " committed; the obligation remains durable and will be retried: "
+          + (err && err.message ? err.message : err),
+      );
+      return;
     }
+    if (!outcome || typeof outcome !== "object") {
+      this.logger.error("[ServerAccountMutationService] authority-state drain returned no outcome");
+      return;
+    }
+    // A committed mutation PROVES the node has a propagation outbox: the serializer builds or
+    // validates one in its constructor and enqueues the obligation in the fold's own transaction,
+    // so the mutation could not have committed without it. Either of these after a commit is
+    // therefore contradictory wiring, not a deployment shape — and it means this account's
+    // revocations will not reach off-home peers until it is fixed.
+    if (outcome.enabled === false || outcome.stopped === "outbox-unavailable") {
+      this.logger.error(
+        "[ServerAccountMutationService] the home accepted a device mutation but its authority-state"
+          + " outbox is unreachable from this client (stopped=" + outcome.stopped + ");"
+          + " revocations will NOT reach off-home peers",
+      );
+      return;
+    }
+    if (Array.isArray(outcome.publishedEpochs) && outcome.publishedEpochs.length > 0) {
+      return;
+    }
+    // Nothing published, but nothing broke: another device holds the lease, or the head is backing
+    // off. The obligation stays outstanding and whoever holds the lease discharges it.
+    this.logger.info(
+      "[ServerAccountMutationService] authority-state publication deferred (stopped="
+        + outcome.stopped + "); the obligation remains outstanding",
+    );
   }
 
   /**

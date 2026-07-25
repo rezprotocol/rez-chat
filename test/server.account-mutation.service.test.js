@@ -14,6 +14,11 @@ import { ServerAccountMutationService } from "../src/server/services/ServerAccou
 const CRYPTO = new NodeCryptoProvider();
 const enc = (s) => new TextEncoder().encode(s);
 const FAR_FUTURE = 10_000_000_000_000;
+// AccountAuthorityStateV1 validates CANONICAL cert ids (rez:cap:<64-hex>). Earlier fixtures used
+// shorthand like REVOKED_CERT, which the record rejected — the test was red for that reason
+// alone, not for the behavior it describes.
+const REVOKED_CERT = "rez:cap:" + "e".repeat(64);
+const OTHER_CERT = "rez:cap:" + "d".repeat(64);
 
 function makeKvStore() {
   const m = new Map();
@@ -118,15 +123,29 @@ function makeOverlay() {
   return { map: m, double };
 }
 
-function makeBus(runtime) {
+function makeBus(runtime, { onDrain = null } = {}) {
   const invalidations = [];
+  // Every propagation step in call-order, so a test can prove the authority-state publication
+  // happens BEFORE the per-peer republish (the P1#3 ordering fix).
+  const order = [];
   return {
-    runtime, services: {}, stores: {}, invalidations,
+    runtime, services: {}, stores: {}, invalidations, order,
     on() { return () => {}; },
     emit() {},
     registerFunction() {},
     call(namespace, name, payload) {
-      if (namespace === "device-set" && name === "invalidate") invalidations.push(payload && payload.peerAccountId);
+      if (namespace === "device-set" && name === "invalidate") {
+        order.push("invalidate:" + (payload && payload.peerAccountId));
+        invalidations.push(payload && payload.peerAccountId);
+      }
+      // P1#3 leaf 5c: the authority-state record is no longer built + put here — the service
+      // drains the home's durable obligation through this directive instead.
+      if (namespace === "authority-publication" && name === "drain") {
+        order.push("drain");
+        return Promise.resolve(
+          onDrain ? onDrain() : { enabled: true, cycles: 1, publishedEpochs: [], stopped: "nothing-pending" },
+        );
+      }
       return Promise.resolve(null);
     },
   };
@@ -149,13 +168,16 @@ function makeHome({ authorityEpoch = 0, submit } = {}) {
   };
 }
 
-function makeMutationService(account, overlay, home, { clock } = {}) {
-  const bus = makeBus({ peerLinks: account.svc, sdk: { durableRecords: overlay.double(), devices: home.devices, identity: home.identity } });
+function makeMutationService(account, overlay, home, { clock, onDrain = null } = {}) {
+  const bus = makeBus(
+    { peerLinks: account.svc, sdk: { durableRecords: overlay.double(), devices: home.devices, identity: home.identity } },
+    { onDrain },
+  );
   const svc = new ServerAccountMutationService({ bus, ownerAccountId: account.accountId, clock: clock || (() => 1000) });
   return { svc, bus };
 }
 
-test("submit → propagate: republishes the device set to EVERY peer at the new revision + publishes authority state", async () => {
+test("submit → propagate: publishes authority state FIRST, then republishes the device set to EVERY peer", async () => {
   const overlay = makeOverlay();
   const alice = await makeAccount({ mailboxId: "rez:inbox:alice" });
   const bob = await makeAccount({ mailboxId: "rez:inbox:bob" });
@@ -165,15 +187,30 @@ test("submit → propagate: republishes the device set to EVERY peer at the new 
 
   const home = makeHome({
     authorityEpoch: 1,
-    submit: () => ({ revision: 2, devices: [], authorityState: { epoch: 2, revokedCertIds: ["rez:cap:gone"], minValidIssuedAtMs: 0 } }),
+    submit: () => ({ revision: 2, devices: [], authorityState: { epoch: 2, revokedCertIds: [REVOKED_CERT], minValidIssuedAtMs: 0 } }),
   });
-  const { svc, bus } = makeMutationService(alice, overlay, home, { clock: () => 5000 });
+  // Stands in for ServerAuthorityPublicationService draining the home's durable obligation: it
+  // builds + publishes exactly the record the worker would. The worker's own lease protocol is
+  // proven in server.authority-publication.service.test.js.
+  const onDrain = async () => {
+    const rec = await alice.svc.buildAccountAuthorityStateRecord({
+      epoch: 2, revokedCertIds: [REVOKED_CERT], minValidIssuedAtMs: 0, nowMs: 5000,
+    });
+    await overlay.double().put({ record: rec.record });
+    return { enabled: true, cycles: 1, publishedEpochs: [2], stopped: "nothing-pending" };
+  };
+  const { svc, bus } = makeMutationService(alice, overlay, home, { clock: () => 5000, onDrain });
 
   const result = await svc.submitMutation({ action: "device.revoke", target: { revokedDeviceId: "rez:dev:gone" } });
   assert.equal(result.revision, 2);
   assert.equal(home.calls.built[0].expectedRevision, 1, "expectedRevision read from the home epoch");
 
-  // 2 device-set records (alice→bob, alice→carol) + 1 authority-state record.
+  // P1#3: the revocation record — the only thing OFF-home peers can read — is published BEFORE
+  // the best-effort per-peer republish, so a peer write failure can no longer preempt it.
+  assert.equal(bus.order[0], "drain", "authority state is discharged first");
+  assert.equal(bus.order.filter((o) => o === "drain").length, 1, "drained once per mutation");
+
+  // 2 device-set records (alice→bob, alice→carol) + 1 authority-state record from the drain.
   assert.equal(overlay.map.size, 3, "republished to both peers + published authority state");
   // Both peers' caches were dropped so they re-ingest the new revision.
   assert.deepEqual([...bus.invalidations].sort(), [bob.accountId, carol.accountId].sort());
@@ -186,7 +223,52 @@ test("submit → propagate: republishes the device set to EVERY peer at the new 
   // The authority-state record bob reads carries the revoked cert.
   const bobSvc = makeMutationService(bob, overlay, home, { clock: () => 6000 }).svc;
   const rev = await bobSvc.getPeerRevocationState({ peerAccountId: alice.accountId });
-  assert.ok(rev && rev.revokedCertIds.includes("rez:cap:gone"), "peer reads the published revocation");
+  assert.ok(rev && rev.revokedCertIds.includes(REVOKED_CERT), "peer reads the published revocation");
+});
+
+test("a failed authority-state drain does NOT fail the committed mutation", async () => {
+  // The mutation has COMMITTED at the home and the obligation is durable. Reporting failure to
+  // the caller would say a committed revocation did not happen — false, and exactly the
+  // misreporting shape the P1#2 audit flagged. It is logged and retried instead.
+  const overlay = makeOverlay();
+  const alice = await makeAccount({ mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount({ mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_a_b", bLinkId: "pl_b_a" });
+
+  const home = makeHome({
+    authorityEpoch: 1,
+    submit: () => ({ revision: 2, devices: [], authorityState: { epoch: 2, revokedCertIds: [REVOKED_CERT], minValidIssuedAtMs: 0 } }),
+  });
+  const onDrain = async () => { throw new Error("home unreachable"); };
+  const { svc, bus } = makeMutationService(alice, overlay, home, { clock: () => 5000, onDrain });
+  const logged = [];
+  svc.logger = { ...console, error: (m) => logged.push(m), info: () => {}, warn: () => {} };
+
+  const result = await svc.submitMutation({ action: "device.revoke", target: { revokedDeviceId: "rez:dev:gone" } });
+
+  assert.equal(result.revision, 2, "the committed mutation is still reported as committed");
+  assert.ok(logged.some((m) => m.includes("authority-state publication FAILED")), "but the failure is loud");
+  // The per-peer republish still ran: a publication failure must not cascade into skipping it.
+  assert.deepEqual(bus.invalidations, [bob.accountId]);
+});
+
+test("an unreachable outbox after a COMMITTED mutation is escalated as contradictory wiring", async () => {
+  // A mutation can only commit if the home enqueued its obligation — the serializer builds or
+  // validates a propagation outbox in its constructor. So "no outbox" here is not a deployment
+  // shape, it is broken wiring, and it means revocations stop reaching off-home peers.
+  const overlay = makeOverlay();
+  const alice = await makeAccount({ mailboxId: "rez:inbox:alice" });
+  const home = makeHome({
+    authorityEpoch: 1,
+    submit: () => ({ revision: 2, devices: [], authorityState: { epoch: 2, revokedCertIds: [], minValidIssuedAtMs: 0 } }),
+  });
+  const onDrain = async () => ({ enabled: true, cycles: 1, publishedEpochs: [], stopped: "outbox-unavailable" });
+  const { svc } = makeMutationService(alice, overlay, home, { clock: () => 5000, onDrain });
+  const logged = [];
+  svc.logger = { ...console, error: (m) => logged.push(m), info: () => {}, warn: () => {} };
+
+  await svc.submitMutation({ action: "device.revoke", target: { revokedDeviceId: "rez:dev:gone" } });
+  assert.ok(logged.some((m) => m.includes("outbox is unreachable") && m.includes("NOT reach off-home peers")));
 });
 
 test("submit retries on a stale expectedRevision, then converges", async () => {
@@ -236,7 +318,7 @@ test("getPeerRevocationState is bounded-staleness cached (second call does not r
   const alice = await makeAccount({ mailboxId: "rez:inbox:alice" });
   const bob = await makeAccount({ mailboxId: "rez:inbox:bob" });
   await crossLink(alice, bob, { aLinkId: "pl_a_b", bLinkId: "pl_b_a" });
-  const rec = await alice.svc.buildAccountAuthorityStateRecord({ epoch: 2, revokedCertIds: ["rez:cap:z"], nowMs: 100 });
+  const rec = await alice.svc.buildAccountAuthorityStateRecord({ epoch: 2, revokedCertIds: [OTHER_CERT], nowMs: 100 });
   await overlay.double().put({ record: rec.record });
 
   let gets = 0;
@@ -252,7 +334,7 @@ test("getPeerRevocationState is bounded-staleness cached (second call does not r
   const second = await svc.getPeerRevocationState({ peerAccountId: alice.accountId });
   assert.equal(gets, 1, "second call served from cache");
   assert.deepEqual(second, first);
-  assert.ok(first.revokedCertIds.includes("rez:cap:z"));
+  assert.ok(first.revokedCertIds.includes(OTHER_CERT));
 });
 
 test("account-mutation service is a no-op when this account runs no per-device sessions", async () => {
