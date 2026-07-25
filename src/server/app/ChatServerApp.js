@@ -18,6 +18,7 @@ import {
   ServerPeerLinkProtocolService,
   ServerDeviceSetService,
   ServerAccountMutationService,
+  ServerAuthorityPublicationService,
   ServerDeviceLinkService,
   ServerAccountStateSyncService,
   ServerFileTransferService,
@@ -326,6 +327,17 @@ export class ChatServerApp {
       // S11: serialized device add/revoke + revocation propagation. Reuses the
       // device-set republish + a public authority-state record. E6-independent.
       accountMutation: new ServerAccountMutationService({
+        bus: this.bus,
+        ownerAccountId: this.#ownerAccountId,
+        clock,
+        logger,
+      }),
+      // P1#3 leaf 5b: drains the home's authority-state publication outbox — the
+      // node enqueues the obligation in the mutation's own transaction but cannot
+      // discharge it, since the record is ACCOUNT-signed. Driven on demand via the
+      // `authority-publication` / `drain` directive; it does not yet replace the
+      // inline publish in accountMutation#propagate (separate cutover).
+      authorityPublication: new ServerAuthorityPublicationService({
         bus: this.bus,
         ownerAccountId: this.#ownerAccountId,
         clock,

@@ -11,6 +11,7 @@ export { ServerEventService } from "./ServerEventService.js";
 export { ServerPeerLinkProtocolService } from "./ServerPeerLinkProtocolService.js";
 export { ServerDeviceSetService } from "./ServerDeviceSetService.js";
 export { ServerAccountMutationService } from "./ServerAccountMutationService.js";
+export { ServerAuthorityPublicationService } from "./ServerAuthorityPublicationService.js";
 export { ServerDeviceLinkService } from "./ServerDeviceLinkService.js";
 export { ServerAccountStateSyncService } from "./ServerAccountStateSyncService.js";
 export { InboxCatchupService } from "./InboxCatchupService.js";
