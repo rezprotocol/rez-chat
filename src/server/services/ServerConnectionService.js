@@ -79,9 +79,11 @@ export class ServerConnectionService extends BaseServerService {
   async getMeshStatus(payload = {}) {
     this._coerceParams(payload, MeshStatusParams);
     const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
-    const status = typeof sdk.node.meshStatus === "function"
-      ? await sdk.node.meshStatus()
-      : await sdk.node.status();
+    // node.status IS the mesh-status source: its body carries { node, mesh, peers }. There is no
+    // separate meshStatus op — the branch that probed for `sdk.node.meshStatus` could never be
+    // taken (NodeCapability has no such method), and the SDK's MeshCapability.getMeshStatus it
+    // mirrored was dead too (no wire type, no node handler) and has been deleted.
+    const status = await sdk.node.status();
     return new MeshStatusResult({ mesh: meshFromStatus(status) });
   }
 
