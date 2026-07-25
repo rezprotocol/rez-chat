@@ -56,10 +56,51 @@ function makeOverlay() {
   };
 }
 
-function makeBus({ overlay, hasAdminRoot = true, accountAuthority = null, accountIdentityDhKeyPair = null }) {
+// A home that commits device.add and echoes back the registry rows it stored. Returning the
+// COMMITTED rows (rather than the arguments) is what makes the approver's commit check meaningful:
+// it is the home's own state that must bind this device, inbox, and leaf cert.
+function makeMutationHome({ mutations = [], committedDevices = null, submitThrows = null, peersFailed = [] } = {}) {
+  return async (payload) => {
+    mutations.push(payload);
+    if (submitThrows) throw new Error(submitThrows);
+    const binding = payload.target.deviceInboxBinding;
+    const capability = payload.target.deviceCapability;
+    const devices = committedDevices || [{
+      deviceId: binding.deviceId,
+      inboxId: binding.inboxId,
+      certId: capability.certId,
+      status: "active",
+    }];
+    return {
+      revision: 2,
+      devices,
+      authorityState: { epoch: 2, revokedCertIds: [], minValidIssuedAtMs: 0 },
+      propagation: { peersPublished: 0, peersFailed },
+    };
+  };
+}
+
+function makeStorageProvider() {
+  const data = new Map();
+  const kv = {
+    async get(k) { return data.has(k) ? JSON.parse(data.get(k)) : undefined; },
+    async set(k, v) { data.set(k, JSON.stringify(v)); },
+    async delete(k) { return data.delete(k); },
+    async keys(prefix) {
+      const out = [];
+      for (const k of data.keys()) if (!prefix || k.startsWith(prefix)) out.push(k);
+      return out;
+    },
+  };
+  return { provider: { getKeyValueStore: () => kv }, data };
+}
+
+function makeBus({ overlay, hasAdminRoot = true, accountAuthority = null, accountIdentityDhKeyPair = null, onSubmit = null }) {
   const events = [];
+  const calls = [];
   return {
     events,
+    calls,
     runtime: {
       sdk: overlay ? { durableRecords: overlay } : null,
       peerLinks: { hasAdminRoot, cryptoProvider: CRYPTO },
@@ -69,7 +110,11 @@ function makeBus({ overlay, hasAdminRoot = true, accountAuthority = null, accoun
     on() { return () => {}; },
     emit(name, payload) { events.push({ name, payload }); },
     registerFunction() {},
-    call() { return Promise.resolve(null); },
+    call(namespace, name, payload) {
+      calls.push({ namespace, name, payload });
+      if (namespace === "account-mutation" && name === "submit" && onSubmit) return onSubmit(payload);
+      return Promise.resolve(null);
+    },
   };
 }
 
@@ -95,22 +140,27 @@ function makePrimaryKeys() {
   };
 }
 
-function makeService({ overlay, keys, hasAdminRoot = true, dh = true }) {
+function makeService({ overlay, keys, hasAdminRoot = true, dh = true, onSubmit = undefined, storageProvider = undefined, mutations = [] }) {
   const bus = makeBus({
     overlay,
     hasAdminRoot,
     accountAuthority: keys.authority,
     accountIdentityDhKeyPair: dh ? keys.accountIdentityDhKeyPair : null,
+    onSubmit: onSubmit === undefined ? makeMutationHome({ mutations }) : onSubmit,
   });
+  const storage = storageProvider === undefined ? makeStorageProvider().provider : storageProvider;
   const svc = new ServerDeviceLinkService({
     bus,
     ownerAccountId: keys.accountId,
+    // P1#2a: the pending-ceremony journal is durable state, so the service needs a storage
+    // provider to run a ceremony at all.
+    storageProvider: storage,
     logger: { error() {}, warn() {}, info() {}, log() {} },
   });
   // The approver polls internally — shrink its cadence via the SDK defaults
   // by monkey-adjusting is not possible; the service passes only nowMs. The
   // default 1s poll is acceptable for these tests' timeouts.
-  return { svc, bus };
+  return { svc, bus, mutations };
 }
 
 async function waitForEvent(bus, state, timeoutMs = 15_000) {
@@ -245,4 +295,129 @@ test("gates: delegated runtime, missing B-dh, double start, no pending approve",
   const again = await svc.startCeremony({});
   assert.match(again.linkCode, /^rez:link:v1:/);
   await svc.cancelCeremony({});
+});
+
+// ---- L4: the service supplies registration-before-release + persist-and-resume ----
+
+async function runFullCeremony({ overlay, keys, svc, bus }) {
+  const started = await svc.startCeremony({});
+  await waitForEvent(bus, "code-issued");
+  const requesterRun = runDeviceLinkRequester({ code: started.linkCode, crypto: CRYPTO, records: overlay, ...FAST });
+  const pending = await waitForEvent(bus, "pending");
+  await svc.approveCeremony({ newDeviceId: pending.newDeviceId });
+  const requester = await requesterRun;
+  return { pending, requester };
+}
+
+test("L4: device.add carries the device's OWN inbox binding + the leaf cert, and the commit read back is the HOME's row", async () => {
+  const overlay = makeOverlay();
+  const keys = makePrimaryKeys();
+  const mutations = [];
+  const { svc, bus } = makeService({ overlay, keys, mutations });
+
+  const { pending, requester } = await runFullCeremony({ overlay, keys, svc, bus });
+
+  assert.equal(mutations.length, 1, "exactly one device.add");
+  const submitted = mutations[0];
+  assert.equal(submitted.action, "device.add");
+  assert.equal(submitted.signWith, "account");
+  // The binding is the NEW DEVICE's own, device-signed — the home keys its cursor on it.
+  assert.equal(submitted.target.deviceInboxBinding.deviceId, pending.newDeviceId);
+  assert.equal(submitted.target.deviceInboxBinding.inboxId, requester.inboxId);
+  // ...and the leaf cert rides with it, so the home binds a REVOCABLE certId before release.
+  assert.equal(typeof submitted.target.deviceCapability.certId, "string");
+  assert.ok(submitted.target.deviceCapability.certId.startsWith("rez:cap:"));
+});
+
+test("L4 fail-closed: a home that commits a DIFFERENT device never releases the leaf", async () => {
+  // The approver validates the commit against the leaf it minted. Returning the home's committed
+  // rows (not an echo of the arguments) is what lets this be caught at all.
+  const overlay = makeOverlay();
+  const keys = makePrimaryKeys();
+  const { svc, bus } = makeService({
+    overlay,
+    keys,
+    onSubmit: makeMutationHome({
+      committedDevices: [{ deviceId: "rez:dev:" + "f".repeat(64), inboxId: "inbox:" + "0".repeat(24), certId: "rez:cap:" + "0".repeat(64), status: "active" }],
+    }),
+  });
+
+  const started = await svc.startCeremony({});
+  await waitForEvent(bus, "code-issued");
+  const requesterRun = runDeviceLinkRequester({ code: started.linkCode, crypto: CRYPTO, records: overlay, deadlineMs: 1200, ...FAST })
+    .then(() => null).catch((err) => err);
+  const pending = await waitForEvent(bus, "pending");
+  await svc.approveCeremony({ newDeviceId: pending.newDeviceId });
+
+  const reqErr = await requesterRun;
+  assert.ok(reqErr, "the requester never received a bundle");
+  const failed = bus.events.filter((e) => e.payload && e.payload.state === "failed");
+  assert.ok(failed.length > 0, "the ceremony failed rather than releasing an unbound leaf");
+});
+
+test("L4: a PROPAGATION failure does not withhold a leaf whose registration committed", async () => {
+  // Commit != propagation. The device.add is durably committed and the authority-state obligation
+  // is durable in the node outbox; treating a peer republish failure as a registration failure
+  // would orphan a device the home has already registered.
+  const overlay = makeOverlay();
+  const keys = makePrimaryKeys();
+  const { svc, bus } = makeService({
+    overlay,
+    keys,
+    onSubmit: makeMutationHome({ peersFailed: [{ peerAccountId: "rez:acct:peer", reason: "offline" }] }),
+  });
+
+  const { pending, requester } = await runFullCeremony({ overlay, keys, svc, bus });
+  assert.equal(requester.deviceId, pending.newDeviceId, "the leaf WAS released");
+});
+
+test("L4 fail-closed: a failing device.add fails the ceremony and releases nothing", async () => {
+  const overlay = makeOverlay();
+  const keys = makePrimaryKeys();
+  const { svc, bus } = makeService({ overlay, keys, onSubmit: makeMutationHome({ submitThrows: "home unreachable" }) });
+
+  const started = await svc.startCeremony({});
+  await waitForEvent(bus, "code-issued");
+  const requesterRun = runDeviceLinkRequester({ code: started.linkCode, crypto: CRYPTO, records: overlay, deadlineMs: 1200, ...FAST })
+    .then(() => null).catch((err) => err);
+  const pending = await waitForEvent(bus, "pending");
+  await svc.approveCeremony({ newDeviceId: pending.newDeviceId });
+
+  const reqErr = await requesterRun;
+  assert.ok(reqErr, "no leaf reached the new device");
+});
+
+test("L4: the ceremony is durably journaled — pending BEFORE device.add, then published, then confirmed", async () => {
+  const overlay = makeOverlay();
+  const keys = makePrimaryKeys();
+  const { provider, data } = makeStorageProvider();
+  const mutations = [];
+  // Observe the store's write order against the device.add: the record must exist first.
+  let stateWhenSubmitted = null;
+  const onSubmit = async (payload) => {
+    const keysAtSubmit = [...data.keys()].filter((k) => k.startsWith("app:pendingceremony/"));
+    stateWhenSubmitted = keysAtSubmit.length > 0 ? JSON.parse(data.get(keysAtSubmit[0])).state : null;
+    return makeMutationHome({ mutations })(payload);
+  };
+  const { svc, bus } = makeService({ overlay, keys, storageProvider: provider, onSubmit });
+
+  const { pending } = await runFullCeremony({ overlay, keys, svc, bus });
+  // markConfirmed runs when the approver's poll observes the device's confirm record, which is
+  // AFTER the requester resolves — wait for the ceremony's own terminal event, not the requester.
+  await waitForEvent(bus, "confirmed");
+
+  assert.equal(stateWhenSubmitted, "pending", "the resume record existed BEFORE device.add ran");
+  const stored = JSON.parse(data.get("app:pendingceremony/" + pending.newDeviceId));
+  assert.equal(stored.state, "confirmed", "and advanced through published to confirmed");
+  assert.equal(stored.deviceId, pending.newDeviceId);
+  assert.ok(stored.sealedResponse, "the exact publication is retained for resume");
+  assert.ok(stored.confirmTagB64.length > 0);
+  assert.equal(stored.masterSecret, undefined, "no key material at rest");
+});
+
+test("L4: a ceremony cannot start without the durable journal", async () => {
+  const overlay = makeOverlay();
+  const keys = makePrimaryKeys();
+  const { svc } = makeService({ overlay, keys, storageProvider: null });
+  await assert.rejects(() => svc.startCeremony({}), /requires a storageProvider for the pending-ceremony journal/);
 });

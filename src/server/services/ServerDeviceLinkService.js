@@ -9,6 +9,7 @@ import { DeviceLinkStatusResult } from "../../records/results/DeviceLinkStatusRe
 import { DeviceLinkApproveResult } from "../../records/results/DeviceLinkApproveResult.js";
 import { DeviceLinkCancelResult } from "../../records/results/DeviceLinkCancelResult.js";
 import { DeviceLinkUpdatedEvent } from "../../records/events/DeviceLinkUpdatedEvent.js";
+import { PendingCeremonyStore } from "../storage/PendingCeremonyStore.js";
 
 /**
  * ServerDeviceLinkService — the PRIMARY-device approver flow of the S10 PSK
@@ -25,6 +26,16 @@ import { DeviceLinkUpdatedEvent } from "../../records/events/DeviceLinkUpdatedEv
  * — transports stay generic). ONE ceremony at a time: the PSK is single-use
  * and the approver instance is coterminous with it.
  *
+ * REGISTRATION-BEFORE-RELEASE (P1#2 / P1#2a). The approver is constructed with two required
+ * seams this service supplies:
+ *   registerDevice      → submits `device.add` carrying the new device's own inbox binding and the
+ *                         minted leaf cert, and returns the HOME's committed row so the approver
+ *                         can check the home bound this exact device/inbox/cert before any leaf is
+ *                         released.
+ *   registrationJournal → PendingCeremonyStore, so the exact sealed response is durable BEFORE
+ *                         device.add and can be republished after a crash (a fresh ceremony would
+ *                         mint a different certId and never converge).
+ *
  * Key material: the account root B signs the leaf cert via
  * bus.runtime.accountAuthority (whose sign() THROWS on a delegated boot —
  * and start() refuses earlier with a typed error); B-dh ships in the bundle
@@ -33,11 +44,19 @@ import { DeviceLinkUpdatedEvent } from "../../records/events/DeviceLinkUpdatedEv
 export class ServerDeviceLinkService extends BaseServerService {
   #clock;
   #ceremony; // null | { approver, state, expiresAtMs, pending, resolveApproval, rejectApproval, driver }
+  #pendingCeremonies;
 
-  constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
+  constructor({ bus, ownerAccountId, storageProvider = null, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
     this.#ceremony = null;
+    // The durable persist-and-resume journal (P1#2a). Required to run a ceremony at all — a
+    // registration with nothing to resume from cannot be recovered, only abandoned — but the
+    // service still constructs without it so non-linking boots are unaffected; startCeremony is
+    // where the requirement bites.
+    this.#pendingCeremonies = storageProvider
+      ? new PendingCeremonyStore({ storageProvider, clock: this.#clock })
+      : null;
     this._register("deviceLink", "start", (payload) => this.startCeremony(payload || {}));
     this._register("deviceLink", "status", (payload) => this.statusCeremony(payload || {}));
     this._register("deviceLink", "approve", (payload) => this.approveCeremony(payload || {}));
@@ -85,12 +104,26 @@ export class ServerDeviceLinkService extends BaseServerService {
     if (!cryptoProvider) {
       throw new Error("deviceLink.start requires a cryptoProvider (via bus.runtime.peerLinks)");
     }
+    if (!this.#pendingCeremonies) {
+      throw new Error(
+        "deviceLink.start requires a storageProvider for the pending-ceremony journal (P1#2a):"
+          + " a registration that is not durable before device.add cannot be resumed after a crash",
+      );
+    }
     const approver = new DeviceLinkApprover({
       crypto: cryptoProvider,
       records: sdk.durableRecords,
       accountSignPublicKeyB64: signerRef.signerPublicKeyB64,
       accountSign: (bytes) => authority.signer.sign(bytes),
       accountDhKeyPair,
+      // P1#2 registration-before-release + P1#2a persist-and-resume.
+      registerDevice: (args) => this.#registerDevice(args),
+      registrationJournal: {
+        persistPending: (record) => this.#pendingCeremonies.createPending(record),
+        markPublished: ({ deviceId }) => this.#pendingCeremonies.markPublished(deviceId),
+        markConfirmed: ({ deviceId }) => this.#pendingCeremonies.markConfirmed(deviceId),
+        warn: (message) => this.logger.warn(message),
+      },
       nowMs: this.#clock,
     });
     const started = await approver.start();
@@ -167,6 +200,60 @@ export class ServerDeviceLinkService extends BaseServerService {
         message: err && err.message ? err.message : String(err),
       });
     }
+  }
+
+  /**
+   * Submit `device.add` for the device being linked, and return the HOME's committed row.
+   *
+   * The approver validates the returned commit against the leaf it minted, so what is returned
+   * here must be what the HOME stored — not an echo of the arguments. Echoing the inputs would
+   * make that check tautological; reading back the committed registry row makes it catch a home
+   * that bound something different.
+   *
+   * COMMIT != PROPAGATION: `account-mutation`/`submit` reports propagation outcomes on its result
+   * rather than throwing (see ServerAccountMutationService), so a peer-republish failure cannot
+   * withhold a leaf whose registration already committed. A propagation failure is logged here and
+   * left to the durable outbox + the next drain.
+   */
+  async #registerDevice({ newDeviceId, deviceInboxBinding, deviceCapability } = {}) {
+    const deviceId = typeof newDeviceId === "string" ? newDeviceId.trim() : "";
+    if (deviceId.length === 0) {
+      throw new Error("deviceLink registerDevice: newDeviceId is required");
+    }
+    if (!deviceInboxBinding || typeof deviceInboxBinding !== "object") {
+      throw new Error("deviceLink registerDevice: deviceInboxBinding is required");
+    }
+    if (!deviceCapability || typeof deviceCapability !== "object") {
+      throw new Error("deviceLink registerDevice: deviceCapability (the leaf cert) is required");
+    }
+
+    const result = await this._call("account-mutation", "submit", {
+      action: "device.add",
+      target: { deviceInboxBinding, deviceCapability },
+      signWith: "account",
+    });
+    if (!result || typeof result !== "object") {
+      throw new Error("deviceLink registerDevice: the account-mutation service returned no result");
+    }
+    const devices = Array.isArray(result.devices) ? result.devices : null;
+    if (devices === null) {
+      throw new Error("deviceLink registerDevice: the commit carried no device set to confirm against");
+    }
+    const committed = devices.find((d) => d && typeof d.deviceId === "string" && d.deviceId === deviceId);
+    if (!committed) {
+      throw new Error("deviceLink registerDevice: the home committed a mutation that does not contain device " + deviceId);
+    }
+    const propagation = result.propagation && typeof result.propagation === "object" ? result.propagation : null;
+    if (propagation && Array.isArray(propagation.peersFailed) && propagation.peersFailed.length > 0) {
+      // Reported, NOT fatal: the registration is committed and the authority-state publication is
+      // durable. Failing here would withhold a leaf for a device the home already registered.
+      this.logger.warn(
+        "[ServerDeviceLinkService] device.add committed for " + deviceId + " but "
+          + propagation.peersFailed.length + " peer device-set republish(es) failed; the"
+          + " registration stands and propagation is retried separately",
+      );
+    }
+    return { deviceId: committed.deviceId, inboxId: committed.inboxId, certId: committed.certId };
   }
 
   async statusCeremony(payload) {

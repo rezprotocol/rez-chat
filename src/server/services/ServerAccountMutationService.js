@@ -115,8 +115,12 @@ export class ServerAccountMutationService extends BaseServerService {
         + MAX_STALE_RETRIES + " attempts");
     }
 
-    await this.#propagate(result);
-    return result;
+    // COMMIT != PROPAGATION (P1#2 L4). The mutation has committed at the home by this point.
+    // Propagation outcomes are REPORTED on the result, never thrown — a caller that treats a
+    // propagation failure as "the mutation failed" would, in the device-link case, withhold a leaf
+    // whose registration is already durably committed, orphaning it.
+    const propagation = await this.#propagate(result);
+    return { ...result, propagation };
   }
 
   // Publish the account authority-state record (now via the home's durable outbox), then
@@ -143,15 +147,27 @@ export class ServerAccountMutationService extends BaseServerService {
     const accountDeviceSet = await this.#accountDeviceSetFromHome();
     const links = await peerLinks.peerLinkStorage.peerLinks.listByOwner(owner);
     const seen = new Set();
+    const failedPeers = [];
+    let publishedPeers = 0;
     for (const link of links) {
       const peer = link && typeof link.peerAccountId === "string" ? link.peerAccountId.trim() : "";
       if (!peer || seen.has(peer)) continue;
       seen.add(peer);
-      const built = await peerLinks.buildDeviceSetRecordForPeer({ peerAccountId: peer, revision, nowMs: this.#clock(), accountDeviceSet });
-      await durableRecords.put({ record: built.record });
-      this._call("device-set", "invalidate", { peerAccountId: peer });
+      // Per-peer isolation: one unreachable peer must not stop the others from converging, and
+      // must not surface as a failed mutation. Failures are collected and reported, not swallowed
+      // — a durable per-peer queue is its own slice.
+      try {
+        const built = await peerLinks.buildDeviceSetRecordForPeer({ peerAccountId: peer, revision, nowMs: this.#clock(), accountDeviceSet });
+        await durableRecords.put({ record: built.record });
+        this._call("device-set", "invalidate", { peerAccountId: peer });
+        publishedPeers += 1;
+      } catch (err) {
+        const reason = err && err.message ? err.message : String(err);
+        this.logger.error("[ServerAccountMutationService] device-set republish failed for " + peer + ": " + reason);
+        failedPeers.push({ peerAccountId: peer, reason });
+      }
     }
-
+    return { peersPublished: publishedPeers, peersFailed: failedPeers };
   }
 
   /**

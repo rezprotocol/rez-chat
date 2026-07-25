@@ -348,6 +348,9 @@ export class ChatServerApp {
       deviceLink: new ServerDeviceLinkService({
         bus: this.bus,
         ownerAccountId: this.#ownerAccountId,
+        // P1#2a: backs the pending-ceremony journal, so a device-link registration is durable
+        // before device.add and resumable after a crash.
+        storageProvider: this.#storageProvider,
         clock,
         logger,
       }),
