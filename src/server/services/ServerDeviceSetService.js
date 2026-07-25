@@ -212,6 +212,15 @@ export class ServerDeviceSetService extends BaseServerService {
     // have a session for (idempotent) — so an unchanged republish neither churns
     // sessions nor desyncs the responder (Audit R2 #2).
     const knownRevision = existing && Number.isInteger(existing.revision) ? existing.revision : 0;
+    // Audit 2026-07-09 (F1): consult the peer's published authority state so a
+    // REVOKED delegated signer's device set is rejected here, not silently
+    // accepted. ServerAccountMutationService owns the bounded-staleness fetch +
+    // projection; it returns null when the peer has published no revocations
+    // (byte-identical to the pre-S11 open path). Co-registered with this service
+    // (both gated on multiDeviceFanout), so the call is always available on the
+    // fan-out path. A genuine lookup error propagates (fail-closed) rather than
+    // being swallowed.
+    const revocationState = await this._call("account-mutation", "peerRevocationState", { peerAccountId: peer });
     let result;
     try {
       result = await this.#peerLinks().ingestPeerDeviceSet({
@@ -219,6 +228,7 @@ export class ServerDeviceSetService extends BaseServerService {
         record,
         nowMs: this.#clock(),
         minRevision: knownRevision,
+        revocationState,
       });
     } catch (err) {
       if (err && err.code === "DEVICE_SET_STALE_REVISION" && existing) {

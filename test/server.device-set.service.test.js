@@ -349,3 +349,67 @@ test("L8 republishToAllPeers publishes to each DISTINCT peer once", async () => 
   assert.equal(res.published, 2, "two distinct peers (the duplicate p1 is deduped)");
   assert.equal(peerLinks.calls.build.length, 2);
 });
+
+// ---- audit 2026-07-09 (F1): the resolver must consult peer revocation ----
+
+// resolveForPeer previously ingested a peer's device set WITHOUT passing the
+// peer's published revocationState — so a revoked delegated signer's set was
+// still accepted. It must now fetch account-mutation.peerRevocationState and
+// thread it into ingestPeerDeviceSet (where the SDK opener rejects revoked certs).
+test("F1: resolveForPeer fetches the peer's revocationState and threads it into ingest", async () => {
+  const marker = { revokedCertIds: ["rez:cap:revoked-leaf"], minValidIssuedAtMs: 42 };
+  const ingestArgs = [];
+  const busCalls = [];
+  const peerLinks = {
+    deviceId: "rez:dev:self",
+    buildDeviceSetRecordForPeer() {},
+    async resolvePeerDeviceSetCoordinates({ peerAccountId }) {
+      return { recordKind: "deviceSet", recordId: "rid:" + peerAccountId, publisherPublicKeyB64: "pub" };
+    },
+    async ingestPeerDeviceSet(args) {
+      ingestArgs.push(args);
+      return { deviceSetRecord: { devices: [], revision: 1 }, established: [], revision: 1 };
+    },
+  };
+  const bus = {
+    runtime: { peerLinks, sdk: { durableRecords: { async get() { return { recordKind: "deviceSet" }; } } } },
+    services: {}, stores: {},
+    on() { return () => {}; },
+    emit() {},
+    registerFunction() {},
+    call(namespace, name, payload) {
+      busCalls.push({ namespace, name, payload });
+      if (namespace === "account-mutation" && name === "peerRevocationState") return Promise.resolve(marker);
+      return Promise.resolve(null);
+    },
+  };
+  const svc = new ServerDeviceSetService({ bus, ownerAccountId: "rez:acct:self" });
+  await svc.resolveForPeer({ peerAccountId: "rez:acct:peer" });
+
+  const revCall = busCalls.find((c) => c.namespace === "account-mutation" && c.name === "peerRevocationState");
+  assert.ok(revCall, "resolveForPeer consulted account-mutation.peerRevocationState");
+  assert.equal(revCall.payload.peerAccountId, "rez:acct:peer");
+  assert.equal(ingestArgs.length, 1, "ingest ran once");
+  assert.deepEqual(ingestArgs[0].revocationState, marker, "the peer's revocationState was threaded into ingest");
+});
+
+// Byte-compat: a peer with NO published revocations yields null → ingest sees
+// null (identical to the pre-S11 open path).
+test("F1: no published revocations ⇒ null revocationState threaded (byte-compat)", async () => {
+  const ingestArgs = [];
+  const peerLinks = {
+    deviceId: "rez:dev:self",
+    buildDeviceSetRecordForPeer() {},
+    async resolvePeerDeviceSetCoordinates() { return { recordKind: "deviceSet", recordId: "rid", publisherPublicKeyB64: "pub" }; },
+    async ingestPeerDeviceSet(args) { ingestArgs.push(args); return { deviceSetRecord: { devices: [], revision: 1 }, established: [], revision: 1 }; },
+  };
+  const bus = {
+    runtime: { peerLinks, sdk: { durableRecords: { async get() { return { recordKind: "deviceSet" }; } } } },
+    services: {}, stores: {},
+    on() { return () => {}; }, emit() {}, registerFunction() {},
+    call() { return Promise.resolve(null); },
+  };
+  const svc = new ServerDeviceSetService({ bus, ownerAccountId: "rez:acct:self" });
+  await svc.resolveForPeer({ peerAccountId: "rez:acct:peer" });
+  assert.equal(ingestArgs[0].revocationState, null);
+});
