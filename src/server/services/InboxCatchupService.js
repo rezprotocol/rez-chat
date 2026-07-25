@@ -292,6 +292,21 @@ export class InboxCatchupService extends BaseServerService {
       let throughSeq = 0;          // highest contiguous consumed seq this batch
       const consumedSeqs = [];     // seqs whose dedup marker we may forget post-ack
       let blocked = false;
+      // S15: a gap stops the CURSOR, not the PASS. The drain used to `break` on the first
+      // un-consumable seq, so a perfectly decryptable message sitting at a higher seq waited
+      // behind it — up to the 30-minute quarantine bound. Mail was never lost (it is durable),
+      // but reply latency could spike badly, which is what made multi-device replies look broken.
+      //
+      // Continuing past a gap is safe on both axes that matter, each verified rather than assumed:
+      //   - RATCHET: out-of-order decrypt within one session is standard Double Ratchet behaviour;
+      //     rez-core keeps a SkippedKeyStore for exactly this, so a later message does not corrupt
+      //     the chain.
+      //   - APPLY ORDER: the inbound pipeline DEFERS a message whose dependency has not arrived
+      //     (a group message before its sender's member.join is held, then delivered once the join
+      //     lands — server.inbound-pipeline.ordering.e2e). So an early submit cannot mis-apply.
+      // What must NOT move is the cursor: `throughSeq` stays the highest GAP-FREE consumed seq, so
+      // the home never prunes ciphertext for a seq we have not actually consumed.
+      let contiguous = true;
       for (const item of items) {
         const seq = this.#itemSeq(item);
         if (seq == null) {
@@ -307,8 +322,11 @@ export class InboxCatchupService extends BaseServerService {
         // contiguous advance here and retry it on the next drain.
         const backoffUntil = this.#decryptBackoffUntilMsByEvent.get("seq:" + seq);
         if (typeof backoffUntil === "number" && this.#clock() < backoffUntil) {
+          // Still in poison backoff: do not even re-submit it, and the cursor stops here — but
+          // later seqs still get their chance below.
           blocked = true;
-          break;
+          contiguous = false;
+          continue;
         }
         const frame = { t: "evt.mailbox.deposited", body: { mailboxId, seq, ciphertextB64: this.#itemCiphertext(item) } };
         let result = null;
@@ -324,8 +342,14 @@ export class InboxCatchupService extends BaseServerService {
         const durable = result && result.durable != null ? result.durable : (result && result.consumed);
         const ok = Boolean(durable || (result && result.alreadyProcessed));
         if (ok) {
-          throughSeq = seq;
-          consumedSeqs.push(seq);
+          // Only a gap-free run may move the watermark. Past a gap the item is still applied (or
+          // staged) — its dedup marker means the next drain sees `alreadyProcessed` and advances
+          // cheaply once the gap clears — but the cursor stays put, and its marker is NOT eligible
+          // to be forgotten, since forgetting is only safe for seqs the server cursor has passed.
+          if (contiguous) {
+            throughSeq = seq;
+            consumedSeqs.push(seq);
+          }
           continue;
         }
         // Gap: a seq we cannot consume yet. Count it; once a bound (D1) fires,
@@ -334,11 +358,12 @@ export class InboxCatchupService extends BaseServerService {
         // commit the ratchet, so an ordering race can still resolve it).
         const skip = await this.#handleDurableFailure(mailboxId, seq);
         if (skip) {
-          throughSeq = seq;        // accept the loss; advance past the poison seq
+          // Quarantine: the loss is accepted deliberately, so this seq does not break contiguity.
+          if (contiguous) throughSeq = seq;
           continue;
         }
         blocked = true;
-        break;
+        contiguous = false;
       }
       if (throughSeq > 0) {
         try {
