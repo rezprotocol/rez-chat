@@ -24,7 +24,13 @@ test("RuntimeService seeds mesh state from the runtime client snapshot", async (
     getUplinkStates() {
       return [{ url: "ws://127.0.0.1:8787/ws", active: true, ready: true, healthy: true }];
     },
-    async getMeshStatus() {
+    // Seeding goes through the GENERIC directive path — client.call(method, params) — not a
+    // bespoke getMeshStatus() method. Transports must forward (method, params) through one entry
+    // point and never enumerate bus directives (AGENTS.md / CLAUDE.md transport generality); this
+    // double predated that and exposed a per-directive method, so the seed silently no-opped.
+    async call(method, params) {
+      assert.equal(method, "mesh.status");
+      assert.deepEqual(params, {});
       meshStatusCalls += 1;
       return {
         mesh: {

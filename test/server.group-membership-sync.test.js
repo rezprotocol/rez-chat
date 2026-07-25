@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { GroupStore } from "../src/server/storage/ChatGroupStore.js";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
+import { MailboxPushBridge } from "../src/server/runtime/MailboxPushBridge.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -88,11 +89,16 @@ test("inbound group message ensures sender membership", async () => {
       onMailboxDeposited: (fn) => { handlers.mailbox = fn; return () => {}; },
       onDeliveryAck: (fn) => { handlers.ack = fn; return () => {}; },
     },
+    // The bridge ack-deletes the relay buffer copy once a deposit resolves.
+    mailbox: { async ack() { return { removed: true }; } },
   };
   server.bus.runtime = { sdk: mockSdk };
 
-  // Start the event service so it subscribes
+  // Attach the bridge that OWNS the onMailboxDeposited subscription — this is what puts a
+  // handler in `handlers.mailbox`. (It used to arrive via services.events.start(); that
+  // subscription moved to MailboxPushBridge, which is now its single owner.)
   await server.bus.services.events.start();
+  MailboxPushBridge.attach({ sdk: mockSdk, bus: server.bus, logger: { ...console, error() {}, warn() {}, log() {} } });
 
   // Simulate inbound group message with senderAccountId in the payload
   const payload = { kind: "text", text: "hello group", senderAccountId: SENDER, threadId };
@@ -138,9 +144,12 @@ test("inbound DM does not trigger group membership sync", async () => {
       onMailboxDeposited: (fn) => { handlers.mailbox = fn; return () => {}; },
       onDeliveryAck: (fn) => { handlers.ack = fn; return () => {}; },
     },
+    // The bridge ack-deletes the relay buffer copy once a deposit resolves.
+    mailbox: { async ack() { return { removed: true }; } },
   };
   server.bus.runtime = { sdk: mockSdk };
   await server.bus.services.events.start();
+  MailboxPushBridge.attach({ sdk: mockSdk, bus: server.bus, logger: { ...console, error() {}, warn() {}, log() {} } });
 
   const payload = { kind: "text", text: "hello dm", senderAccountId: SENDER, threadId: "th_dm_sync" };
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64");
@@ -184,9 +193,12 @@ test("inbound DM with sender-local thread id resolves to local direct thread", a
       onMailboxDeposited: (fn) => { handlers.mailbox = fn; return () => {}; },
       onDeliveryAck: (fn) => { handlers.ack = fn; return () => {}; },
     },
+    // The bridge ack-deletes the relay buffer copy once a deposit resolves.
+    mailbox: { async ack() { return { removed: true }; } },
   };
   server.bus.runtime = { sdk: mockSdk };
   await server.bus.services.events.start();
+  MailboxPushBridge.attach({ sdk: mockSdk, bus: server.bus, logger: { ...console, error() {}, warn() {}, log() {} } });
 
   const payload = {
     kind: "text",

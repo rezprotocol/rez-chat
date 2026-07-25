@@ -85,8 +85,17 @@ test("BiometricGate Windows throws BiometricCancelledError when adapter returns 
   );
 });
 
-test("BiometricGate Linux passes through without prompting", async () => {
+test("BiometricGate Linux FAILS CLOSED rather than passing through", async () => {
+  // SECURITY_AUDIT MED-18 deliberately replaced the old pass-through `return true` on Linux:
+  // there is no portable user-gesture biometric API there, so a silent success handed a free
+  // unlock to any caller that used the gate without an upstream safeStorage check. Callers that
+  // mean to gate on safeStorage must consult isAvailable() and skip the step explicitly.
+  // This test asserted the retired pass-through semantics and was never in the npm test list,
+  // so nothing flagged it when the security fix landed.
   const gate = new BiometricGate({ platform: "linux" });
   assert.equal(gate.isAvailable(), false);
-  assert.equal(await gate.requireBiometric({ reason: "Unlock Rez" }), true);
+  await assert.rejects(
+    () => gate.requireBiometric({ reason: "Unlock Rez" }),
+    (err) => err.name === "BiometricUnavailableError" && err.code === "BIOMETRIC_UNAVAILABLE",
+  );
 });

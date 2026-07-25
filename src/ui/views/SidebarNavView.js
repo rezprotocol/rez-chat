@@ -215,8 +215,7 @@ export class SidebarNavView extends BusComponent {
     const slot = contactsBtn.querySelector("[data-role='nav-badge-slot']");
     if (!slot) return;
     const queries = this.bus.queries;
-    const count = queries && queries.contacts && typeof queries.contacts.incomingConnectRequestCount === "function"
-      ? queries.contacts.incomingConnectRequestCount() : 0;
+    const count = queries.contacts.incomingConnectRequestCount();
     if (count <= 0) {
       slot.replaceChildren();
       return;

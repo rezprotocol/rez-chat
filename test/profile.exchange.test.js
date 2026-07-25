@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { ServerProfileService } from "../src/server/services/ServerProfileService.js";
 import { CHAT_BRIDGE_SPEC } from "../src/server/transport/ChatBridge.js";
 import { ProfileBroadcastParams, ProfileBroadcastResult } from "../src/records/index.js";
+import { ProfilePayloadV1 } from "@rezprotocol/sdk/profile";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
 function createBus() {
@@ -93,8 +94,16 @@ function createService({ threads = {}, ownerDisplayName = null, clock = () => 10
 
 test("handleIncomingProfile updates contact displayName", async () => {
   const { service, contactStore } = createService();
+  // A profile only UPDATES an existing contact — it never creates one (see the no-create test
+  // below), so the contact this test means to update has to exist first.
+  contactStore._contacts["owner_123/peer_abc"] = {
+    ownerAccountId: "owner_123",
+    accountId: "peer_abc",
+    displayName: "old",
+    updatedAtMs: 1000,
+  };
   const consumed = await service.handleIncomingProfile(
-    { kind: "rez.profile.v1", displayName: "Alice", updatedAtMs: 5000 },
+    new ProfilePayloadV1({ displayName: "Alice", updatedAtMs: 5000, avatarFileHash: "" }),
     { senderAccountId: "peer_abc" },
   );
   assert.equal(consumed, true);
@@ -105,13 +114,13 @@ test("handleIncomingProfile updates contact displayName", async () => {
 test("handleIncomingProfile rejects stale profile (older updatedAtMs)", async () => {
   const { service, contactStore } = createService();
   contactStore._contacts["owner_123/peer_abc"] = {
-    accountId: "owner_123",
+    ownerAccountId: "owner_123",
     accountId: "peer_abc",
     displayName: "Bob",
     updatedAtMs: 9000,
   };
   const consumed = await service.handleIncomingProfile(
-    { kind: "rez.profile.v1", displayName: "BobOld", updatedAtMs: 5000 },
+    new ProfilePayloadV1({ displayName: "BobOld", updatedAtMs: 5000, avatarFileHash: "" }),
     { senderAccountId: "peer_abc" },
   );
   assert.equal(consumed, true);
@@ -122,13 +131,13 @@ test("handleIncomingProfile rejects stale profile (older updatedAtMs)", async ()
 test("handleIncomingProfile accepts newer profile", async () => {
   const { service, contactStore } = createService();
   contactStore._contacts["owner_123/peer_abc"] = {
-    accountId: "owner_123",
+    ownerAccountId: "owner_123",
     accountId: "peer_abc",
     displayName: "Bob",
     updatedAtMs: 5000,
   };
   const consumed = await service.handleIncomingProfile(
-    { kind: "rez.profile.v1", displayName: "Robert", updatedAtMs: 9000 },
+    new ProfilePayloadV1({ displayName: "Robert", updatedAtMs: 9000, avatarFileHash: "" }),
     { senderAccountId: "peer_abc" },
   );
   assert.equal(consumed, true);
@@ -137,16 +146,25 @@ test("handleIncomingProfile accepts newer profile", async () => {
 });
 
 test("handleIncomingProfile emits contacts.updated", async () => {
-  const { service, bus } = createService();
+  const { service, bus, contactStore } = createService();
+  contactStore._contacts["owner_123/peer_xyz"] = {
+    ownerAccountId: "owner_123",
+    accountId: "peer_xyz",
+    displayName: "old",
+    updatedAtMs: 1000,
+  };
   let emitted = null;
-  bus.on("contacts.updated", (payload) => { emitted = payload; });
+  // The event is `contact.updated` (singular) carrying a ContactUpdatedEvent that WRAPS the
+  // contact — this test predated both the rename and the wrapper, and asserted the fields
+  // directly on the payload.
+  bus.on("contact.updated", (payload) => { emitted = payload; });
   await service.handleIncomingProfile(
-    { kind: "rez.profile.v1", displayName: "Carol", updatedAtMs: 5000 },
+    new ProfilePayloadV1({ displayName: "Carol", updatedAtMs: 5000, avatarFileHash: "" }),
     { senderAccountId: "peer_xyz" },
   );
-  assert.ok(emitted, "contacts.updated should have been emitted");
-  assert.equal(emitted.displayName, "Carol");
-  assert.equal(emitted.accountId, "peer_xyz");
+  assert.ok(emitted, "contact.updated should have been emitted");
+  assert.equal(emitted.contact.displayName, "Carol");
+  assert.equal(emitted.contact.accountId, "peer_xyz");
 });
 
 test("handleIncomingProfile rejects invalid payload", async () => {
@@ -162,7 +180,7 @@ test("handleIncomingProfile rejects invalid payload", async () => {
     { senderAccountId: "peer_abc" },
   ), false);
   assert.equal(await service.handleIncomingProfile(
-    { kind: "rez.profile.v1", displayName: "Alice", updatedAtMs: 5000 },
+    new ProfilePayloadV1({ displayName: "Alice", updatedAtMs: 5000, avatarFileHash: "" }),
     { senderAccountId: "" },
   ), false);
 });
@@ -277,4 +295,23 @@ test("ProfileBroadcastResult round-trip via toJSON/fromJSON", () => {
   const restored = ProfileBroadcastResult.fromJSON(json);
   assert.equal(restored.sent, 3);
   assert.equal(restored.failed, 1);
+});
+
+test("handleIncomingProfile ACKS but does not CREATE a contact for an unknown peer", async () => {
+  // Contacts come solely from an explicit 1:1 flow (direct invite / connect-request approval).
+  // A profile from a peer we hold no contact for — a group co-member sharing a fan-out peer-link,
+  // say — must not mint one, or group membership would leak into the contact list. It is still
+  // acknowledged (consumed: true); there is simply nothing to store.
+  const { service, contactStore, bus } = createService();
+  let emitted = null;
+  bus.on("contact.updated", (payload) => { emitted = payload; });
+
+  const consumed = await service.handleIncomingProfile(
+    new ProfilePayloadV1({ displayName: "Stranger", updatedAtMs: 5000, avatarFileHash: "" }),
+    { senderAccountId: "peer_unknown" },
+  );
+
+  assert.equal(consumed, true, "acknowledged, so the sender does not retry forever");
+  assert.equal(await contactStore.get({ ownerAccountId: "owner_123", accountId: "peer_unknown" }), null);
+  assert.equal(emitted, null, "no contact, no contact.updated");
 });

@@ -22,8 +22,7 @@ export class OfflineBannerView extends BusComponent {
 
   #render() {
     if (!this._rootEl) return;
-    const store = this.bus.stores ? this.bus.stores.connection : null;
-    const connection = store && typeof store.getConnection === "function" ? store.getConnection() : null;
+    const connection = this.bus.stores.connection.getConnection();
     const status = String((connection && connection.status) || "disconnected");
     if (status === "connected") {
       this._rootEl.replaceChildren();

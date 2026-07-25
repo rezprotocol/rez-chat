@@ -34,8 +34,7 @@ export class ConnectRequestAlertView extends BusComponent {
   render() {
     if (!this._rootEl) return;
     const queries = this.bus.queries;
-    const requests = queries && queries.contacts && typeof queries.contacts.incomingConnectRequests === "function"
-      ? queries.contacts.incomingConnectRequests() : [];
+    const requests = queries.contacts.incomingConnectRequests();
     const visible = requests.filter((r) => r && !this.#dismissed.has(String(r.peerAccountId || "").trim()));
     if (!visible.length) {
       this._rootEl.replaceChildren();

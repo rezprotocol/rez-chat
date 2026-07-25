@@ -29,8 +29,7 @@ export class PendingRequestsSectionView extends BusComponent {
   render() {
     if (!this._rootEl) return;
     const queries = this.bus.queries;
-    const requests = queries && queries.contacts && typeof queries.contacts.incomingConnectRequests === "function"
-      ? queries.contacts.incomingConnectRequests() : [];
+    const requests = queries.contacts.incomingConnectRequests();
     if (!requests.length) {
       this._rootEl.replaceChildren();
       return;
