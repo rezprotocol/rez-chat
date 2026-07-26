@@ -39,11 +39,62 @@ function makeOutbox({ claims = [], prepares = [], completes = [], failOn = null 
   };
 }
 
+// A deterministic stand-in for setTimeout/clearTimeout. Tests advance the schedule explicitly
+// instead of sleeping, so the recovery cadence is asserted rather than waited on.
+function makeScheduler() {
+  let next = 1;
+  const pending = new Map();
+  return {
+    pending,
+    setTimer(fn, ms) {
+      const handle = next;
+      next += 1;
+      pending.set(handle, { fn, ms });
+      return handle;
+    },
+    clearTimer(handle) { pending.delete(handle); },
+    /** The single armed timer, or null. The service never arms more than one at a time. */
+    armed() {
+      const entries = [...pending.values()];
+      assert.ok(entries.length <= 1, "the service must never stack timers");
+      return entries.length === 1 ? entries[0] : null;
+    },
+    /** Fire the armed timer as the runtime would. */
+    async fire() {
+      const [handle] = [...pending.keys()];
+      assert.ok(handle !== undefined, "expected a scheduled retry");
+      const { fn } = pending.get(handle);
+      pending.delete(handle);
+      await fn();
+    },
+  };
+}
+
+// A stand-in for sdk.connectivity: tests trigger a reconnect by calling `reconnect()`.
+function makeConnectivity() {
+  const subscribers = [];
+  return {
+    unsubscribes: 0,
+    onReconnected(fn) {
+      subscribers.push(fn);
+      return () => { this.unsubscribes += 1; };
+    },
+    async reconnect() {
+      for (const fn of subscribers) await fn();
+    },
+    subscriberCount() { return subscribers.length; },
+  };
+}
+
 function makeHarness({
   outbox = makeOutbox(),
   authorityStates = [{ epoch: 6, revokedCertIds: ["rez:cap:" + "a".repeat(64)], minValidIssuedAtMs: 0 }],
   withOutbox = true,
   buildThrows = false,
+  scheduler = null,
+  connectivity = null,
+  retryIntervalMs = 300_000,
+  maxRetryIntervalMs = 1_800_000,
 } = {}) {
   const built = [];
   const logs = { warn: [], error: [], info: [] };
@@ -56,6 +107,7 @@ function makeHarness({
       },
     },
   };
+  if (connectivity !== null) sdk.connectivity = connectivity;
   const peerLinks = {
     async buildAccountAuthorityStateRecord(args) {
       built.push(args);
@@ -80,8 +132,11 @@ function makeHarness({
       info: (m) => logs.info.push(m),
       log: () => {},
     },
+    retryIntervalMs,
+    maxRetryIntervalMs,
+    ...(scheduler === null ? {} : { setTimer: scheduler.setTimer, clearTimer: scheduler.clearTimer }),
   });
-  return { svc, outbox, built, logs };
+  return { svc, outbox, built, logs, scheduler, connectivity };
 }
 
 const LEASED = { leased: true, token: TOKEN, anchorEpoch: 6, headEpoch: 6, leaseExpiresAtMs: NOW + 30_000, attempts: 0 };
@@ -279,4 +334,223 @@ test("a runtime without the outbox surface drains nothing and reports it", async
   const { svc } = makeHarness({ withOutbox: false });
   assert.equal(svc.isEnabled(), false);
   assert.deepEqual(await svc.drainPublications(), { enabled: false, cycles: 0, publishedEpochs: [], stopped: "disabled" });
+});
+
+// ── RECOVERY LIVENESS (audit finding #2) ──────────────────────────────────────────────────────
+// The drain used to run only when THIS device mutated its own account. Everything below is the
+// coverage that was missing: an obligation enqueued by another device, or left behind by a crash,
+// or backing off after a failure, had nothing that would ever retry it.
+
+const NOTHING = { leased: false, awaitingRootSignature: false };
+
+test("recovery: start() drains once immediately — the cold-boot path", async () => {
+  const scheduler = makeScheduler();
+  const outbox = makeOutbox({ claims: [NOTHING] });
+  const { svc } = makeHarness({ outbox, scheduler, connectivity: makeConnectivity() });
+
+  await svc.start();
+
+  assert.deepEqual(outbox.calls.map((c) => c.op), ["claim"], "a drain ran at startup");
+  assert.ok(scheduler.armed(), "and the periodic net is armed behind it");
+  assert.equal(scheduler.armed().ms, 300_000);
+  await svc.stop();
+});
+
+test("recovery: the periodic net keeps draining an obligation no local mutation will ever trigger", async () => {
+  // The stranded case: another device performed the mutation, so this device sees no local event.
+  // The obligation only moves because something re-checks on a timer.
+  const scheduler = makeScheduler();
+  const outbox = makeOutbox({
+    claims: [NOTHING, LEASED, NOTHING],
+    prepares: [PREPARED],
+    completes: [{ completed: true, doneThroughEpoch: 6 }],
+  });
+  const { svc, built } = makeHarness({ outbox, scheduler, connectivity: makeConnectivity() });
+
+  await svc.start();
+  assert.equal(built.length, 0, "nothing to publish yet");
+
+  await scheduler.fire(); // the obligation has appeared since boot
+
+  assert.equal(built.length, 1, "the periodic drain published it");
+  assert.equal(built[0].epoch, 6);
+  assert.ok(scheduler.armed(), "and the net re-arms after a successful pass");
+  await svc.stop();
+});
+
+test("recovery: a reconnect drains immediately", async () => {
+  const scheduler = makeScheduler();
+  const connectivity = makeConnectivity();
+  const outbox = makeOutbox({ claims: [NOTHING] });
+  const { svc } = makeHarness({ outbox, scheduler, connectivity });
+
+  await svc.start();
+  assert.equal(connectivity.subscriberCount(), 1);
+  const afterStart = outbox.calls.length;
+
+  await connectivity.reconnect();
+
+  assert.ok(outbox.calls.length > afterStart, "reconnect triggered its own drain");
+  await svc.stop();
+});
+
+test("recovery: polling STANDS DOWN where it cannot help, and re-arms on reconnect", async () => {
+  // Each of these is a property of this runtime / node / session authority. Retrying on a timer
+  // would burn wakeups and cluster lease budget to reach the identical answer.
+  const cases = [
+    ["awaiting-root-signature", { claims: [{ leased: false, awaitingRootSignature: true }] }],
+    ["outbox-unavailable", { failOn: "claim" }],
+  ];
+  for (const [expected, outboxOpts] of cases) {
+    const scheduler = makeScheduler();
+    const connectivity = makeConnectivity();
+    const { svc, logs } = makeHarness({ outbox: makeOutbox(outboxOpts), scheduler, connectivity });
+
+    await svc.start();
+
+    assert.equal(svc.recoveryState.suspendedReason, expected);
+    assert.equal(scheduler.armed(), null, expected + ": no timer is left running");
+    assert.ok(logs.info.some((m) => m.includes("suspended")), expected + ": and it says so");
+
+    // A new session may land on a different node or carry different authority, so reconnect
+    // re-evaluates from scratch rather than staying suspended forever.
+    await connectivity.reconnect();
+    assert.equal(svc.recoveryState.suspendedReason, expected, "still true, so still suspended");
+    await svc.stop();
+  }
+});
+
+test("recovery: a suspended service RESUMES when the reconnect answers differently", async () => {
+  const scheduler = makeScheduler();
+  const connectivity = makeConnectivity();
+  // Delegated at boot; after reconnect the node reports an ordinary claimable state.
+  const outbox = makeOutbox({ claims: [{ leased: false, awaitingRootSignature: true }, NOTHING] });
+  const { svc } = makeHarness({ outbox, scheduler, connectivity });
+
+  await svc.start();
+  assert.equal(svc.recoveryState.suspendedReason, "awaiting-root-signature");
+  assert.equal(scheduler.armed(), null);
+
+  await connectivity.reconnect();
+
+  assert.equal(svc.recoveryState.suspendedReason, null, "the suspension cleared");
+  assert.ok(scheduler.armed(), "and the periodic net is armed again");
+  await svc.stop();
+});
+
+test("recovery: a 'disabled' runtime suspends too, rather than polling a drain that cannot run", async () => {
+  const scheduler = makeScheduler();
+  const { svc } = makeHarness({ withOutbox: false, scheduler, connectivity: makeConnectivity() });
+  await svc.start();
+  assert.equal(svc.recoveryState.suspendedReason, "disabled");
+  assert.equal(scheduler.armed(), null);
+  await svc.stop();
+});
+
+test("recovery: a THROWN drain backs off exponentially, capped — and never escapes start()", async () => {
+  // The node already applied its own per-epoch backoff before this throw. This second, client-side
+  // backoff stops a persistently broken device from holding the account's single cluster-wide lease
+  // and starving a healthy sibling.
+  const scheduler = makeScheduler();
+  const outbox = makeOutbox({ claims: [LEASED], prepares: [PREPARED], failOn: "complete" });
+  const { svc, logs } = makeHarness({
+    outbox,
+    scheduler,
+    connectivity: makeConnectivity(),
+    retryIntervalMs: 1000,
+    maxRetryIntervalMs: 4000,
+  });
+
+  // start() must not reject even though every drain throws — the obligation is durable, and
+  // failing here would take the whole chat server down at boot.
+  await svc.start();
+
+  assert.equal(scheduler.armed().ms, 2000, "first failure doubles the base interval");
+  await scheduler.fire();
+  assert.equal(scheduler.armed().ms, 4000, "second doubles again");
+  await scheduler.fire();
+  assert.equal(scheduler.armed().ms, 4000, "and holds at the ceiling");
+  assert.ok(logs.error.some((m) => m.includes("retrying in")), "each failure says when it will retry");
+  await svc.stop();
+});
+
+test("recovery: backoff RESETS after a clean pass", async () => {
+  const scheduler = makeScheduler();
+  // Fail once (complete throws), then a clean claim.
+  const outbox = makeOutbox({ claims: [LEASED, NOTHING], prepares: [PREPARED], failOn: "complete" });
+  const { svc } = makeHarness({
+    outbox,
+    scheduler,
+    connectivity: makeConnectivity(),
+    retryIntervalMs: 1000,
+    maxRetryIntervalMs: 8000,
+  });
+
+  await svc.start();
+  assert.equal(scheduler.armed().ms, 2000, "backed off");
+
+  outbox.failOn = null; // the fault clears
+  await scheduler.fire();
+
+  assert.equal(scheduler.armed().ms, 1000, "a clean pass returns to the base cadence");
+  await svc.stop();
+});
+
+test("recovery: stop() cancels the timer and unsubscribes — no work after shutdown", async () => {
+  const scheduler = makeScheduler();
+  const connectivity = makeConnectivity();
+  const outbox = makeOutbox({ claims: [NOTHING] });
+  const { svc } = makeHarness({ outbox, scheduler, connectivity });
+
+  await svc.start();
+  assert.ok(scheduler.armed());
+
+  await svc.stop();
+
+  assert.equal(scheduler.armed(), null, "the periodic net is cancelled");
+  assert.equal(connectivity.unsubscribes, 1, "and the reconnect subscription released");
+
+  // A reconnect arriving after shutdown must not restart the loop.
+  const afterStop = outbox.calls.length;
+  await connectivity.reconnect();
+  assert.equal(scheduler.armed(), null, "a post-stop reconnect does not re-arm the timer");
+  void afterStop;
+});
+
+test("recovery: a runtime without sdk.connectivity still recovers, and says what it lost", async () => {
+  // Degraded, not silent: startup + periodic still run, but there is no reconnect trigger, and a
+  // reader must not mistake this for full coverage.
+  const scheduler = makeScheduler();
+  const outbox = makeOutbox({ claims: [NOTHING] });
+  const { svc, logs } = makeHarness({ outbox, scheduler, connectivity: null });
+
+  await svc.start();
+
+  assert.deepEqual(outbox.calls.map((c) => c.op), ["claim"], "startup drain still ran");
+  assert.ok(scheduler.armed(), "periodic net still armed");
+  assert.ok(logs.warn.some((m) => m.includes("onReconnected is unavailable")));
+  await svc.stop();
+});
+
+test("recovery: overlapping self-driven triggers COALESCE instead of stacking", async () => {
+  const scheduler = makeScheduler();
+  const connectivity = makeConnectivity();
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const outbox = makeOutbox({ claims: [NOTHING] });
+  const baseClaim = outbox.claim.bind(outbox);
+  outbox.claim = async () => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await Promise.resolve();
+    const r = await baseClaim();
+    inFlight -= 1;
+    return r;
+  };
+  const { svc } = makeHarness({ outbox, scheduler, connectivity });
+
+  await Promise.all([svc.start(), svc.requestDrain("reconnect"), svc.requestDrain("periodic")]);
+
+  assert.equal(maxInFlight, 1, "self-driven drains never run concurrently");
+  await svc.stop();
 });

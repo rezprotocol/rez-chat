@@ -37,9 +37,27 @@ import { BaseServerService } from "../base/BaseServerService.js";
  * never marked done and never abandoned: it stays outstanding until a verified publication, or
  * until a superseding verified epoch completes it. The original error is always rethrown.
  *
- * This service does NOT publish on its own schedule and does not yet replace the inline
- * publish in ServerAccountMutationService#propagate — that cutover is a separate slice. Callers
- * drive it through the `authority-publication` / `drain` directive.
+ * RECOVERY LIVENESS (audit finding #2, 2026-07-26). A drain used to happen only when THIS device
+ * mutated its own account — `ServerAccountMutationService` calls the directive right after its fold
+ * commits. That covers the local case and nothing else, so an obligation was stranded whenever:
+ *   - another device performed the mutation (this device sees no local event, and the mutating
+ *     device may be delegated and unable to sign it);
+ *   - this process died between the enqueue and the publish;
+ *   - the head was backing off after a failed attempt, and no further mutation ever arrived to
+ *     trigger a retry.
+ * In all three the obligation stayed durable and correct — and simply never ran. Honest reporting
+ * is not liveness.
+ *
+ * So the service now also drives itself: once at start, on every SDK reconnect, and on a periodic
+ * safety net with exponential backoff after failures. The mutation-driven call is unchanged and
+ * remains the fast path; this is the net underneath it.
+ *
+ * SUSPENSION. Three outcomes mean polling cannot help, and the timer stands down until the next
+ * reconnect rather than burning wakeups: `disabled` (this runtime cannot drain at all),
+ * `outbox-unavailable` (this node has no outbox), and `awaiting-root-signature` (this device is
+ * delegated, and its own session authority cannot change without re-authenticating). Reconnect
+ * clears the suspension, because any of the three may be answered differently by a different node
+ * or a new session.
  */
 
 // One drain call handles a bounded number of lease cycles. A cycle ends by publishing, by
@@ -48,13 +66,229 @@ import { BaseServerService } from "../base/BaseServerService.js";
 // should come back later rather than spin.
 const DEFAULT_MAX_CYCLES = 4;
 
+// The safety-net cadence. Deliberately slow: the fast paths (a local mutation, and the mutating
+// device's own drain) already cover the common case, so this only has to catch the stranded
+// remainder. Polling faster would spend cluster-wide lease budget to shave minutes off a recovery
+// that is already rare.
+const DEFAULT_RETRY_INTERVAL_MS = 300_000;
+
+// After a THROWN drain the interval doubles up to this ceiling, then holds. A drain that throws has
+// already reported the failed attempt to the node (which applies its own per-epoch backoff and the
+// blocked threshold); this second, client-side backoff exists so a persistently broken client does
+// not keep claiming the account's single cluster-wide lease and starving a healthy sibling device.
+const DEFAULT_MAX_RETRY_INTERVAL_MS = 1_800_000;
+
 export class ServerAuthorityPublicationService extends BaseServerService {
   #clock;
+  #retryIntervalMs;
+  #maxRetryIntervalMs;
+  #currentRetryMs;
+  #timer;
+  #setTimer;
+  #clearTimer;
+  #offReconnect;
+  #stopped;
+  #suspendedReason;
+  #draining;
+  #pending;
 
-  constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
+  constructor({
+    bus,
+    ownerAccountId,
+    clock = () => Date.now(),
+    logger = console,
+    retryIntervalMs = DEFAULT_RETRY_INTERVAL_MS,
+    maxRetryIntervalMs = DEFAULT_MAX_RETRY_INTERVAL_MS,
+    // Injectable so tests drive the schedule deterministically instead of waiting on wall clock.
+    // Defaults are the real timers; nothing in production passes these.
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (handle) => clearTimeout(handle),
+  } = {}) {
     super({ bus, ownerAccountId, logger });
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
+    this.#retryIntervalMs = Number.isFinite(retryIntervalMs) && retryIntervalMs > 0
+      ? Number(retryIntervalMs)
+      : DEFAULT_RETRY_INTERVAL_MS;
+    this.#maxRetryIntervalMs = Number.isFinite(maxRetryIntervalMs) && maxRetryIntervalMs >= this.#retryIntervalMs
+      ? Number(maxRetryIntervalMs)
+      : Math.max(this.#retryIntervalMs, DEFAULT_MAX_RETRY_INTERVAL_MS);
+    this.#currentRetryMs = this.#retryIntervalMs;
+    this.#setTimer = typeof setTimer === "function" ? setTimer : ((fn, ms) => setTimeout(fn, ms));
+    this.#clearTimer = typeof clearTimer === "function" ? clearTimer : ((handle) => clearTimeout(handle));
+    this.#timer = null;
+    this.#offReconnect = null;
+    this.#stopped = false;
+    this.#suspendedReason = null;
+    this.#draining = false;
+    this.#pending = false;
     this._register("authority-publication", "drain", (payload) => this.drainPublications(payload || {}));
+  }
+
+  /**
+   * Arm the recovery net: subscribe to reconnect, run one drain now, and schedule the periodic
+   * retry. Never throws — a drain failure at boot must not take the chat server down with it, and
+   * the obligation is durable either way.
+   */
+  async start() {
+    this.#stopped = false;
+    const sdk = this.#sdk();
+    const connectivity = sdk && sdk.connectivity ? sdk.connectivity : null;
+    if (connectivity && typeof connectivity.onReconnected === "function") {
+      this.#offReconnect = connectivity.onReconnected(() => this.#onReconnected());
+    } else {
+      // Degraded, but loudly: startup + periodic retry still run. A runtime without connectivity
+      // (some unit-test wirings) would otherwise appear to have full recovery coverage.
+      this.logger.warn(
+        "[ServerAuthorityPublicationService] sdk.connectivity.onReconnected is unavailable;"
+          + " running startup + periodic recovery only, with no reconnect-triggered drain",
+      );
+    }
+    await this.requestDrain("startup");
+  }
+
+  async stop() {
+    this.#stopped = true;
+    this.#cancelTimer();
+    if (typeof this.#offReconnect === "function") {
+      try {
+        this.#offReconnect();
+      } catch (err) {
+        this.logger.error("[ServerAuthorityPublicationService] reconnect unsubscribe failed: "
+          + (err && err.message ? err.message : err));
+      }
+      this.#offReconnect = null;
+    }
+    await super.stop();
+  }
+
+  /**
+   * A drain that never throws — the entry point for every SELF-driven trigger (startup, reconnect,
+   * the periodic net). It reports the outcome, decides whether to keep polling, and reschedules.
+   *
+   * The directive path (`authority-publication`/`drain` → drainPublications) keeps its throwing
+   * contract untouched: ServerAccountMutationService needs the real error to log what a committed
+   * mutation failed to propagate.
+   *
+   * Concurrent drains are SAFE rather than prevented: the outbox lease is serialized cluster-wide,
+   * so a second claim simply answers `leased: false`. This coalescer only keeps the self-driven
+   * triggers from stacking on each other; it deliberately does not gate the directive, which must
+   * run and report on its own.
+   *
+   * @param {string} trigger - "startup" | "reconnect" | "periodic", for logs
+   */
+  async requestDrain(trigger) {
+    if (this.#draining) {
+      this.#pending = true;
+      return;
+    }
+    this.#draining = true;
+    try {
+      do {
+        this.#pending = false;
+        await this.#runOnce(trigger);
+      } while (this.#pending && !this.#stopped);
+    } finally {
+      this.#draining = false;
+    }
+  }
+
+  // One self-driven drain: run it, classify the outcome, and set up the next wakeup.
+  async #runOnce(trigger) {
+    if (this.#stopped) return;
+    let outcome;
+    try {
+      outcome = await this.drainPublications({});
+    } catch (err) {
+      // drainPublications already reported the failed attempt to the node before rethrowing, so
+      // the obligation is backed off server-side and never lost. Here we only decide when THIS
+      // client tries again — backing off so a persistently broken device stops taking the lease.
+      const next = this.#backoff();
+      this.logger.error(
+        "[ServerAuthorityPublicationService] " + trigger + " drain failed: "
+          + (err && err.message ? err.message : err)
+          + "; retrying in " + Math.round(next / 1000) + "s",
+      );
+      this.#scheduleNext(next);
+      return;
+    }
+    this.#resetBackoff();
+    if (this.#shouldSuspend(outcome)) {
+      this.#suspendedReason = outcome.enabled === false ? "disabled" : outcome.stopped;
+      this.#cancelTimer();
+      this.logger.info(
+        "[ServerAuthorityPublicationService] periodic recovery suspended (" + this.#suspendedReason
+          + "); polling cannot change this outcome — it will re-arm on the next reconnect",
+      );
+      return;
+    }
+    this.#suspendedReason = null;
+    this.#scheduleNext(this.#currentRetryMs);
+  }
+
+  /**
+   * Outcomes that polling cannot change. Each is a property of THIS runtime, THIS node, or THIS
+   * session's authority — none of which shifts without a reconnect. `nothing-pending`, `lease-lost`
+   * and `max-cycles` are all transient by contrast and keep the normal cadence.
+   */
+  #shouldSuspend(outcome) {
+    if (!outcome || typeof outcome !== "object") return false;
+    if (outcome.enabled === false) return true;
+    return outcome.stopped === "outbox-unavailable" || outcome.stopped === "awaiting-root-signature";
+  }
+
+  #onReconnected() {
+    // A new session may be on a different node, or hold different authority, so every suspension
+    // reason is re-evaluated from scratch.
+    this.#suspendedReason = null;
+    this.#resetBackoff();
+    this.requestDrain("reconnect").catch((err) => {
+      // requestDrain does not throw; this is belt-and-braces so a bug here can never surface as an
+      // unhandled rejection inside a transport callback.
+      this.logger.error("[ServerAuthorityPublicationService] reconnect drain failed: "
+        + (err && err.message ? err.message : err));
+    });
+  }
+
+  #scheduleNext(delayMs) {
+    this.#cancelTimer();
+    if (this.#stopped) return;
+    this.#timer = this.#setTimer(() => {
+      this.#timer = null;
+      // The promise is RETURNED, not dropped. A real timer ignores it; an injected scheduler can
+      // await it, which is what lets the tests assert the cadence deterministically instead of
+      // racing a drain that is still in flight.
+      return this.requestDrain("periodic").catch((err) => {
+        this.logger.error("[ServerAuthorityPublicationService] periodic drain failed: "
+          + (err && err.message ? err.message : err));
+      });
+    }, delayMs);
+    // Never hold the process open for a safety net.
+    if (this.#timer && typeof this.#timer.unref === "function") this.#timer.unref();
+  }
+
+  #cancelTimer() {
+    if (this.#timer !== null) {
+      this.#clearTimer(this.#timer);
+      this.#timer = null;
+    }
+  }
+
+  #backoff() {
+    this.#currentRetryMs = Math.min(this.#currentRetryMs * 2, this.#maxRetryIntervalMs);
+    return this.#currentRetryMs;
+  }
+
+  #resetBackoff() {
+    this.#currentRetryMs = this.#retryIntervalMs;
+  }
+
+  /** Scheduler state, for tests and diagnostics. */
+  get recoveryState() {
+    return {
+      scheduled: this.#timer !== null,
+      suspendedReason: this.#suspendedReason,
+      nextRetryMs: this.#currentRetryMs,
+    };
   }
 
   #sdk() {
