@@ -206,10 +206,29 @@ test("lease-lost at prepare or at complete is benign — no throw, nothing publi
 });
 
 test("nothing to publish is a normal outcome, not an error", async () => {
-  const outbox = makeOutbox({ claims: [{ leased: false }] });
+  const outbox = makeOutbox({ claims: [{ leased: false, awaitingRootSignature: false }] });
   const { svc } = makeHarness({ outbox });
   const res = await svc.drainPublications();
   assert.deepEqual(res, { enabled: true, cycles: 1, publishedEpochs: [], stopped: "nothing-pending" });
+});
+
+test("AWAITING-ROOT-SIGNATURE stops the drain cleanly and is NOT reported as nothing-pending", async () => {
+  // A delegated device cannot author the root-signed authority state, so the node refuses it the
+  // lease. The worker must stop without taking, preparing, or failing anything — and must report a
+  // DISTINCT state, because this one means revocations are stuck until a primary session runs,
+  // whereas nothing-pending is the steady state.
+  const outbox = makeOutbox({ claims: [{ leased: false, awaitingRootSignature: true }] });
+  const { svc, logs, built } = makeHarness({ outbox });
+
+  const res = await svc.drainPublications();
+
+  assert.deepEqual(res, { enabled: true, cycles: 1, publishedEpochs: [], stopped: "awaiting-root-signature" });
+  assert.deepEqual(outbox.calls.map((c) => c.op), ["claim"], "no prepare, no fail — the obligation is untouched");
+  assert.equal(built.length, 0, "and no attempt to sign a record this device cannot sign");
+  assert.ok(
+    logs.warn.some((m) => m.includes("waiting for a primary")),
+    "the operator is told why revocations are not propagating",
+  );
 });
 
 test("a node without a propagation outbox is reported and skipped, not retried or thrown", async () => {

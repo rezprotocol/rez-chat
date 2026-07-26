@@ -7,7 +7,16 @@ import { BaseServerService } from "../base/BaseServerService.js";
  * The home enqueues a publication obligation inside the same transaction that folds a device
  * add/revoke, but it cannot discharge it: an AccountAuthorityStateV1 is ACCOUNT-signed and the
  * node holds no account key. This service is the authorized device that discharges it, one
- * lease at a time:
+ * lease at a time.
+ *
+ * WHO CAN DRAIN. Only a PRIMARY (account-root) session. Since the audit P0 fix the authority state
+ * is root-signed only — the record that decides who is authorized cannot be authored by a delegated
+ * signer, or the device a revocation names could rewrite it. The outbox stores an OBLIGATION, not a
+ * signed payload, so there is nothing for a delegated device to merely relay: authoring it requires
+ * the account key. A delegated session's claim is therefore refused with `awaitingRootSignature`
+ * and this service stops cleanly, without taking a lease it could only fail out of.
+ *
+ * The cycle:
  *
  *   claim   → take the account's single cluster-wide publication lease
  *   prepare → FREEZE the epoch M this lease will publish
@@ -92,7 +101,7 @@ export class ServerAuthorityPublicationService extends BaseServerService {
    * @param {number} [opts.maxCycles] — lease cycles to attempt before returning (default 4)
    * @returns {Promise<{ enabled: boolean, cycles: number, publishedEpochs: number[], stopped: string }>}
    *     `stopped` is why the drain ended: "disabled", "outbox-unavailable", "nothing-pending",
-   *     "lease-lost", or "max-cycles".
+   *     "awaiting-root-signature", "lease-lost", or "max-cycles".
    * @throws whatever failed while a lease was held — after reporting the failed attempt.
    */
   async drainPublications({ maxCycles = DEFAULT_MAX_CYCLES } = {}) {
@@ -116,6 +125,22 @@ export class ServerAuthorityPublicationService extends BaseServerService {
           return { enabled: true, cycles, publishedEpochs, stopped: "outbox-unavailable" };
         }
         throw err;
+      }
+      // AWAITING ROOT SIGNATURE. The account authority state is root-signed only, so a delegated
+      // device cannot author the publication. The node refuses the lease outright rather than
+      // handing over one this device could only fail out of — so nothing was attempted, nothing
+      // backed off, and the obligation stays immediately claimable by the primary.
+      //
+      // This is deliberately NOT folded into "nothing-pending": the two need different handling.
+      // Nothing-pending is the steady state; this one means revocations are NOT reaching off-home
+      // peers until a primary session runs, which a caller may want to surface to the user.
+      if (claim.awaitingRootSignature === true) {
+        this.logger.warn(
+          "[ServerAuthorityPublicationService] this device is delegated and the account authority state is"
+            + " root-signed only — the pending publication is waiting for a primary (account-root) session;"
+            + " revocations will not reach off-home peers until one runs",
+        );
+        return { enabled: true, cycles, publishedEpochs, stopped: "awaiting-root-signature" };
       }
       // Not leased: nothing pending, another device holds the lease, or the head is backing off
       // after a failed attempt. All three mean "not this device's turn right now".
