@@ -231,6 +231,22 @@ test("AWAITING-ROOT-SIGNATURE stops the drain cleanly and is NOT reported as not
   );
 });
 
+test("a claim that fails contract validation PROPAGATES — a version mismatch must not stall silently", async () => {
+  // Mixed-version fallback: a NEW SDK against an OLD node throws on claim (awaitingRootSignature is
+  // required). The worker must let that out. If it were swallowed the drain would report a clean
+  // "nothing-pending" forever while revocations never propagated — the exact silent stall the
+  // strict response gate exists to prevent.
+  const outbox = makeOutbox();
+  outbox.claim = async () => {
+    outbox.calls.push({ op: "claim" });
+    throw new Error("AccountOutboxCapability.claim: response is missing the required 'awaitingRootSignature' boolean");
+  };
+  const { svc } = makeHarness({ outbox });
+
+  await assert.rejects(() => svc.drainPublications(), /missing the required 'awaitingRootSignature'/);
+  assert.equal(outbox.calls.length, 1, "and it does not spin retrying a contract mismatch");
+});
+
 test("a node without a propagation outbox is reported and skipped, not retried or thrown", async () => {
   const outbox = makeOutbox({ failOn: "claim" });
   const { svc, logs } = makeHarness({ outbox });
