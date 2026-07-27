@@ -1563,7 +1563,21 @@ export class DesktopVaultService {
    * @param {(reason: string) => (void|Promise<void>)} handler
    */
   setAutoLockHandler(handler) {
-    this.#onAutoLock = typeof handler === "function" ? handler : null;
+    if (typeof handler !== "function") {
+      throw new Error("DesktopVaultService.setAutoLockHandler requires a function");
+    }
+    // ONE-TIME. A safety hook that can be replaced can be replaced with something weaker, or
+    // cleared entirely, by any code that runs later — and the failure would be invisible, because a
+    // vault with a silently-disabled handler looks exactly like one that is working. Registration
+    // happens once, in the DesktopSupervisor constructor; a second attempt is a wiring bug and
+    // fails loudly rather than winning.
+    if (this.#onAutoLock !== null) {
+      throw new Error(
+        "DesktopVaultService.setAutoLockHandler: an auto-lock handler is already registered and"
+          + " cannot be replaced — the safety hook is one-time by design",
+      );
+    }
+    this.#onAutoLock = handler;
   }
 
   #handleAutoLock(reason) {

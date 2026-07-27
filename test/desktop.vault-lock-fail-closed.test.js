@@ -17,9 +17,10 @@ import { DesktopVaultService } from "../src/desktop/runtime/DesktopVaultService.
 // walked-away-from-the-machine was the one that left the session fully live.
 
 /** A chat app whose chatServer getter reflects whether stopChatServer actually ran. */
-function makeChatApp({ stopThrows = null, stopSilentlyFails = false } = {}) {
+function makeChatApp({ stopThrows = null, stopSilentlyFails = false, terminalStopThrows = null } = {}) {
   const app = {
     stops: 0,
+    terminalStops: 0,
     _server: { id: "chat-server" },
     get chatServer() { return app._server; },
     async stopChatServer() {
@@ -29,7 +30,12 @@ function makeChatApp({ stopThrows = null, stopSilentlyFails = false } = {}) {
       // failing chatServer.stop(), so a failed teardown can return normally.
       if (!stopSilentlyFails) app._server = null;
     },
-    async stop() { app._server = null; },
+    // The TERMINAL escalation: full chat-app teardown (node + shell).
+    async stop() {
+      app.terminalStops += 1;
+      if (terminalStopThrows) throw terminalStopThrows;
+      app._server = null;
+    },
   };
   return app;
 }
@@ -75,32 +81,73 @@ test("lock() tears the chat runtime down, not just the vault", async () => {
   assert.equal(supervisor.status().runtimeConnected, false);
 });
 
-test("lock() STILL locks the vault when the runtime teardown throws", async () => {
-  // Zeroization is the one thing we can always do. Skipping it because something else failed would
-  // be strictly worse than a partial lock.
-  const { supervisor, vault, errors } = makeSupervisor({ stopThrows: new Error("stop exploded") });
+test("a graceful teardown that THROWS escalates to a terminal shutdown", async () => {
+  // Zeroization still happens (the `finally`), and the runtime is brought down the hard way rather
+  // than left live. A locked vault beside a running session is the original failure; reporting it
+  // accurately is not the same as fixing it.
+  const { supervisor, vault, chatApp, errors } = makeSupervisor({ stopThrows: new Error("stop exploded") });
   vault.unlock();
 
   const result = await supervisor.lock();
 
   assert.equal(vault.locked, true, "locked despite the failure");
-  assert.equal(result.runtimeStopped, false, "and honestly reports that the runtime is not down");
-  assert.ok(errors.some((m) => m.includes("the vault is LOCKED but the chat runtime was not")));
+  assert.equal(chatApp.terminalStops, 1, "escalated to a full chat-app shutdown");
+  assert.equal(result.runtimeStopped, true, "and the runtime really is down");
+  assert.equal(result.escalated, true, "reported as escalated, not as a clean lock");
+  assert.ok(errors.some((m) => m.includes("forcing a terminal shutdown")));
+  assert.equal(supervisor.status().lockIncomplete, false);
 });
 
-test("lock() detects a teardown that FAILED SILENTLY", async () => {
+test("a teardown that FAILS SILENTLY is caught by the post-condition and escalated", async () => {
   // chatApp.stopChatServer() logs and swallows a failing chatServer.stop(), so a broken teardown
-  // returns normally. Trusting the call would report a clean lock over a live session — so the
-  // post-condition is checked against the same signal status() reports.
-  const { supervisor, vault, chatApp, errors } = makeSupervisor({ stopSilentlyFails: true });
+  // returns normally. Trusting the call would leave a live session behind a "successful" lock.
+  const { supervisor, vault, chatApp } = makeSupervisor({ stopSilentlyFails: true });
   vault.unlock();
 
   const result = await supervisor.lock();
 
-  assert.equal(chatApp.chatServer !== null, true, "the server really is still attached");
-  assert.equal(vault.locked, true);
-  assert.equal(result.runtimeStopped, false, "not reported as a clean lock");
-  assert.ok(errors.some((m) => m.includes("still be live")));
+  assert.equal(chatApp.terminalStops, 1);
+  assert.equal(result.runtimeStopped, true);
+  assert.equal(result.escalated, true);
+});
+
+test("lock() THROWS LOCK_INCOMPLETE when even the terminal shutdown fails", async () => {
+  // The requirement in full: an incomplete lock must not be presentable as success. The IPC layer
+  // turns a throw into { ok: false, error: { code } } and the UI's unwrap() rethrows it, so no
+  // path can read this as a lock.
+  const { supervisor, vault, errors } = makeSupervisor({
+    stopSilentlyFails: true,
+    terminalStopThrows: new Error("terminal stop exploded"),
+  });
+  vault.unlock();
+
+  await assert.rejects(
+    () => supervisor.lock(),
+    (err) => {
+      assert.equal(err.code, "LOCK_INCOMPLETE");
+      return true;
+    },
+  );
+
+  assert.equal(vault.locked, true, "the vault is still locked — zeroization is unconditional");
+  assert.equal(supervisor.status().lockIncomplete, true, "and the unsafe state is OBSERVABLE, not just logged");
+  assert.ok(errors.some((m) => m.includes("LOCK INCOMPLETE")));
+});
+
+test("a successful lock CLEARS a previously-recorded incomplete state", async () => {
+  const { supervisor, vault, chatApp } = makeSupervisor({
+    stopSilentlyFails: true,
+    terminalStopThrows: new Error("terminal stop exploded"),
+  });
+  vault.unlock();
+  await assert.rejects(() => supervisor.lock(), /could not be stopped/);
+  assert.equal(supervisor.status().lockIncomplete, true);
+
+  // The runtime recovers; the next lock succeeds and the sticky flag clears.
+  chatApp._server = null;
+  const result = await supervisor.lock();
+  assert.equal(result.runtimeStopped, true);
+  assert.equal(supervisor.status().lockIncomplete, false);
 });
 
 test("the supervisor constructor ALWAYS registers the auto-lock handler", async () => {
@@ -117,15 +164,45 @@ test("the supervisor constructor ALWAYS registers the auto-lock handler", async 
   assert.equal(chatApp.chatServer, null);
 });
 
-test("an auto-lock whose teardown fails is reported, never silent", async () => {
-  const { supervisor, vault, errors } = makeSupervisor({ stopThrows: new Error("stop exploded") });
+test("a vault WITHOUT the auto-lock seam cannot build a supervisor at all", () => {
+  // Making it required is what stops the original bug recurring: the hook existed and nothing wired
+  // it, which no test could catch as long as wiring was optional.
+  class SeamlessVault extends FakeVault { }
+  const v = new SeamlessVault();
+  v.setAutoLockHandler = undefined;
+  assert.throws(
+    () => new DesktopSupervisor({ vault: v, chatApp: makeChatApp(), logger: makeLogger().logger }),
+    /requires a vault exposing setAutoLockHandler/,
+  );
+});
+
+test("auto-lock ESCALATES too — a failed teardown is not just logged", async () => {
+  // Nobody is awaiting an auto-lock, so there is no caller to retry and no error for a user to see.
+  // The escalation has to be self-contained.
+  const { supervisor, vault, chatApp } = makeSupervisor({ stopThrows: new Error("stop exploded") });
   void supervisor;
   vault.unlock();
 
   await vault.autoLockHandler("absolute_timeout");
 
-  assert.ok(errors.some((m) => m.includes("auto-lock (absolute_timeout)")));
-  assert.ok(errors.some((m) => m.includes("may still be live")));
+  assert.equal(chatApp.terminalStops, 1, "terminal shutdown ran without anyone asking");
+  assert.equal(chatApp.chatServer, null);
+});
+
+test("auto-lock records an unsafe state when every escalation fails (it cannot throw)", async () => {
+  const { supervisor, vault, errors } = makeSupervisor({
+    stopSilentlyFails: true,
+    terminalStopThrows: new Error("terminal stop exploded"),
+  });
+  vault.unlock();
+
+  // Must NOT reject — there is no caller to catch it, and an unhandled rejection would be worse
+  // than a recorded state.
+  await vault.autoLockHandler("idle_timeout");
+
+  assert.equal(supervisor.status().lockIncomplete, true, "observable via status()");
+  assert.ok(errors.some((m) => m.includes("LOCK INCOMPLETE")));
+  assert.ok(errors.some((m) => m.includes("auto-lock (idle_timeout)")));
 });
 
 // ── THE VAULT'S OWN TIMER PATH ─────────────────────────────────────────────────────────────────
@@ -196,5 +273,16 @@ test("a rejecting auto-lock handler is logged, not left as an unhandled rejectio
   }
 
   assert.ok(cap.errors.some((m) => m.includes("handler FAILED")), cap.errors.join("|"));
+  vault.close();
+});
+
+test("setAutoLockHandler is ONE-TIME — a safety hook must not be replaceable", async () => {
+  // A replaceable hook can be replaced with something weaker, or cleared entirely, by any code that
+  // runs later — and the failure would be invisible, because a vault with a silently-disabled
+  // handler looks exactly like a working one.
+  const vault = await unlockedVault({ idleTimeoutMs: 60_000 });
+  vault.setAutoLockHandler(() => {});
+  assert.throws(() => vault.setAutoLockHandler(() => {}), /one-time by design/);
+  assert.throws(() => vault.setAutoLockHandler(null), /requires a function/);
   vault.close();
 });

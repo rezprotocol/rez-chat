@@ -341,8 +341,12 @@ export class DesktopAccountAuthService {
   }
 
   async logout() {
-    this._account = null;
+    // LOCK FIRST. supervisor.lock() throws LOCK_INCOMPLETE when the vault locked but the chat
+    // runtime could not be stopped; clearing local state before that would leave the UI showing a
+    // half-logged-out session over a runtime that is still live. Local state is cleared only once
+    // the lock is known to have completed.
     await this._desktop.vault.lock();
+    this._account = null;
     const list = await this._authBootstrapService.listAccounts();
     this._sessionStore.setAccountList(list);
     if (list.length === 0) {

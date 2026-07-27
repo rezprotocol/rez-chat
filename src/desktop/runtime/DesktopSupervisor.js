@@ -28,6 +28,9 @@ export class DesktopSupervisor {
   #started;
   #chatAppListeners;
 
+  /** True when a lock left the runtime live and every escalation failed. Surfaced by status(). */
+  #lockIncomplete;
+
   constructor({
     vault,
     startRezChat = null,
@@ -48,13 +51,19 @@ export class DesktopSupervisor {
     this.#logger = logger || console;
     this.#started = false;
     this.#chatAppListeners = new Set();
+    this.#lockIncomplete = false;
     // AUDIT #4 — auto-lock must fail closed over the chat runtime. Registered HERE, unconditionally,
     // so it is intrinsic to having a supervisor rather than optional wiring a caller can forget: the
     // previous `onAutoLock` constructor option had no caller anywhere, so every idle/absolute
     // timeout locked the vault and left the runtime live.
-    if (typeof this.#vault.setAutoLockHandler === "function") {
-      this.#vault.setAutoLockHandler((reason) => this.#onVaultAutoLocked(reason));
+    if (typeof this.#vault.setAutoLockHandler !== "function") {
+      throw new Error(
+        "DesktopSupervisor requires a vault exposing setAutoLockHandler(): without it an idle or"
+          + " absolute timeout locks the vault and leaves the chat runtime live, which is the exact"
+          + " failure this wiring exists to prevent",
+      );
     }
+    this.#vault.setAutoLockHandler((reason) => this.#onVaultAutoLocked(reason));
   }
 
   /**
@@ -127,6 +136,9 @@ export class DesktopSupervisor {
     return {
       started: this.#started === true,
       runtimeConnected: this.#chatApp != null && this.#chatApp.chatServer != null,
+      // Sticky: a lock that could not stop the runtime is an unsafe state an operator must see,
+      // not a transient the next status() call washes away. Cleared only by a lock that succeeds.
+      lockIncomplete: this.#lockIncomplete === true,
       vault: vaultStatus,
     };
   }
@@ -250,13 +262,20 @@ export class DesktopSupervisor {
     } finally {
       this.#vault.lock();
     }
-    return this.#lockResult(teardownError, "lock");
+    // THROWS on an incomplete lock. A locked vault beside a verified-live runtime is the original
+    // security failure, merely reported accurately — so the caller must not be able to read it as
+    // success. The IPC layer turns this into { ok: false, error: { code: "LOCK_INCOMPLETE" } } and
+    // the UI's unwrap() rethrows it, so no path presents it as a lock.
+    return this.#finishLock(teardownError, "lock", true);
   }
 
   /**
    * The vault's idle/absolute timer already locked it; bring the runtime down to match.
-   * Same teardown as an explicit lock — an auto-lock that left the session live would be exactly
-   * the hole the explicit path just closed.
+   *
+   * NOBODY IS AWAITING THIS. There is no user to see a thrown error and no caller to retry, so
+   * escalation has to be self-contained: a failed graceful teardown is followed by a TERMINAL
+   * shutdown of the whole chat app, and if even that fails the supervisor records an unsafe state
+   * that `status()` reports rather than leaving the fact in a log line nobody reads.
    */
   async #onVaultAutoLocked(reason) {
     let teardownError = null;
@@ -265,28 +284,72 @@ export class DesktopSupervisor {
     } catch (err) {
       teardownError = err;
     }
-    this.#lockResult(teardownError, "auto-lock (" + reason + ")");
+    await this.#finishLock(teardownError, "auto-lock (" + reason + ")", false);
+  }
+
+  /** Is the chat runtime actually down? The same signal status() reports — checked, not assumed. */
+  #runtimeIsDown() {
+    return this.#chatApp == null || this.#chatApp.chatServer == null;
   }
 
   /**
-   * Verify the runtime is actually down, rather than trusting the teardown call.
+   * Verify the post-condition, ESCALATE if it failed, and only then decide the outcome.
    *
-   * chatApp.stopChatServer() logs and swallows a failing `chatServer.stop()`, so a failed teardown
-   * can return normally. For a security boundary that is the wrong shape — so the POST-CONDITION is
-   * checked directly against the same signal `status()` reports.
+   * chatApp.stopChatServer() logs and swallows a failing chatServer.stop(), so a broken teardown
+   * returns normally — trusting it would report a clean lock over a live session. When the graceful
+   * path leaves the runtime up, the escalation is a full `chatApp.stop()`: it costs the next unlock
+   * a cold boot, which is the right trade against leaving an unlocked session running.
+   *
+   * @param {Error|null} teardownError
+   * @param {string} label
+   * @param {boolean} throwOnFailure — true for the explicit path (a caller is waiting)
    */
-  #lockResult(teardownError, label) {
-    const stillRunning = this.#chatApp != null && this.#chatApp.chatServer != null;
-    const status = this.#vault.status();
-    if (teardownError || stillRunning) {
-      const detail = teardownError && teardownError.message ? teardownError.message : "chat-server is still attached";
-      if (this.#logger && typeof this.#logger.error === "function") {
-        this.#logger.error("[desktop] " + label + ": the vault is LOCKED but the chat runtime was not"
-          + " fully torn down — the session may still be live: " + detail);
-      }
-      return { ...status, runtimeStopped: false };
+  async #finishLock(teardownError, label, throwOnFailure) {
+    if (this.#runtimeIsDown()) {
+      this.#lockIncomplete = false;
+      return { ...this.#vault.status(), runtimeStopped: true, escalated: false };
     }
-    return { ...status, runtimeStopped: true };
+    const detail = teardownError && teardownError.message ? teardownError.message : "chat-server is still attached";
+    if (this.#logger && typeof this.#logger.error === "function") {
+      this.#logger.error("[desktop] " + label + ": graceful teardown left the chat runtime LIVE ("
+        + detail + ") — forcing a terminal shutdown");
+    }
+    const forced = await this.#forceRuntimeShutdown(label);
+    if (forced && this.#runtimeIsDown()) {
+      this.#lockIncomplete = false;
+      return { ...this.#vault.status(), runtimeStopped: true, escalated: true };
+    }
+    // Nothing left to try. Record it so it is observable in status(), not only in a log.
+    this.#lockIncomplete = true;
+    if (this.#logger && typeof this.#logger.error === "function") {
+      this.#logger.error("[desktop] " + label + ": LOCK INCOMPLETE — the vault is locked but the chat"
+        + " runtime could not be stopped and may still be live. Manual intervention required.");
+    }
+    if (throwOnFailure) {
+      const err = new Error("the vault is locked but the chat runtime could not be stopped");
+      err.code = "LOCK_INCOMPLETE";
+      throw err;
+    }
+    return { ...this.#vault.status(), runtimeStopped: false, escalated: true };
+  }
+
+  /** Terminal teardown: stop the whole chat app (node + shell), not just the chat-server. */
+  async #forceRuntimeShutdown(label) {
+    const app = this.#chatApp;
+    if (!app) return true;
+    try {
+      if (typeof app.stop === "function") await app.stop();
+      // Cleared so supervisor.stop() does not double-stop, matching the legacy disconnect path.
+      this.#chatApp = null;
+      this.#notifyChatAppListeners();
+      return true;
+    } catch (err) {
+      if (this.#logger && typeof this.#logger.error === "function") {
+        this.#logger.error("[desktop] " + label + ": terminal chat-app shutdown FAILED: "
+          + (err && err.message ? err.message : err));
+      }
+      return false;
+    }
   }
 
   /**

@@ -50,6 +50,12 @@ class FakeVault {
     return this.status();
   }
 
+  // Required by DesktopSupervisor: a vault without this seam cannot have its auto-lock wired, which
+  // is exactly the hole audit #4 found. The constructor refuses one, so every double must offer it.
+  setAutoLockHandler(handler) {
+    this.autoLockHandler = handler;
+  }
+
   getActiveIdentitySummary() {
     return this.locked ? null : this.identity;
   }
