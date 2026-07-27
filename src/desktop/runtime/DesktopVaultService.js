@@ -156,7 +156,6 @@ export class DesktopVaultService {
     database = null,
     idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
     absoluteTimeoutMs = DEFAULT_ABSOLUTE_TIMEOUT_MS,
-    onAutoLock = null,
   } = {}) {
     const resolvedPath = normalizeString(dbPath);
     if (!resolvedPath && !database) {
@@ -176,7 +175,7 @@ export class DesktopVaultService {
     this.#idleTimer = null;
     this.#absoluteTimer = null;
     this.#unlockedAtMs = 0;
-    this.#onAutoLock = typeof onAutoLock === "function" ? onAutoLock : null;
+    this.#onAutoLock = null;
     this.#backupAead = null;
   }
 
@@ -1551,19 +1550,45 @@ export class DesktopVaultService {
     this.#unlockedAtMs = 0;
   }
 
+  /**
+   * Register the handler that must run when a TIMER locks the vault.
+   *
+   * The single mechanism, deliberately a setter rather than a constructor option: the vault is
+   * built before the supervisor that owns the runtime teardown, so it cannot be passed in. The
+   * DesktopSupervisor constructor always registers, which is what makes "an auto-lock tears down
+   * the chat runtime" intrinsic to having a supervisor at all rather than optional wiring someone
+   * can forget. It replaced an `onAutoLock` constructor option that had NO caller anywhere — so
+   * every auto-lock silently notified nobody.
+   *
+   * @param {(reason: string) => (void|Promise<void>)} handler
+   */
+  setAutoLockHandler(handler) {
+    this.#onAutoLock = typeof handler === "function" ? handler : null;
+  }
+
   #handleAutoLock(reason) {
     // The vault may already have been locked by an explicit `lock()` call
     // since the timer was armed. In that case do nothing.
     if (!this.#activeAccount) return;
     this.lock();
-    if (this.#onAutoLock) {
-      try {
-        this.#onAutoLock(reason);
-      } catch (err) {
-        console.error("[DesktopVaultService] onAutoLock callback failed: "
-          + (err && err.message ? err.message : err));
-      }
+    if (!this.#onAutoLock) {
+      // Locking the vault zeroes ITS copy of the keys and nothing else. If nobody is listening,
+      // the chat runtime keeps running with its own live session — so a missing handler is a
+      // security-relevant misconfiguration, not a quiet default.
+      console.error("[DesktopVaultService] auto-lock (" + reason + ") fired with NO handler"
+        + " registered — the vault is locked but the chat runtime was not torn down");
+      return;
     }
+    // The handler tears down a running runtime, so it is async. Await it here (fire-and-forget
+    // from the timer's perspective) rather than dropping the promise, or a rejection would surface
+    // as an unhandled rejection and the failure would be invisible.
+    Promise.resolve()
+      .then(() => this.#onAutoLock(reason))
+      .catch((err) => {
+        console.error("[DesktopVaultService] auto-lock (" + reason + ") handler FAILED — the vault"
+          + " is locked but the chat runtime may still be live: "
+          + (err && err.message ? err.message : err));
+      });
   }
 
   #migrate() {

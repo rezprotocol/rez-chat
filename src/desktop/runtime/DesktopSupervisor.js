@@ -48,6 +48,13 @@ export class DesktopSupervisor {
     this.#logger = logger || console;
     this.#started = false;
     this.#chatAppListeners = new Set();
+    // AUDIT #4 — auto-lock must fail closed over the chat runtime. Registered HERE, unconditionally,
+    // so it is intrinsic to having a supervisor rather than optional wiring a caller can forget: the
+    // previous `onAutoLock` constructor option had no caller anywhere, so every idle/absolute
+    // timeout locked the vault and left the runtime live.
+    if (typeof this.#vault.setAutoLockHandler === "function") {
+      this.#vault.setAutoLockHandler((reason) => this.#onVaultAutoLocked(reason));
+    }
   }
 
   /**
@@ -219,8 +226,67 @@ export class DesktopSupervisor {
     return this.#vault.disableDeviceUnlock(params);
   }
 
-  lock() {
-    return this.#vault.lock();
+  /**
+   * Lock the vault AND tear down the chat runtime (audit #4).
+   *
+   * Locking used to mean `vault.lock()` and nothing else — which zeroes the vault's own copy of the
+   * keys while the chat-server keeps running: still connected to the node, still holding its own
+   * identity, still sending and receiving. "Locked" was a UI state, not a security boundary.
+   *
+   * ORDER AND GUARANTEE. The runtime is torn down FIRST (stop new work), but the vault lock runs in
+   * a `finally` so it happens even if teardown throws — zeroization is the one thing we can always
+   * do, and skipping it because something else failed would be strictly worse. A teardown failure
+   * is then reported, not swallowed: the returned status carries `runtimeStopped: false` and the
+   * failure is logged as the security event it is.
+   *
+   * @returns {Promise<object>} the vault status, plus `runtimeStopped`
+   */
+  async lock() {
+    let teardownError = null;
+    try {
+      await this.disconnect();
+    } catch (err) {
+      teardownError = err;
+    } finally {
+      this.#vault.lock();
+    }
+    return this.#lockResult(teardownError, "lock");
+  }
+
+  /**
+   * The vault's idle/absolute timer already locked it; bring the runtime down to match.
+   * Same teardown as an explicit lock — an auto-lock that left the session live would be exactly
+   * the hole the explicit path just closed.
+   */
+  async #onVaultAutoLocked(reason) {
+    let teardownError = null;
+    try {
+      await this.disconnect();
+    } catch (err) {
+      teardownError = err;
+    }
+    this.#lockResult(teardownError, "auto-lock (" + reason + ")");
+  }
+
+  /**
+   * Verify the runtime is actually down, rather than trusting the teardown call.
+   *
+   * chatApp.stopChatServer() logs and swallows a failing `chatServer.stop()`, so a failed teardown
+   * can return normally. For a security boundary that is the wrong shape — so the POST-CONDITION is
+   * checked directly against the same signal `status()` reports.
+   */
+  #lockResult(teardownError, label) {
+    const stillRunning = this.#chatApp != null && this.#chatApp.chatServer != null;
+    const status = this.#vault.status();
+    if (teardownError || stillRunning) {
+      const detail = teardownError && teardownError.message ? teardownError.message : "chat-server is still attached";
+      if (this.#logger && typeof this.#logger.error === "function") {
+        this.#logger.error("[desktop] " + label + ": the vault is LOCKED but the chat runtime was not"
+          + " fully torn down — the session may still be live: " + detail);
+      }
+      return { ...status, runtimeStopped: false };
+    }
+    return { ...status, runtimeStopped: true };
   }
 
   /**
