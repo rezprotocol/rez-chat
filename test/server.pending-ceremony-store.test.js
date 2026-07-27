@@ -69,11 +69,11 @@ test("RULE 1 — a second registration for the same device is REFUSED while one 
   await store.createPending(fields());
   await assert.rejects(
     () => store.createPending(fields({ certId: "rez:cap:" + "d".repeat(64) })),
-    /already has a pending registration — resume or revoke it before starting another/,
+    /already has a registration in state pending — resume or revoke it before starting another/,
   );
 
   await store.markPublished(DEVICE);
-  await assert.rejects(() => store.createPending(fields()), /already has a published registration/);
+  await assert.rejects(() => store.createPending(fields()), /already has a registration in state published/);
 
   // Once terminal, a fresh ceremony for that device is fine.
   await store.markConfirmed(DEVICE);
@@ -169,9 +169,14 @@ test("listExpirable finds pending registrations past their deadline", async () =
   assert.equal(due.length, 1);
   assert.equal(due[0].deviceId, DEVICE);
 
-  // Published registrations are never "expirable" — they already did their job.
+  // A published registration is not "expirable" — it owes no publication, so there is nothing for
+  // the RESUME pass to do. That is NOT the same as "job done", and reading it that way was the gap
+  // audit #3 found: a published registration is precisely the one whose leaf is in the wild, so if
+  // it then expires unconfirmed it is the most important thing to compensate. `listCompensatable`
+  // is the work-list that covers it (see server.ceremony-recovery.test.js).
   await store.markPublished(DEVICE);
-  assert.equal((await store.listExpirable()).length, 0);
+  assert.equal((await store.listExpirable()).length, 0, "nothing left to publish");
+  assert.equal((await store.listCompensatable()).length, 1, "but it DOES still need compensating");
 });
 
 test("a corrupt row THROWS rather than reading as 'no pending registration'", async () => {

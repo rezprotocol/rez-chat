@@ -10,6 +10,14 @@ import { DeviceLinkApproveResult } from "../../records/results/DeviceLinkApprove
 import { DeviceLinkCancelResult } from "../../records/results/DeviceLinkCancelResult.js";
 import { DeviceLinkUpdatedEvent } from "../../records/events/DeviceLinkUpdatedEvent.js";
 import { PendingCeremonyStore } from "../storage/PendingCeremonyStore.js";
+import { CeremonyRecoveryWorker } from "./CeremonyRecoveryWorker.js";
+
+// The recovery sweep cadence. A ceremony's own deadline is minutes, so this only has to be well
+// under the window in which an abandoned registration matters — not fast.
+const DEFAULT_RECOVERY_INTERVAL_MS = 120_000;
+// While a ceremony is live the sweep stands down entirely (see #recoverNow). Ceremonies are
+// single-instance and deadline-bounded, so this cannot starve recovery — it just defers it.
+const DEFERRED_RECOVERY_RETRY_MS = 15_000;
 
 /**
  * ServerDeviceLinkService — the PRIMARY-device approver flow of the S10 PSK
@@ -45,11 +53,39 @@ export class ServerDeviceLinkService extends BaseServerService {
   #clock;
   #ceremony; // null | { approver, state, expiresAtMs, pending, resolveApproval, rejectApproval, driver }
   #pendingCeremonies;
+  #recovery;
+  #recoveryIntervalMs;
+  #timer;
+  #setTimer;
+  #clearTimer;
+  #offReconnect;
+  #stopped;
+  #sweeping;
 
-  constructor({ bus, ownerAccountId, storageProvider = null, clock = () => Date.now(), logger = console } = {}) {
+  constructor({
+    bus,
+    ownerAccountId,
+    storageProvider = null,
+    clock = () => Date.now(),
+    logger = console,
+    recoveryIntervalMs = DEFAULT_RECOVERY_INTERVAL_MS,
+    // Injectable so tests drive the sweep schedule deterministically.
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (handle) => clearTimeout(handle),
+  } = {}) {
     super({ bus, ownerAccountId, logger });
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
     this.#ceremony = null;
+    this.#recovery = null;
+    this.#recoveryIntervalMs = Number.isFinite(recoveryIntervalMs) && recoveryIntervalMs > 0
+      ? Number(recoveryIntervalMs)
+      : DEFAULT_RECOVERY_INTERVAL_MS;
+    this.#setTimer = typeof setTimer === "function" ? setTimer : ((fn, ms) => setTimeout(fn, ms));
+    this.#clearTimer = typeof clearTimer === "function" ? clearTimer : ((handle) => clearTimeout(handle));
+    this.#timer = null;
+    this.#offReconnect = null;
+    this.#stopped = false;
+    this.#sweeping = false;
     // The durable persist-and-resume journal (P1#2a). Required to run a ceremony at all — a
     // registration with nothing to resume from cannot be recovered, only abandoned — but the
     // service still constructs without it so non-linking boots are unaffected; startCeremony is
@@ -65,6 +101,114 @@ export class ServerDeviceLinkService extends BaseServerService {
 
   #sdk() {
     return this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
+  }
+
+  // ── Recovery lifecycle (audit finding #3) ───────────────────────────────────────────────────
+  // The journal was durable and never read back. This is its reader: a sweep at start, on every
+  // reconnect, and periodically, republishing what is still in time and compensating what is not.
+
+  /**
+   * True while a ceremony owns the journal. The whole sweep defers on this rather than trying to
+   * interleave: the ceremony's own critical section (persist → device.add → publish →
+   * markPublished) and its confirmation poll BOTH write the journal, and a sweep running inside
+   * either could republish a response the approver is about to publish, or compensate a
+   * registration whose confirmation is a millisecond away. A ceremony is single-instance and
+   * deadline-bounded, so deferring cannot starve recovery.
+   */
+  _ceremonyIsActive() {
+    const c = this.#ceremony;
+    if (!c) return false;
+    return c.state !== "done" && c.state !== "failed" && c.state !== "expired"
+      && c.state !== "cancelled" && c.state !== "confirmed";
+  }
+
+  #buildRecoveryWorker() {
+    const sdk = this.#sdk();
+    if (!this.#pendingCeremonies) return null;
+    if (!sdk || !sdk.durableRecords || typeof sdk.durableRecords.put !== "function") return null;
+    if (!sdk.devices || typeof sdk.devices.getAuthorityState !== "function") return null;
+    return new CeremonyRecoveryWorker({
+      journal: this.#pendingCeremonies,
+      records: sdk.durableRecords,
+      // Routed through the SAME directive the ceremony itself uses, so a compensating revoke gets
+      // the identical serialization, propagation and reporting as any other device mutation.
+      submitMutation: ({ action, target }) => this._call("account-mutation", "submit", {
+        action,
+        target,
+        signWith: "account",
+      }),
+      getAuthorityState: () => sdk.devices.getAuthorityState(),
+      clock: this.#clock,
+      logger: this.logger,
+    });
+  }
+
+  /**
+   * Run one sweep if nothing else owns the journal. Never throws — this is the self-driven entry
+   * point, and a recovery failure must not take the chat server down at boot.
+   * @returns {Promise<object|null>} the sweep result, or null when it did not run
+   */
+  async recoverNow(trigger) {
+    if (this.#stopped || this.#sweeping) return null;
+    if (this._ceremonyIsActive()) {
+      this.logger.info("[ServerDeviceLinkService] deferring ceremony recovery (" + trigger
+        + "): a link ceremony is in progress and owns the journal");
+      this.#scheduleNext(DEFERRED_RECOVERY_RETRY_MS);
+      return null;
+    }
+    if (this.#recovery === null) this.#recovery = this.#buildRecoveryWorker();
+    if (this.#recovery === null) {
+      // No journal or no durable-record/devices surface: this runtime cannot link devices at all,
+      // so it has no registrations to recover. Said once, at info, not on every tick.
+      this.#scheduleNext(this.#recoveryIntervalMs);
+      return null;
+    }
+    this.#sweeping = true;
+    let result = null;
+    try {
+      result = await this.#recovery.sweep({});
+      if (result.republished.length > 0 || result.revoked.length > 0 || result.disproven.length > 0) {
+        this.logger.info("[ServerDeviceLinkService] ceremony recovery (" + trigger + "): "
+          + result.republished.length + " republished, " + result.revoked.length + " revoked, "
+          + result.disproven.length + " disproven, " + result.retained.length + " retained");
+      }
+    } catch (err) {
+      this.logger.error("[ServerDeviceLinkService] ceremony recovery sweep (" + trigger + ") failed: "
+        + (err && err.message ? err.message : err));
+    } finally {
+      this.#sweeping = false;
+      this.#scheduleNext(this.#recoveryIntervalMs);
+    }
+    return result;
+  }
+
+  #scheduleNext(delayMs) {
+    if (this.#timer !== null) {
+      this.#clearTimer(this.#timer);
+      this.#timer = null;
+    }
+    if (this.#stopped) return;
+    this.#timer = this.#setTimer(() => {
+      this.#timer = null;
+      // Returned, not dropped: real timers ignore it, an injected scheduler can await it.
+      return this.recoverNow("periodic");
+    }, delayMs);
+    if (this.#timer && typeof this.#timer.unref === "function") this.#timer.unref();
+  }
+
+  async start() {
+    this.#stopped = false;
+    const sdk = this.#sdk();
+    const connectivity = sdk && sdk.connectivity ? sdk.connectivity : null;
+    if (connectivity && typeof connectivity.onReconnected === "function") {
+      this.#offReconnect = connectivity.onReconnected(() => {
+        // A new session may reach a home that can now answer the authority reads a previous sweep
+        // could not, so every reconnect gets a fresh attempt.
+        this.#recovery = null;
+        return this.recoverNow("reconnect");
+      });
+    }
+    await this.recoverNow("startup");
   }
 
   #emitUpdated(fields) {
@@ -319,6 +463,20 @@ export class ServerDeviceLinkService extends BaseServerService {
   }
 
   async stop() {
+    this.#stopped = true;
+    if (this.#timer !== null) {
+      this.#clearTimer(this.#timer);
+      this.#timer = null;
+    }
+    if (typeof this.#offReconnect === "function") {
+      try {
+        this.#offReconnect();
+      } catch (err) {
+        this.logger.error("[ServerDeviceLinkService] reconnect unsubscribe failed: "
+          + (err && err.message ? err.message : err));
+      }
+      this.#offReconnect = null;
+    }
     if (this.#ceremony) {
       await this.cancelCeremony({});
       if (this.#ceremony.driver) {
@@ -327,5 +485,10 @@ export class ServerDeviceLinkService extends BaseServerService {
       this.#ceremony = null;
     }
     await super.stop();
+  }
+
+  /** Recovery scheduler state, for tests and diagnostics. */
+  get recoveryState() {
+    return { scheduled: this.#timer !== null, sweeping: this.#sweeping, ceremonyActive: this._ceremonyIsActive() };
   }
 }
