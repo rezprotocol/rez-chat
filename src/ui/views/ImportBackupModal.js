@@ -17,7 +17,7 @@ export class ImportBackupModal extends ModalView {
 
   constructor({ bus } = {}) {
     super({ bus });
-    this.#step = "pick";
+    this.#step = this.#desktop() ? "pick" : "browser-form";
     this.#envelope = null;
     this.#errorText = "";
     this.#busy = false;
@@ -29,7 +29,94 @@ export class ImportBackupModal extends ModalView {
 
   renderContent() {
     if (this.#step === "form") return this.#renderFormStep();
+    if (this.#step === "browser-form") return this.#renderBrowserFormStep();
     return this.#renderPickStep();
+  }
+
+  #renderBrowserFormStep() {
+    const nameInput = h("input", {
+      type: "text",
+      autocomplete: "username",
+      className: "bg-surface-container-high border border-outline-variant/40 rounded-lg px-space-md py-2 text-label-technical font-label-technical text-on-surface placeholder:text-outline-variant focus:border-primary/60 focus:ring-1 focus:ring-primary/30 focus:outline-none transition-all w-full",
+      placeholder: "Display name",
+    });
+    const phraseInput = h("textarea", {
+      rows: "3",
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "off",
+      spellcheck: "false",
+      className: "bg-surface-container-high border border-outline-variant/40 rounded-lg px-space-md py-2 text-label-technical font-label-technical text-on-surface placeholder:text-outline-variant focus:border-primary/60 focus:ring-1 focus:ring-primary/30 focus:outline-none transition-all w-full resize-none",
+      placeholder: "Enter the 24-word recovery phrase",
+    });
+    const passwordInput = h("input", {
+      type: "password",
+      autocomplete: "new-password",
+      className: "bg-surface-container-high border border-outline-variant/40 rounded-lg px-space-md py-2 text-label-technical font-label-technical text-on-surface placeholder:text-outline-variant focus:border-primary/60 focus:ring-1 focus:ring-primary/30 focus:outline-none transition-all w-full",
+      placeholder: "New password (8+ characters)",
+    });
+    const confirmInput = h("input", {
+      type: "password",
+      autocomplete: "new-password",
+      className: "bg-surface-container-high border border-outline-variant/40 rounded-lg px-space-md py-2 text-label-technical font-label-technical text-on-surface placeholder:text-outline-variant focus:border-primary/60 focus:ring-1 focus:ring-primary/30 focus:outline-none transition-all w-full",
+      placeholder: "Confirm new password",
+    });
+    const errorEl = h("p", {
+      className: this.#errorText ? "text-label-micro font-label-technical text-error" : "hidden",
+    }, this.#errorText);
+    const submitBtn = h("button", {
+      type: "submit",
+      disabled: this.#busy,
+      className: "bg-primary-container text-on-primary-container px-space-md py-2 rounded-lg font-label-technical text-label-technical font-bold hover:bg-primary hover:text-on-primary transition-all cursor-pointer disabled:opacity-50",
+    }, this.#busy ? "Recovering..." : "Recover account");
+    const cancelBtn = h("button", {
+      type: "button",
+      className: "bg-surface-container-high border border-outline-variant/40 px-space-md py-2 rounded-lg text-on-surface-variant font-label-technical text-label-technical font-bold hover:border-primary/40 hover:text-on-surface transition-all cursor-pointer",
+    }, "Cancel");
+    cancelBtn.addEventListener("click", () => this.close());
+    const form = h("form", { className: "flex flex-col gap-space-md" }, [
+      h("p", { className: "text-body-sm font-body-sm text-on-surface-variant" },
+        "Your phrase restores the same Rez account identity and creates a new browser device. Local-only message history is not contained in the phrase; exportable full-history backups remain a desktop feature."),
+      nameInput,
+      phraseInput,
+      passwordInput,
+      confirmInput,
+      errorEl,
+      h("div", { className: "flex gap-space-md justify-end" }, [cancelBtn, submitBtn]),
+    ]);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (this.#busy) return;
+      const mnemonic = String(phraseInput.value || "").trim().replace(/\s+/g, " ");
+      const newPassword = String(passwordInput.value || "");
+      const confirm = String(confirmInput.value || "");
+      if (!mnemonic) this.#errorText = "Enter the recovery phrase.";
+      else if (newPassword.length < 8) this.#errorText = "New password must be at least 8 characters.";
+      else if (newPassword !== confirm) this.#errorText = "New password and confirmation do not match.";
+      else this.#errorText = "";
+      if (this.#errorText) {
+        this.#rerender();
+        return;
+      }
+      this.#busy = true;
+      this.#rerender();
+      try {
+        await this.bus.call("session", "restoreWithMnemonic", {
+          mnemonic,
+          newPassword,
+          profileName: String(nameInput.value || "").trim() || "Recovered account",
+        });
+        this.close();
+      } catch (err) {
+        this.#errorText = err && err.message ? err.message : "Could not recover account.";
+        this.#busy = false;
+        this.#rerender();
+      }
+    });
+    return h("div", { className: "p-space-lg flex flex-col gap-space-md" }, [
+      h("h3", { className: "text-headline-sm font-headline-sm text-on-surface" }, "Recover with phrase"),
+      form,
+    ]);
   }
 
   #renderPickStep() {

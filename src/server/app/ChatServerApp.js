@@ -1,32 +1,34 @@
-import { ThreadStoreService, ThreadIndexService, ContactStore, ConnectRequestStore, GroupStore, ChannelStore, LinkPreviewStore, DeviceFanoutCacheStore } from "../storage/index.js";
+import { ThreadStoreService } from "../storage/ChatThreadStore.js";
+import { ThreadIndexService } from "../storage/ChatThreadIndex.js";
+import { ContactStore } from "../storage/ChatContactStore.js";
+import { ConnectRequestStore } from "../storage/ConnectRequestStore.js";
+import { GroupStore } from "../storage/ChatGroupStore.js";
+import { ChannelStore } from "../storage/ChatChannelStore.js";
+import { DeviceFanoutCacheStore } from "../storage/DeviceFanoutCacheStore.js";
 import { ChatServerBus } from "./ChatServerBus.js";
 import { ChatBridge } from "../transport/ChatBridge.js";
 import { InboundDepositPipeline } from "../runtime/InboundDepositPipeline.js";
 import { ProcessedDepositLog } from "../inbox/ProcessedDepositLog.js";
 import { InboundApplyOutbox } from "../inbox/InboundApplyOutbox.js";
-import {
-  ServerRuntimeService,
-  ServerSessionService,
-  ServerThreadsService,
-  ServerMessagesService,
-  ServerContactsService,
-  ServerGroupsService,
-  ServerChannelsService,
-  ServerInvitesService,
-  ServerConnectionService,
-  ServerEventService,
-  ServerPeerLinkProtocolService,
-  ServerDeviceSetService,
-  ServerAccountMutationService,
-  ServerAuthorityPublicationService,
-  ServerDeviceLinkService,
-  ServerAccountStateSyncService,
-  ServerFileTransferService,
-  ServerProfileService,
-  ServerLinksService,
-  InboxCatchupService,
-  GlobalGroupLookup,
-} from "../services/index.js";
+import { ServerRuntimeService } from "../services/ServerRuntimeService.js";
+import { ServerSessionService } from "../services/ServerSessionService.js";
+import { ServerThreadsService } from "../services/ServerThreadsService.js";
+import { ServerMessagesService } from "../services/ServerMessagesService.js";
+import { ServerContactsService } from "../services/ServerContactsService.js";
+import { ServerGroupsService } from "../services/ServerGroupsService.js";
+import { ServerChannelsService } from "../services/ServerChannelsService.js";
+import { ServerInvitesService } from "../services/ServerInvitesService.js";
+import { ServerConnectionService } from "../services/ServerConnectionService.js";
+import { ServerEventService } from "../services/ServerEventService.js";
+import { ServerPeerLinkProtocolService } from "../services/ServerPeerLinkProtocolService.js";
+import { ServerDeviceSetService } from "../services/ServerDeviceSetService.js";
+import { ServerAccountMutationService } from "../services/ServerAccountMutationService.js";
+import { ServerAuthorityPublicationService } from "../services/ServerAuthorityPublicationService.js";
+import { ServerAccountStateSyncService } from "../services/ServerAccountStateSyncService.js";
+import { ServerFileTransferService } from "../services/ServerFileTransferService.js";
+import { ServerProfileService } from "../services/ServerProfileService.js";
+import { InboxCatchupService } from "../services/InboxCatchupService.js";
+import { GlobalGroupLookup } from "../services/GlobalGroupLookup.js";
 
 export class ChatServerApp {
   #started;
@@ -48,6 +50,9 @@ export class ChatServerApp {
     expectedNodePublicKeyB64 = "",
     accountAuthority = null,
     accountIdentityDhKeyPair = null,
+    wsFactory = null,
+    linksServiceFactory = null,
+    deviceLinkServiceFactory = null,
     logger = console,
   } = {}) {
     if (!Array.isArray(uplinks) || uplinks.length === 0) {
@@ -82,7 +87,19 @@ export class ChatServerApp {
     // from the vault via bootstrapChatServer; null on legacy/web vaults
     // (deviceLink.start fails loud with a typed error).
     this.bus.runtime.accountIdentityDhKeyPair = accountIdentityDhKeyPair;
-    this.#createServices({ identity, uplinks, clock, sdk, peerLinkService, inboxClaimant, expectedNodePublicKeyB64, logger });
+    this.#createServices({
+      identity,
+      uplinks,
+      clock,
+      sdk,
+      peerLinkService,
+      inboxClaimant,
+      expectedNodePublicKeyB64,
+      wsFactory,
+      linksServiceFactory,
+      deviceLinkServiceFactory,
+      logger,
+    });
     this.#bridge = new ChatBridge({
       bus: this.bus,
       ownerAccountId: this.#ownerAccountId,
@@ -191,10 +208,6 @@ export class ChatServerApp {
       storageProvider,
       clock: this.#clock,
     });
-    this.bus.stores.linkPreviewStore = new LinkPreviewStore({
-      storageProvider,
-      clock: this.#clock,
-    });
     // Durable per-(messageId, peerDeviceId) sealed-ciphertext cache so a send
     // retry — including one after a sender restart — replays identical bytes
     // instead of re-encrypting (Audit R3 #4). Only exercised on the gated
@@ -208,7 +221,19 @@ export class ChatServerApp {
     });
   }
 
-  #createServices({ identity, uplinks, clock, sdk, peerLinkService, inboxClaimant, expectedNodePublicKeyB64, logger }) {
+  #createServices({
+    identity,
+    uplinks,
+    clock,
+    sdk,
+    peerLinkService,
+    inboxClaimant,
+    expectedNodePublicKeyB64,
+    wsFactory,
+    linksServiceFactory,
+    deviceLinkServiceFactory,
+    logger,
+  }) {
     const services = {
       runtime: new ServerRuntimeService({
         bus: this.bus,
@@ -218,6 +243,7 @@ export class ChatServerApp {
         peerLinkService,
         inboxClaimant,
         expectedNodePublicKeyB64,
+        wsFactory,
         logger,
       }),
       session: new ServerSessionService({
@@ -295,13 +321,6 @@ export class ChatServerApp {
         clock,
         logger,
       }),
-      links: new ServerLinksService({
-        bus: this.bus,
-        linkPreviewStore: this.bus.stores.linkPreviewStore,
-        ownerAccountId: this.#ownerAccountId,
-        clock,
-        logger,
-      }),
       events: new ServerEventService({
         bus: this.bus,
         ownerAccountId: this.#ownerAccountId,
@@ -343,17 +362,6 @@ export class ChatServerApp {
         clock,
         logger,
       }),
-      // S10: the PSK device-link approver flow (primary side). Directives
-      // fail loud with typed errors on delegated / pre-migration boots.
-      deviceLink: new ServerDeviceLinkService({
-        bus: this.bus,
-        ownerAccountId: this.#ownerAccountId,
-        // P1#2a: backs the pending-ceremony journal, so a device-link registration is durable
-        // before device.add and resumable after a crash.
-        storageProvider: this.#storageProvider,
-        clock,
-        logger,
-      }),
       // S14: cross-device account-state sync. Fans relationship-graph deltas
       // (contacts, direct threads) to sibling device inboxes so a sibling that
       // never took part in an invite surfaces (and can reply to) a peer's
@@ -366,6 +374,32 @@ export class ChatServerApp {
         logger,
       }),
     };
+    if (typeof linksServiceFactory === "function") {
+      const links = linksServiceFactory({
+        bus: this.bus,
+        storageProvider: this.#storageProvider,
+        ownerAccountId: this.#ownerAccountId,
+        clock,
+        logger,
+      });
+      if (!links || typeof links !== "object") {
+        throw new Error("ChatServerApp linksServiceFactory returned invalid service");
+      }
+      services.links = links;
+    }
+    if (typeof deviceLinkServiceFactory === "function") {
+      const deviceLink = deviceLinkServiceFactory({
+        bus: this.bus,
+        storageProvider: this.#storageProvider,
+        ownerAccountId: this.#ownerAccountId,
+        clock,
+        logger,
+      });
+      if (!deviceLink || typeof deviceLink !== "object") {
+        throw new Error("ChatServerApp deviceLinkServiceFactory returned invalid service");
+      }
+      services.deviceLink = deviceLink;
+    }
     // The single serialized inbound path. Both the live SDK push
     // (MailboxPushBridge) and the catch-up drain (InboxCatchupService) feed
     // deposits through this one pipeline so each is fully applied before the

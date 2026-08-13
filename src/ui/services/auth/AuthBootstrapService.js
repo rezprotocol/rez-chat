@@ -57,6 +57,11 @@ export class AuthBootstrapService {
     return createKeystoreStoreForAccount(this._storageProvider, accountId);
   }
 
+  getRecoveryStore(accountId) {
+    if (this._keystoreStoreLegacy) return null;
+    return createKeystoreStoreForAccount(this._storageProvider, "recovery:" + String(accountId || DEFAULT_ACCOUNT_KEY));
+  }
+
   async listAccounts() {
     if (this._keystoreStoreLegacy) {
       const has = await this._keystoreStoreLegacy.hasKeystore();
@@ -142,6 +147,22 @@ export class AuthBootstrapService {
     return this._accountRegistry.setAccountIdHint(id, accountIdHint);
   }
 
+  async removeAccount(id) {
+    if (!this._accountRegistry || typeof this._accountRegistry.removeAccount !== "function") {
+      throw new Error("AuthBootstrapService removeAccount requires accountRegistry");
+    }
+    return this._accountRegistry.removeAccount(id);
+  }
+
+  async deleteAccountMetadata(id) {
+    if (!this._storageProvider || typeof this._storageProvider.del !== "function") return;
+    const key = String(id || "").trim();
+    if (!key) return;
+    await this._storageProvider.del("avatar:" + key);
+    await this._storageProvider.del("avatarData:" + key);
+    await this._storageProvider.del(KEYSTORE_LOCAL_ONLY_PREF_KEY + ":" + key);
+  }
+
   async setDisplayName(accountId, displayName) {
     if (!this._accountRegistry) return;
     const id = String(accountId != null ? accountId : "").trim();
@@ -212,7 +233,10 @@ export class AuthBootstrapService {
     try {
       const value = await this._storageProvider.get(`${KEYSTORE_LOCAL_ONLY_PREF_KEY}:${storeKey}`);
       return value === true;
-    } catch {
+    } catch (err) {
+      if (this._logger && typeof this._logger.warn === "function") {
+        this._logger.warn("Failed to read local-only keystore pref", err && err.message ? err.message : err);
+      }
       return false;
     }
   }
@@ -315,7 +339,10 @@ export class AuthBootstrapService {
     if (!this._storageProvider || typeof this._storageProvider.get !== "function") return null;
     try {
       return await this._storageProvider.get(REGISTRY_KEY);
-    } catch {
+    } catch (err) {
+      if (this._logger && typeof this._logger.warn === "function") {
+        this._logger.warn("Failed to inspect account registry", err && err.message ? err.message : err);
+      }
       return null;
     }
   }
@@ -325,7 +352,10 @@ export class AuthBootstrapService {
     try {
       const keys = await this._storageProvider.listKeys();
       return Array.isArray(keys) ? keys : [];
-    } catch {
+    } catch (err) {
+      if (this._logger && typeof this._logger.warn === "function") {
+        this._logger.warn("Failed to list browser account storage keys", err && err.message ? err.message : err);
+      }
       return [];
     }
   }
@@ -335,6 +365,7 @@ export class AuthBootstrapService {
     if (!normalizedKey) return true;
     if (normalizedKey === REGISTRY_KEY) return true;
     if (normalizedKey.indexOf(KEYSTORE_LOCAL_ONLY_PREF_KEY + ":") === 0) return true;
+    if (normalizedKey.indexOf("recovery:") === 0) return true;
     if (normalizedKey.indexOf("avatar:") === 0) return true;
     if (normalizedKey.indexOf("avatarData:") === 0) return true;
     return false;
@@ -346,7 +377,17 @@ export class AuthBootstrapService {
     for (const key of keys) {
       if (this._isReservedStorageKey(key)) continue;
       const store = createKeystoreStoreForAccount(this._storageProvider, key);
-      const envelope = await store.getKeystoreEnvelope().catch(() => null);
+      let envelope = null;
+      try {
+        envelope = await store.getKeystoreEnvelope();
+      } catch (err) {
+        if (this._logger && typeof this._logger.warn === "function") {
+          this._logger.warn("Failed to inspect browser keystore envelope", {
+            key: String(key),
+            error: err && err.message ? err.message : err,
+          });
+        }
+      }
       if (envelope) {
         discovered.push(String(key));
       }

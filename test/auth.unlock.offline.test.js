@@ -28,9 +28,9 @@ function createOfflineSdkFactory() {
     async close() {},
     getSessionInfo() {
       return {
-        accountId: account?.accountId || "rez:acct:unknown",
+        accountId: account && account.accountId ? account.accountId : "rez:acct:unknown",
         capabilities: {
-          deviceId: account?.deviceId || "rez:dev:unknown",
+          deviceId: account && account.deviceId ? account.deviceId : "rez:dev:unknown",
           localInboxId: "cap:local:test",
         },
       };
@@ -48,9 +48,9 @@ function createOnlineSdkFactory(metrics) {
     },
     getSessionInfo() {
       return {
-        accountId: account?.accountId || "rez:acct:unknown",
+        accountId: account && account.accountId ? account.accountId : "rez:acct:unknown",
         capabilities: {
-          deviceId: account?.deviceId || "rez:dev:unknown",
+          deviceId: account && account.deviceId ? account.deviceId : "rez:dev:unknown",
           localInboxId: "cap:local:test",
         },
       };

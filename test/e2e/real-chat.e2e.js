@@ -57,7 +57,7 @@ async function startEphemeralStack(t, { threadId } = {}) {
     throw err;
   }
 
-  if (threadId && app?.nodeApp?.chatStore && app?.nodeApp?.runtime) {
+  if (threadId && app && app.nodeApp && app.nodeApp.chatStore && app.nodeApp.runtime) {
     const localInboxId = app.nodeApp.runtime.getIdentity().localInboxId;
     await app.nodeApp.chatStore.ensureThread({
       threadId,
@@ -66,7 +66,7 @@ async function startEphemeralStack(t, { threadId } = {}) {
       kind: "dm",
     });
     const listing = await app.nodeApp.chatStore.listThreads({ limit: 100 });
-    const hasSeeded = Array.isArray(listing?.threads) && listing.threads.some((row) => row.threadId === threadId);
+    const hasSeeded = !!listing && Array.isArray(listing.threads) && listing.threads.some((row) => row.threadId === threadId);
     if (!hasSeeded) {
       await app.nodeApp.chatStore.createThread({
         threadId,
@@ -107,7 +107,7 @@ async function connectClient(page, preferredThreadId = "") {
 
   const alreadyReady = await page.evaluate(() => {
     const statusEl = document.querySelector("[data-role='status']");
-    const text = String(statusEl?.textContent || "");
+    const text = String(statusEl && statusEl.textContent ? statusEl.textContent : "");
     return text.includes("session=ready") && text.includes("connection=connected");
   });
 
@@ -120,7 +120,7 @@ async function connectClient(page, preferredThreadId = "") {
   }
   await page.waitForFunction(() => {
     const statusEl = document.querySelector("[data-role='status']");
-    const text = String(statusEl?.textContent || "");
+    const text = String(statusEl && statusEl.textContent ? statusEl.textContent : "");
     return text.includes("session=ready") && text.includes("connection=connected");
   }, { timeout: 15000 });
 
@@ -139,7 +139,8 @@ async function connectClient(page, preferredThreadId = "") {
   const selectedId = preferredThreadId && ids.includes(preferredThreadId) ? preferredThreadId : ids[0];
   await page.locator(`[data-role='threads'] [data-thread-id='${selectedId}']`).first().click();
   await page.waitForFunction(() => {
-    const title = String(document.querySelector("[data-role='thread-title']")?.textContent || "");
+    const titleEl = document.querySelector("[data-role='thread-title']");
+    const title = String(titleEl && titleEl.textContent ? titleEl.textContent : "");
     return title.trim().length > 0 && title !== "No thread selected";
   }, { timeout: 10000 });
   return selectedId;

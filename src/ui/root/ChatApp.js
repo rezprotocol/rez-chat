@@ -47,6 +47,7 @@ import { UiNavigationService } from "../services/bus/UiNavigationService.js";
 import { LinksService } from "../services/bus/LinksService.js";
 import { SystemNoticesService } from "../services/bus/SystemNoticesService.js";
 import { UpdateAvailableBannerView } from "../views/UpdateAvailableBannerView.js";
+import { AccountBoundaryService } from "../services/AccountBoundaryService.js";
 
 export class ChatApp {
   constructor({
@@ -67,6 +68,11 @@ export class ChatApp {
       : new IndexedDbStorageProvider();
     this.bus = new ChatBus({ config: { theme: this._theme }, logger: this._logger });
     this._createStores();
+    this._accountBoundary = new AccountBoundaryService({
+      sessionStore: this.bus.stores.session,
+      stores: this.bus.stores,
+    });
+    this._accountBoundary.start();
     this._createQueries();
     this._createServices(sdkFactory);
     this._createHost();
@@ -259,6 +265,10 @@ export class ChatApp {
   }
 
   async stop() {
+    if (this._accountBoundary) {
+      this._accountBoundary.stop();
+      this._accountBoundary = null;
+    }
     if (typeof this._offSession === "function") {
       this._offSession();
       this._offSession = null;

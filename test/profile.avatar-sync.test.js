@@ -141,6 +141,68 @@ test("avatar sync does NOT touch local hash when file download fails (no hash/da
   assert.equal(after.data, STORED_AVATAR_B64, "local data unchanged on failed file fetch");
 });
 
+test("browser lock refuses to clear auth when its runtime cannot stop", async () => {
+  const bus = new ChatBus({});
+  const sessionStore = new SessionStore({ bus });
+  bus.stores.session = sessionStore;
+  sessionStore.setUnlocked({ accountId: ACCOUNT_ID, deviceId: "dev_browser" });
+  bus.registerFunction({
+    namespace: "runtime",
+    name: "disconnect",
+    fn: async () => { throw new Error("stop failed"); },
+  });
+  let logouts = 0;
+  const accountAuthService = {
+    runtimeDisconnectMustSucceed() { return true; },
+    async logout() { logouts += 1; },
+  };
+  const service = new SessionService({
+    bus,
+    authBootstrapService: { async init() {} },
+    accountAuthService,
+    sessionStore,
+    logger: { warn() {}, error() {}, info() {} },
+  });
+
+  await assert.rejects(
+    () => service.lock(),
+    (err) => err.code === "RUNTIME_DISCONNECT_FAILED",
+  );
+  assert.equal(logouts, 0);
+  assert.equal(sessionStore.snapshot().status, SESSION_STATUS.UNLOCKED);
+});
+
+test("desktop lock still delegates teardown escalation to the vault supervisor", async () => {
+  const bus = new ChatBus({});
+  const sessionStore = new SessionStore({ bus });
+  bus.stores.session = sessionStore;
+  sessionStore.setUnlocked({ accountId: ACCOUNT_ID, deviceId: "dev_desktop" });
+  bus.registerFunction({
+    namespace: "runtime",
+    name: "disconnect",
+    fn: async () => { throw new Error("pre-step failed"); },
+  });
+  let logouts = 0;
+  const accountAuthService = {
+    runtimeDisconnectMustSucceed() { return false; },
+    async logout() {
+      logouts += 1;
+      sessionStore.setLocked({});
+    },
+  };
+  const service = new SessionService({
+    bus,
+    authBootstrapService: { async init() {} },
+    accountAuthService,
+    sessionStore,
+    logger: { warn() {}, error() {}, info() {} },
+  });
+
+  await service.lock();
+  assert.equal(logouts, 1);
+  assert.equal(sessionStore.snapshot().status, SESSION_STATUS.LOCKED);
+});
+
 test("avatar sync does NOT touch local when file fetch returns empty bytes", async () => {
   const NEW_HASH = "cafebabe7777";
   const bootstrap = makeFakeAuthBootstrap({

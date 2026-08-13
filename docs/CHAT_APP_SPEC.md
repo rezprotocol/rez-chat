@@ -42,12 +42,16 @@ Rez is **postage, not equity**: core messaging is free; paid services — `@hand
 
 ### Storage Boundary
 
-`rez-chat` does not access storage directly.
-All thread, contact, and invite state is accessed through `rez-sdk`.
-`rez-sdk` is responsible for:
-- Constructing derived views (thread index)
-- Managing invite lifecycle state
-- Persisting app metadata via StorageProvider namespaces.
+`rez-chat` owns application records and chooses their account partition. Persistence is supplied
+through the `rez-sdk` storage facade; app services must not open files, SQL, or IndexedDB directly.
+In a browser, the SDK's encrypted IndexedDB provider stores the client runtime under a database
+name derived from the unlocked account ID. Desktop uses the same app/runtime interfaces over the
+native vault and sidecar. Account changes reset every account-scoped UI store before another
+account's runtime can hydrate it.
+
+`rez-sdk` is responsible for storage-provider implementations, peer-link persistence, and crypto
+at the storage boundary. `rez-chat` remains responsible for thread/contact/invite semantics and
+their record types.
 
 ## 4. Network Integration Boundaries
 
@@ -55,6 +59,35 @@ All thread, contact, and invite state is accessed through `rez-sdk`.
 - Unlock/connect behavior is owned by `rez-chat` app services.
 - Framework rendering in `rez-ui` only reflects app state from `rez-chat`.
 - Protocol and crypto details are hidden behind `rez-sdk` APIs.
+
+### Hosted browser runtime
+
+The browser build is a first-class application, not a desktop download page. After unlock it boots
+the same client-owned chat runtime in the browser and connects by WSS to a shared hosted home.
+Account signing keys, account-DH keys, device keys, ratchets, plaintext, and encrypted local app
+state remain in the browser. The hosted `rez-node` cluster stores and routes ciphertext and durable
+mailbox cursors only.
+
+The desktop shell remains supported, but it is not required to use hosted chat. A mobile app-store
+wrapper is a separate shell over these same app/runtime boundaries; it must not move account keys
+or plaintext into the hosted node.
+
+The web build is installable as a PWA. Its service worker may cache only the static application
+shell. `/ws`, `/config`, `/health`, `/ready`, and protocol responses are always network-owned.
+
+Browser-to-browser device linking is not in the hosted beta: the current approval/join ceremony
+still depends on desktop-only seed tooling. The browser must fail this path explicitly rather than
+shipping a Node crypto shim. Phrase recovery creates a fresh authorized root device; delegated
+device linking remains desktop-primary until the ceremony stack is browser-safe.
+
+### Browser recovery
+
+New browser primary accounts derive their account signing and account-DH identities from a
+24-word BIP39 recovery phrase. The phrase is encrypted locally under the account password. A
+password change re-seals the exact keystore payload and must preserve account ID, device ID, and
+device key. Phrase recovery on a fresh browser reconstructs the same account root and creates a
+new device-local key. The phrase does not contain local-only message history; portable full-history
+backup remains a desktop feature until a versioned browser backup format is specified.
 
 ## 5. Behavioral Requirements (Unchanged)
 

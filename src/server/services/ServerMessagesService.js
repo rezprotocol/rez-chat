@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { REZ_CONTRACT_TYPES } from "@rezprotocol/sdk/client";
 import {
   MessageSendParams,
@@ -31,6 +30,7 @@ import {
   REACTION_KIND,
 } from "../../records/payloads/index.js";
 import { BaseServerService } from "../base/BaseServerService.js";
+import { runtimeUuid } from "@rezprotocol/sdk/client";
 
 export class ServerMessagesService extends BaseServerService {
   static QUEUE_TTL_MS = 72 * 60 * 60 * 1000;
@@ -159,7 +159,7 @@ export class ServerMessagesService extends BaseServerService {
     // co-member must not be able to predict (and pre-seed/suppress) a future
     // message's id; the recipient-side sender-binding guard is the hard stop, this
     // removes the guess entirely.
-    const messageId = params.messageId || ("local_" + now + "_" + randomUUID().slice(0, 8));
+    const messageId = params.messageId || ("local_" + now + "_" + runtimeUuid().slice(0, 8));
     // Idempotency on messageId. A resend (tap-to-retry on a failed bubble)
     // re-enters this method with the same messageId. recordOutboundDeposit
     // already overwrites the DB row in place via _upsertMessageUnlocked,

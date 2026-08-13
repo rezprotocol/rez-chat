@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   GroupCreateParams,
   GroupCreateResult,
@@ -28,12 +27,13 @@ import { signMemberJoinProof } from "../../records/payloads/memberJoinProof.js";
 import { BaseServerService } from "../base/BaseServerService.js";
 import { ServerGroupBroadcaster } from "./ServerGroupBroadcaster.js";
 import { ServerGroupOpApplier } from "./ServerGroupOpApplier.js";
+import { runtimeUuid } from "@rezprotocol/sdk/client";
 
 const ADMIN_ROLE = "admin";
 const CREATOR_ROLE = "creator";
 
 function nowOpId() {
-  return "gop_" + randomUUID().replace(/-/g, "");
+  return "gop_" + runtimeUuid().replace(/-/g, "");
 }
 
 export class ServerGroupsService extends BaseServerService {
@@ -142,7 +142,7 @@ export class ServerGroupsService extends BaseServerService {
     // Salt that binds this group to its creator: groupId = hash(createdBy +
     // ":" + creatorSalt). Carried (signed) in invites so acceptors can verify
     // the founder against the groupId (audit pass 5, H2 closure).
-    const creatorSalt = now + ":" + randomUUID();
+    const creatorSalt = now + ":" + runtimeUuid();
     const groupId = this.bus.services.threads.groupIdForCreator(this.ownerAccountId, creatorSalt);
     const threadId = this.bus.services.threads.groupThreadId(groupId);
     await this.#groupStore.ensureGroup({

@@ -1,4 +1,5 @@
 import { nodeAdvertisesDurableInbox } from "../inbox/durableMode.js";
+import { runtimeEnvFlag } from "./runtimeEnvFlag.js";
 
 /**
  * Single owner of `sdk.subscriptions.onMailboxDeposited(...)` on the
@@ -62,7 +63,7 @@ export class MailboxPushBridge {
           const durable = result && result.durable != null ? result.durable : (result && result.consumed);
           const ok = Boolean(durable || (result && result.alreadyProcessed));
           const ids = MailboxPushBridge.#frameIds(frame);
-          if (process.env.REZ_PEERLINK_TRACE === "1") {
+          if (runtimeEnvFlag("REZ_PEERLINK_TRACE")) {
             logger.log(
               "[PLTRACE] pushBridge evt=" + ids.eventId
               + " consumed=" + (result && result.consumed ? 1 : 0)

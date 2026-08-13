@@ -36,6 +36,7 @@ export class SessionService extends BaseBusService {
     this._register("session", "resetPasswordWithMnemonic", (payload) => this.resetPasswordWithMnemonic(payload));
     this._register("session", "exportBackup", (payload) => this.exportBackup(payload));
     this._register("session", "importBackup", (payload) => this.importBackup(payload));
+    this._register("session", "restoreWithMnemonic", (payload) => this.restoreWithMnemonic(payload));
     this._register("session", "purgeAccount", (payload) => this.purgeAccount(payload));
   }
 
@@ -50,13 +51,7 @@ export class SessionService extends BaseBusService {
     // Tear down any stale runtime first, then complete unlock + connect the
     // same way unlock() does.
     this._runtimeConnectSeq += 1;
-    try {
-      await this.bus.call("runtime", "disconnect", {});
-    } catch (err) {
-      if (this._logger && typeof this._logger.warn === "function") {
-        this._logger.warn("runtime disconnect failed during importBackup", err && err.message ? err.message : err);
-      }
-    }
+    await this._disconnectRuntimeForAuthOperation("importBackup");
     this._sessionStore.setUnlocking();
     try {
       const unlocked = await this._accountAuthService.importBackup({ encryptedBackup, mnemonic, newPassword });
@@ -72,9 +67,28 @@ export class SessionService extends BaseBusService {
     }
   }
 
+  async restoreWithMnemonic({ mnemonic = "", newPassword = "", profileName = "" } = {}) {
+    this._runtimeConnectSeq += 1;
+    await this._disconnectRuntimeForAuthOperation("recovery restore");
+    this._sessionStore.setUnlocking();
+    try {
+      const unlocked = await this._accountAuthService.restoreWithMnemonic({ mnemonic, newPassword, profileName });
+      this._completeUnlock(unlocked);
+      return this._sessionStore.snapshot();
+    } catch (err) {
+      const message = err && err.message ? err.message : "Recovery failed.";
+      if (this._sessionStore.snapshot().status === SESSION_STATUS.UNLOCKING) {
+        this._sessionStore.setLocked({ error: message });
+      }
+      this.bus.emit("session.restore.failed", { message });
+      throw err;
+    }
+  }
+
   async revealMnemonic({ password = "" } = {}) {
     const accountId = this._resolveAccountId();
     if (!accountId) throw new Error("revealMnemonic: no active account");
+    if (typeof this._accountAuthService.revealMnemonic !== "function") return null;
     return this._accountAuthService.revealMnemonic({ accountId, password });
   }
 
@@ -84,13 +98,7 @@ export class SessionService extends BaseBusService {
     // ChangePassword auto-locks the vault; tear down runtime alongside so the
     // UI is in a clean LOCKED state for the next unlock.
     this._runtimeConnectSeq += 1;
-    try {
-      await this.bus.call("runtime", "disconnect", {});
-    } catch (err) {
-      if (this._logger && typeof this._logger.warn === "function") {
-        this._logger.warn("runtime disconnect failed during changePassword", err && err.message ? err.message : err);
-      }
-    }
+    await this._disconnectRuntimeForAuthOperation("changePassword");
     const result = await this._accountAuthService.changePassword({ accountId, oldPassword, newPassword });
     this.bus.emit("session.passwordChanged", { accountId });
     return result;
@@ -100,13 +108,7 @@ export class SessionService extends BaseBusService {
     const accountId = String(explicitId == null ? "" : explicitId).trim() || this._resolveAccountId();
     if (!accountId) throw new Error("resetPasswordWithMnemonic: accountId is required");
     this._runtimeConnectSeq += 1;
-    try {
-      await this.bus.call("runtime", "disconnect", {});
-    } catch (err) {
-      if (this._logger && typeof this._logger.warn === "function") {
-        this._logger.warn("runtime disconnect failed during resetPasswordWithMnemonic", err && err.message ? err.message : err);
-      }
-    }
+    await this._disconnectRuntimeForAuthOperation("resetPasswordWithMnemonic");
     const result = await this._accountAuthService.resetPasswordWithMnemonic({ accountId, mnemonic, newPassword });
     this.bus.emit("session.passwordReset", { accountId });
     return result;
@@ -120,13 +122,7 @@ export class SessionService extends BaseBusService {
     const targetId = explicitId || this._resolveAccountId();
     if (!targetId) throw new Error("purgeAccount: no account specified");
     this._runtimeConnectSeq += 1;
-    try {
-      await this.bus.call("runtime", "disconnect", {});
-    } catch (err) {
-      if (this._logger && typeof this._logger.warn === "function") {
-        this._logger.warn("runtime disconnect failed during purgeAccount", err && err.message ? err.message : err);
-      }
-    }
+    await this._disconnectRuntimeForAuthOperation("purgeAccount");
     const result = await this._accountAuthService.purgeAccount({ accountId: targetId, password });
     this.bus.emit("session.purged", { accountId: targetId });
     return result;
@@ -393,13 +389,7 @@ export class SessionService extends BaseBusService {
 
   async lock() {
     this._runtimeConnectSeq += 1;
-    try {
-      await this.bus.call("runtime", "disconnect", {});
-    } catch (err) {
-      if (this._logger && typeof this._logger.warn === "function") {
-        this._logger.warn("runtime disconnect failed during lock", err && err.message ? err.message : err);
-      }
-    }
+    await this._disconnectRuntimeForAuthOperation("lock");
     await this._accountAuthService.logout();
     this.bus.emit("session.locked", this._sessionStore.snapshot());
   }
@@ -433,5 +423,21 @@ export class SessionService extends BaseBusService {
     if (snap && snap.selectedAccountId) return String(snap.selectedAccountId).trim();
     if (snap && snap.accountId) return String(snap.accountId).trim();
     return "";
+  }
+
+  async _disconnectRuntimeForAuthOperation(operation) {
+    try {
+      await this.bus.call("runtime", "disconnect", {});
+    } catch (err) {
+      if (this._logger && typeof this._logger.warn === "function") {
+        this._logger.warn("runtime disconnect failed during " + operation, err && err.message ? err.message : err);
+      }
+      const required = typeof this._accountAuthService.runtimeDisconnectMustSucceed === "function"
+        && this._accountAuthService.runtimeDisconnectMustSucceed();
+      if (required) {
+        if (err && typeof err === "object") err.code = "RUNTIME_DISCONNECT_FAILED";
+        throw err;
+      }
+    }
   }
 }

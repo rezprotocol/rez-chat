@@ -92,7 +92,7 @@ export class FakeRuntimeClient {
 
   async getThread({ threadId } = {}) {
     const id = String(threadId || "");
-    const thread = this._threads.find((row) => String(row?.threadId || "") === id) || {
+    const thread = this._threads.find((row) => String(row && row.threadId ? row.threadId : "") === id) || {
       threadId: id,
       title: "Thread",
     };
@@ -123,7 +123,7 @@ export class FakeRuntimeClient {
 
   async setThreadState({ threadId, visibilityState = undefined, accessState = undefined } = {}) {
     const id = String(threadId || "");
-    const index = this._threads.findIndex((row) => String(row?.threadId || "") === id);
+    const index = this._threads.findIndex((row) => String(row && row.threadId ? row.threadId : "") === id);
     if (index < 0) return { thread: null };
     const current = this._threads[index];
     const next = {

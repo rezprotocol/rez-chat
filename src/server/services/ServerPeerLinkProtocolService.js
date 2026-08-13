@@ -1,6 +1,12 @@
 import { base64ToBytes, buildInboxAddress, bytesToBase64 } from "@rezprotocol/sdk/client";
 import { isAccountStateEnvelope, accountStateAad } from "@rezprotocol/sdk/peer-link";
 import { BaseServerService } from "../base/BaseServerService.js";
+import { runtimeEnvFlag } from "../runtime/runtimeEnvFlag.js";
+import { depositIdentity } from "../runtime/depositIdentity.js";
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
 
 // Minimum gap between recovery-invite triggers for the SAME peer. The inbound
 // pipeline can surface a backlog of undecryptable deposits in a tight burst, so
@@ -162,12 +168,13 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
   }
 
   async processDeposit(event) {
-    const tr = process.env.REZ_PEERLINK_TRACE === "1";
+    const tr = runtimeEnvFlag("REZ_PEERLINK_TRACE");
     const frame = event && typeof event === "object" ? event : {};
     const body = frame.body && typeof frame.body === "object" ? frame.body : frame;
     const ciphertextB64 = typeof body.ciphertextB64 === "string" ? body.ciphertextB64 : "";
-    const mailboxId = typeof body.mailboxId === "string" ? body.mailboxId : "";
-    const eventId = typeof body.eventId === "string" ? body.eventId : "";
+    const identity = depositIdentity(frame);
+    const mailboxId = identity.mailboxId;
+    const eventId = identity.eventId;
     if (!ciphertextB64) {
       if (tr) this.logger.log("[PLTRACE] processDeposit SKIP no-ciphertextB64 mbox=" + mailboxId + " evt=" + eventId);
       return { consumed: false, decryptOk: false, reason: "no-ciphertext" };
@@ -195,7 +202,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     }
     if (!bodyObj) {
       if (tr) {
-        const head = Buffer.from(payloadBytes.slice(0, 24)).toString("hex");
+        const head = bytesToHex(payloadBytes.slice(0, 24));
         this.logger.log("[PLTRACE] processDeposit SKIP unparseable evt=" + eventId + " bytes=" + payloadBytes.length + " head=" + head + (parseErr ? " err=" + (parseErr.message || parseErr) : ""));
       }
       return { consumed: false, decryptOk: false, reason: "unparseable" };
@@ -205,7 +212,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     // deposit so a captured run.log shows exactly which establishment/decrypt path
     // each packet took — the single highest-signal line for diagnosing one-sided
     // peer links (handshake never processed) vs ratchet desync.
-    if (process.env.REZ_PEERLINK_TRACE === "1") {
+    if (runtimeEnvFlag("REZ_PEERLINK_TRACE")) {
       this.logger.log(
         "[PLTRACE] deposit owner=" + this.ownerAccountId + " mbox=" + mailboxId + " evt=" + eventId
         + " type=" + (typeof bodyObj.type === "string" ? bodyObj.type : "-")

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { Hash } from "@rezprotocol/sdk/hash";
 import { LinkPreview } from "../../records/domain/LinkPreview.js";
 
 export const LINK_PREVIEW_PREFIX = "app:linkpreviews/";
@@ -9,7 +9,7 @@ const DEFAULT_OK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_ERROR_TTL_MS = 60 * 60 * 1000;
 
 function urlKey(url) {
-  const h = createHash("sha256").update(String(url)).digest("base64url");
+  const h = Hash.sha256Hex(String(url));
   return LINK_PREVIEW_PREFIX + h.slice(0, 32);
 }
 

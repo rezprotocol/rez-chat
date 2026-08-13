@@ -159,11 +159,11 @@ export class LoginUnlockView extends BusComponent {
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "session.restoreBackup",
       }, "RESTORE_FROM_BACKUP"),
-      accountList.length === 0 ? h("button", {
+      h("button", {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "authScreen.showCreate",
-      }, "ADD_NEW_NODE") : null,
+      }, "ADD_NEW_NODE"),
       h("button", {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all flex items-center gap-1 group",

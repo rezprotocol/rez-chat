@@ -8,5 +8,5 @@ export async function waitForCondition(fn, timeoutMs = 2000) {
 }
 
 export function isBindPermissionError(err) {
-  return ["EACCES", "EPERM"].includes(err?.code);
+  return ["EACCES", "EPERM"].includes(err && err.code);
 }

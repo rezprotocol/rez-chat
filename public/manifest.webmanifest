@@ -1,0 +1,25 @@
+{
+  "id": "/",
+  "name": "Rez Chat",
+  "short_name": "Rez",
+  "description": "Private, account-owned chat on the Rez protocol.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#05080d",
+  "theme_color": "#05080d",
+  "icons": [
+    {
+      "src": "/icons/rez-chat-256.png",
+      "sizes": "256x256",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/rez-chat-1024.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

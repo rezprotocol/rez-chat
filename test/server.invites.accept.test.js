@@ -97,6 +97,22 @@ function createServer({ sdk, peerLinks, clock = () => 1000 } = {}) {
   return app;
 }
 
+test("direct-invite classification survives an inviter runtime restart", async () => {
+  const inviteId = "plinv_persisted_direct";
+  const peerLinks = {
+    ownerAccountId: "rez:acct:bob",
+    getStoredInviteEnvelope: async (_ownerAccountId, requestedInviteId) => (
+      requestedInviteId === inviteId
+        ? { envelope: { inviteId, kind: "direct" }, signatureB64: "sig" }
+        : null
+    ),
+  };
+  const server = createServer({ sdk: {}, peerLinks });
+
+  assert.equal(await server.bus.services.invites.isDirectContactInvite(inviteId), true);
+  assert.equal(await server.bus.services.invites.isDirectContactInvite("plinv_unknown"), false);
+});
+
 test("invite.accept materializes a ready direct thread and sidebar index row", async () => {
   let now = 1000;
   const snapshot = {

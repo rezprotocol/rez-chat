@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   ChannelsListParams,
   ChannelsListResult,
@@ -13,9 +12,10 @@ import {
 import { GroupOpPayloadV1, groupOpPayloadToBytes } from "../../records/payloads/GroupOpPayloadV1.js";
 import { isValidChannelId, slugifyChannelLabel } from "../../records/payloads/ChatMessagePayloadV1.js";
 import { BaseServerService } from "../base/BaseServerService.js";
+import { runtimeUuid } from "@rezprotocol/sdk/client";
 
 function nowOpId() {
-  return "gop_" + randomUUID().replace(/-/g, "");
+  return "gop_" + runtimeUuid().replace(/-/g, "");
 }
 
 /**

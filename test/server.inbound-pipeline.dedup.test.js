@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import { InboundDepositPipeline } from "../src/server/runtime/InboundDepositPipeline.js";
 import { ProcessedDepositLog } from "../src/server/inbox/ProcessedDepositLog.js";
+import { depositIdentity } from "../src/server/runtime/depositIdentity.js";
 
 class MemKv {
   #m = new Map();
@@ -92,6 +93,18 @@ test("durable frames dedup on seq (no eventId) — S2 durable-mode catch-up re-l
   assert.deepEqual(applied, [1, 2]);
   assert.equal(await processedLog.has("mbx_self", "seq:1"), true, "dedup marker is keyed seq:1");
   assert.equal(await processedLog.has("mbx_self", "1"), false, "NOT keyed on the bare seq (no collision with a legacy eventId='1')");
+});
+
+test("durable catch-up seq is also the canonical application eventId", () => {
+  const catchup = depositIdentity({
+    body: { mailboxId: "mbx_self", seq: 7, ciphertextB64: "ciphertext" },
+  });
+  const live = depositIdentity({
+    body: { mailboxId: "mbx_self", eventId: "node-local-event", seq: 7, ciphertextB64: "ciphertext" },
+  });
+
+  assert.deepEqual(catchup, { mailboxId: "mbx_self", eventId: "seq:7", seq: 7, dedupId: "seq:7" });
+  assert.deepEqual(live, catchup, "live and catch-up delivery must reach decrypt/apply under one identity");
 });
 
 test("a decrypt failure is NOT marked processed (so it can be retried)", async () => {

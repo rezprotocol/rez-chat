@@ -6,10 +6,11 @@ import {
 } from "../../records/index.js";
 import { getPayloadEntry } from "../../records/payloads/index.js";
 import { MESSAGE_KIND as CHAT_MESSAGE_KIND } from "../../records/payloads/ChatMessagePayloadV1.js";
-import { E2eeDeliveryAckV1 } from "@rezprotocol/sdk/client";
+import { E2eeDeliveryAckV1, base64ToBytes } from "@rezprotocol/sdk/client";
 import { BaseServerService } from "../base/BaseServerService.js";
 import { ServerDeferredMessageBuffer } from "./ServerDeferredMessageBuffer.js";
 import { ServerGroupAuthzGate } from "./ServerGroupAuthzGate.js";
+import { depositIdentity } from "../runtime/depositIdentity.js";
 
 export class ServerEventService extends BaseServerService {
   #clock;
@@ -216,8 +217,9 @@ export class ServerEventService extends BaseServerService {
   async #handleMailboxDeposited(event) {
     const frame = event && typeof event === "object" ? event : {};
     const body = frame.body && typeof frame.body === "object" ? frame.body : frame;
-    const eventId = typeof body.eventId === "string" ? body.eventId.trim() : "";
-    const mailboxId = typeof body.mailboxId === "string" ? body.mailboxId.trim() : "";
+    const identity = depositIdentity(frame);
+    const eventId = identity.eventId;
+    const mailboxId = identity.mailboxId;
     const ciphertextB64 = typeof body.ciphertextB64 === "string" ? body.ciphertextB64 : "";
     // Envelope-level sender (decrypted snapshot from peer-link). Used as
     // authoritative fallback when the payload itself lacks senderAccountId
@@ -234,7 +236,7 @@ export class ServerEventService extends BaseServerService {
     // emits a `peerlink.user.message` event that we handle separately.)
     if (ciphertextB64) {
       try {
-        const raw = Buffer.from(ciphertextB64, "base64").toString("utf8");
+        const raw = new TextDecoder().decode(base64ToBytes(ciphertextB64));
         const peek = JSON.parse(raw);
         if (peek && typeof peek === "object" && !Array.isArray(peek)) {
           const kind = typeof peek.kind === "string" ? peek.kind : "";
@@ -259,7 +261,7 @@ export class ServerEventService extends BaseServerService {
     let previewText = "";
     if (ciphertextB64) {
       try {
-        const raw = Buffer.from(ciphertextB64, "base64").toString("utf8");
+        const raw = new TextDecoder().decode(base64ToBytes(ciphertextB64));
         const parsed = JSON.parse(raw);
         decodedPayload = parsed && typeof parsed === "object" ? parsed : null;
         previewText = this.bus.services.threads.extractPreviewText(decodedPayload);
@@ -656,7 +658,7 @@ export class ServerEventService extends BaseServerService {
     }
     const invites = this.bus.services && this.bus.services.invites ? this.bus.services.invites : null;
     if (activeInviteId && invites && typeof invites.isDirectContactInvite === "function"
-        && invites.isDirectContactInvite(activeInviteId)) {
+        && await invites.isDirectContactInvite(activeInviteId)) {
       return true;
     }
     return false;

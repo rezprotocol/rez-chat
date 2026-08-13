@@ -35,9 +35,9 @@ function createSdkFactory(metrics) {
     },
     getSessionInfo() {
       return {
-        accountId: account?.accountId || "rez:acct:unknown",
+        accountId: account && account.accountId ? account.accountId : "rez:acct:unknown",
         capabilities: {
-          deviceId: account?.deviceId || "rez:dev:unknown",
+          deviceId: account && account.deviceId ? account.deviceId : "rez:dev:unknown",
           localInboxId: "cap:local:test",
         },
       };
@@ -187,6 +187,161 @@ test("createAccount with registry sets label to profileName and listAccounts ret
   assert.equal(list[0].id, "default");
   assert.equal(list[0].label, "Work");
   assert.equal(service.authStore.snapshot().status, SESSION_STATUS.UNLOCKED);
+  const revealed = await service.accountAuthService.revealMnemonic({ password: "secret99" });
+  assert.equal(revealed.mnemonic.split(" ").length, 24, "browser account creation must produce a recovery phrase");
+  assert.equal(
+    typeof service.getAccount().accountIdentityDhKeyPair.publicKeyB64,
+    "string",
+    "unlocked browser account carries its seed-derived account DH key",
+  );
+});
+
+test("browser account creation removes encrypted artifacts when registry admission fails", async () => {
+  const storage = createMemoryStorage();
+  const registry = new AccountRegistry({ storageProvider: storage });
+  registry.addAccount = async () => {
+    throw new Error("registry unavailable");
+  };
+  const service = createAuthHarness({
+    storageProvider: storage,
+    accountRegistry: registry,
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    logger: console,
+  });
+  await service.init();
+
+  await assert.rejects(
+    () => service.createAccount({ profileName: "Orphan", password: "password123" }),
+    /registry unavailable/,
+  );
+  assert.equal(await service.authBootstrapService.getKeystoreStore("default").hasKeystore(), false);
+  assert.equal(await service.authBootstrapService.getRecoveryStore("default").hasKeystore(), false);
+});
+
+test("browser recovery removes registry entry and envelopes when identity hint persistence fails", async () => {
+  const sourceStorage = createMemoryStorage();
+  const source = createAuthHarness({
+    storageProvider: sourceStorage,
+    accountRegistry: new AccountRegistry({ storageProvider: sourceStorage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    logger: console,
+  });
+  await source.init();
+  await source.createAccount({ profileName: "Source", password: "password123" });
+  const recovery = await source.accountAuthService.revealMnemonic({ password: "password123" });
+
+  const targetStorage = createMemoryStorage();
+  const targetRegistry = new AccountRegistry({ storageProvider: targetStorage });
+  targetRegistry.setAccountIdHint = async () => {
+    throw new Error("hint unavailable");
+  };
+  const target = createAuthHarness({
+    storageProvider: targetStorage,
+    accountRegistry: targetRegistry,
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    logger: console,
+  });
+  await target.init();
+
+  await assert.rejects(
+    () => target.accountAuthService.restoreWithMnemonic({
+      mnemonic: recovery.mnemonic,
+      newPassword: "password456",
+      profileName: "Recovered",
+    }),
+    /hint unavailable/,
+  );
+  assert.deepEqual(await target.listAccounts(), []);
+  assert.equal(await target.authBootstrapService.getKeystoreStore("default").hasKeystore(), false);
+  assert.equal(await target.authBootstrapService.getRecoveryStore("default").hasKeystore(), false);
+});
+
+test("browser account password change preserves account and device identity", async () => {
+  const storage = createMemoryStorage();
+  const service = createAuthHarness({
+    storageProvider: storage,
+    accountRegistry: new AccountRegistry({ storageProvider: storage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    logger: console,
+  });
+  await service.init();
+  await service.createAccount({ profileName: "Stable", password: "password-old" });
+  const before = service.getAccount();
+  await service.accountAuthService.changePassword({
+    accountId: before.accountId,
+    oldPassword: "password-old",
+    newPassword: "password-new",
+  });
+  await assert.rejects(() => service.unlock({ password: "password-old" }));
+  await service.unlock({ password: "password-new" });
+  const after = service.getAccount();
+  assert.equal(after.accountId, before.accountId);
+  assert.equal(after.deviceId, before.deviceId);
+  assert.deepEqual(after.deviceKeyPair, before.deviceKeyPair);
+  assert.equal((await service.accountAuthService.revealMnemonic({ password: "password-new" })).mnemonic.split(" ").length, 24);
+});
+
+test("browser account purge verifies the password and removes vault plus recovery state", async () => {
+  const storage = createMemoryStorage();
+  const service = createAuthHarness({
+    storageProvider: storage,
+    accountRegistry: new AccountRegistry({ storageProvider: storage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    logger: console,
+  });
+  await service.init();
+  await service.createAccount({ profileName: "Disposable", password: "password-delete" });
+  await assert.rejects(
+    () => service.accountAuthService.purgeAccount({ password: "wrong-password" }),
+  );
+  assert.equal((await service.listAccounts()).length, 1);
+  const purged = await service.accountAuthService.purgeAccount({ password: "password-delete" });
+  assert.equal(purged.deleted, true);
+  assert.equal((await service.listAccounts()).length, 0);
+  assert.equal(await storage.get("default"), null);
+  assert.equal(await storage.get("recovery:default"), null);
+  assert.equal(service.authStore.snapshot().status, SESSION_STATUS.NO_KEYSTORE);
+});
+
+test("browser recovery phrase restores the same account root as a fresh device", async () => {
+  const sourceStorage = createMemoryStorage();
+  const source = createAuthHarness({
+    storageProvider: sourceStorage,
+    accountRegistry: new AccountRegistry({ storageProvider: sourceStorage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    logger: console,
+  });
+  await source.init();
+  await source.createAccount({ profileName: "Source", password: "password-source" });
+  const sourceAccount = source.getAccount();
+  const revealed = await source.accountAuthService.revealMnemonic({ password: "password-source" });
+
+  const targetStorage = createMemoryStorage();
+  const target = createAuthHarness({
+    storageProvider: targetStorage,
+    accountRegistry: new AccountRegistry({ storageProvider: targetStorage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    logger: console,
+  });
+  await target.init();
+  await target.accountAuthService.restoreWithMnemonic({
+    mnemonic: revealed.mnemonic,
+    newPassword: "password-target",
+    profileName: "Recovered",
+  });
+  const recovered = target.getAccount();
+  assert.equal(recovered.accountId, sourceAccount.accountId);
+  assert.notEqual(recovered.deviceId, sourceAccount.deviceId);
+  assert.deepEqual(recovered.identityKeyPair, sourceAccount.identityKeyPair);
+  assert.deepEqual(recovered.accountIdentityDhKeyPair, sourceAccount.accountIdentityDhKeyPair);
+  assert.equal((await target.listAccounts())[0].label, "Recovered");
 });
 
 test("init rebuilds registry from discovered local keystore keys", async () => {

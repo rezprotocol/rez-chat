@@ -1,4 +1,5 @@
 import { Hash } from "@rezprotocol/sdk/hash";
+import { bytesToBase64 } from "@rezprotocol/sdk/client";
 import { coerceRow } from "../../records/domain/coerce.js";
 
 /**
@@ -123,6 +124,10 @@ export class KvTable {
     const id = String(value || "").trim();
     if (!this.hashParts) return id;
     const bytes = Hash.sha256(new TextEncoder().encode(id));
-    return Buffer.from(bytes).toString("base64url").slice(0, this.hashLen);
+    return bytesToBase64(bytes)
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "")
+      .slice(0, this.hashLen);
   }
 }

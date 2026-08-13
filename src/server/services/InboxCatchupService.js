@@ -1,6 +1,7 @@
 import { BaseServerService } from "../base/BaseServerService.js";
 import { MailboxDepositQuarantinedEvent } from "../../records/index.js";
 import { nodeAdvertisesDurableInbox } from "../inbox/durableMode.js";
+import { runtimeEnvFlag } from "../runtime/runtimeEnvFlag.js";
 
 const DEFAULT_PAGE_LIMIT = 50;
 // D1: after this many failed decrypts across drains, a deposit is treated as
@@ -207,7 +208,7 @@ export class InboxCatchupService extends BaseServerService {
     while (true) {
       const page = await sdk.mailbox.list({ mailboxId, cursor: pageCursor, limit: this.#pageLimit });
       const items = page && Array.isArray(page.items) ? page.items : [];
-      if (process.env.REZ_INBOX_CATCHUP_DEBUG === "1") {
+      if (runtimeEnvFlag("REZ_INBOX_CATCHUP_DEBUG")) {
         this.logger.log("[InboxCatchupService] mailbox.list mailboxId=" + mailboxId + " cursor=" + (pageCursor || "null") + " items=" + items.length + " nextCursor=" + (page && page.nextCursor ? page.nextCursor : "null"));
       }
       if (items.length === 0) return;
@@ -245,7 +246,7 @@ export class InboxCatchupService extends BaseServerService {
         // falls back to `consumed` for non-durable pipelines/mocks that predate it.
         const durable = result && result.durable != null ? result.durable : (result && result.consumed);
         const ok = Boolean(durable || (result && result.alreadyProcessed));
-        if (process.env.REZ_INBOX_CATCHUP_DEBUG === "1" || process.env.REZ_PEERLINK_TRACE === "1") {
+        if (runtimeEnvFlag("REZ_INBOX_CATCHUP_DEBUG") || runtimeEnvFlag("REZ_PEERLINK_TRACE")) {
           this.logger.log(
             "[InboxCatchupService] item evt=" + eventId + " ctLen=" + ciphertextB64.length
             + " consumed=" + (result && result.consumed ? 1 : 0)
@@ -285,7 +286,7 @@ export class InboxCatchupService extends BaseServerService {
     while (true) {
       const page = await sdk.mailbox.list({ mailboxId, cursor: null, limit: this.#pageLimit });
       const items = page && Array.isArray(page.items) ? page.items : [];
-      if (process.env.REZ_INBOX_CATCHUP_DEBUG === "1") {
+      if (runtimeEnvFlag("REZ_INBOX_CATCHUP_DEBUG")) {
         this.logger.log("[InboxCatchupService] durable list mailboxId=" + mailboxId + " items=" + items.length);
       }
       if (items.length === 0) return;

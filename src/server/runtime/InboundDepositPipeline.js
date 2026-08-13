@@ -1,3 +1,6 @@
+import { runtimeEnvFlag } from "./runtimeEnvFlag.js";
+import { depositIdentity } from "./depositIdentity.js";
+
 /**
  * InboundDepositPipeline — the SINGLE, serialized inbound path for mailbox
  * deposits. Both the live SDK push (MailboxPushBridge) and the catch-up drain
@@ -163,19 +166,7 @@ export class InboundDepositPipeline {
   }
 
   #frameIds(frame) {
-    const body = frame && frame.body && typeof frame.body === "object" ? frame.body : (frame || {});
-    const mailboxId = typeof body.mailboxId === "string" ? body.mailboxId : "";
-    const eventId = typeof body.eventId === "string" ? body.eventId : "";
-    // Durable nodes (S2) stamp a per-inbox monotonic `seq` on every deposit,
-    // carried on the live EVT and on each catch-up list item. When present it is
-    // the home-stable dedup identity: the relay `eventId` is home-local AND absent
-    // on durable catch-up items (which carry only { seq, ciphertextB64 }), so the
-    // one non-idempotent step (re-decrypt) must be guarded on `seq` instead. dedupId
-    // selects seq in durable mode, eventId otherwise — identical guarding on both the
-    // live-push and reconnect-drain paths, with zero change for legacy/fs frames.
-    const seq = Number.isInteger(body.seq) && body.seq >= 0 ? body.seq : null;
-    const dedupId = seq != null ? "seq:" + seq : eventId;
-    return { mailboxId, eventId, seq, dedupId };
+    return depositIdentity(frame);
   }
 
   #frameCiphertext(frame) {
@@ -198,7 +189,7 @@ export class InboundDepositPipeline {
     if (!ciphertextB64) return; // nothing to re-feed (plaintext deposits self-apply)
     const existing = this.#pending.get(key);
     if (existing) return; // already retained; attempts advance only via re-drain
-    if (process.env.REZ_PEERLINK_TRACE === "1") {
+    if (runtimeEnvFlag("REZ_PEERLINK_TRACE")) {
       this.#logger.log("[PLTRACE] pipeline RETAIN evt=" + dedupId + " (pending=" + (this.#pending.size + 1) + ")");
     }
     if (this.#pending.size >= this.#maxPending) {
@@ -228,7 +219,7 @@ export class InboundDepositPipeline {
               + (err && err.message ? err.message : err));
             r = null;
           }
-          if (process.env.REZ_PEERLINK_TRACE === "1") {
+          if (runtimeEnvFlag("REZ_PEERLINK_TRACE")) {
             this.#logger.log("[PLTRACE] pipeline REDRAIN evt=" + key + " consumed=" + (r && r.consumed ? 1 : 0) + " already=" + (r && r.alreadyProcessed ? 1 : 0));
           }
           if (r && (r.consumed || r.alreadyProcessed)) {

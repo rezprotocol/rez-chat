@@ -10,7 +10,7 @@ import "./styles/tailwind.css";
 import "@rezprotocol/ui/framework/theme.css";
 import "./ui/styles.css";
 import { ChatRuntimeConfig } from "./ui/records/ChatRuntimeConfig.js";
-import { ChatRuntimeClient } from "./client/runtime/ChatRuntimeClient.js";
+import { BrowserChatRuntimeClient } from "./client/runtime/BrowserChatRuntimeClient.js";
 import { DesktopRuntimeClient } from "./client/runtime/DesktopRuntimeClient.js";
 import { ChatApp } from "./ui/root/ChatApp.js";
 
@@ -48,11 +48,12 @@ if (!mountEl) throw new Error("Missing #app root element");
 
 const config = await loadRuntimeConfig();
 globalThis.__REZ_RUNTIME_CONFIG__ = config;
+document.documentElement.dataset.rezRuntime = "client-owned";
 
 const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 const wsUrl = `${protocol}//${window.location.host}/ws`;
+const browserUplinks = config.uplinks.length > 0 ? config.uplinks : [wsUrl];
 
-const bridgeToken = config && typeof config.bridgeToken === "string" ? config.bridgeToken : "";
 const desktopBridge = window && window.rezDesktop && window.rezDesktop.runtime
   && window.rezDesktop.bus && typeof window.rezDesktop.bus.call === "function"
   ? window.rezDesktop
@@ -65,11 +66,10 @@ if (window && window.rezDesktop && window.rezDesktop.platform === "darwin") {
   document.documentElement.classList.add("desktop-mac");
 }
 
-const sdkFactory = ({ account } = {}) => new ChatRuntimeClient({
-  wsUrl,
-  accountId: account && account.accountId ? String(account.accountId).trim() : null,
-  deviceId: account && account.deviceId ? String(account.deviceId).trim() : null,
-  bridgeToken,
+const sdkFactory = ({ account } = {}) => new BrowserChatRuntimeClient({
+  account,
+  uplinks: browserUplinks,
+  logger: console,
 });
 const desktopSdkFactory = () => new DesktopRuntimeClient({ desktop: desktopBridge });
 
@@ -80,3 +80,9 @@ const app = new ChatApp({
   logger: console,
 });
 await app.start();
+
+if (!desktopBridge && "serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch((err) => {
+    console.error("[main] service worker registration failed", err && err.message ? err.message : err);
+  });
+}

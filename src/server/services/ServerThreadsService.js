@@ -1,4 +1,5 @@
 import { Hash } from "@rezprotocol/sdk/hash";
+import { bytesToBase64 } from "@rezprotocol/sdk/client";
 import { IMAGE_KIND, SYSTEM_EVENT_KIND } from "../../records/payloads/index.js";
 import { nonEmptyString } from "../../records/domain/coerce.js";
 import {
@@ -27,6 +28,13 @@ import { THREAD_TYPES } from "../storage/ChatThreadStore.js";
 import { BaseServerService } from "../base/BaseServerService.js";
 
 const PEER_LINK_PREVIEW_PREFIX = "[peer-link] ";
+
+function bytesToBase64Url(bytes) {
+  return bytesToBase64(bytes)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
 
 export class ServerThreadsService extends BaseServerService {
   #threadStore;
@@ -65,8 +73,7 @@ export class ServerThreadsService extends BaseServerService {
 
   groupThreadId(groupId) {
     const digest = Hash.sha256(new TextEncoder().encode("group:v1|" + String(groupId || "")));
-    const b64 = Buffer.from(digest.subarray(0, 16)).toString("base64")
-      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    const b64 = bytesToBase64Url(digest.subarray(0, 16));
     return "th_" + b64;
   }
 
@@ -85,8 +92,7 @@ export class ServerThreadsService extends BaseServerService {
     if (!id) return "";
     const remote = String(peerAccountId || "").trim();
     const digest = Hash.sha256(new TextEncoder().encode("direct:v1|" + id + "|" + remote));
-    const b64 = Buffer.from(digest.subarray(0, 16)).toString("base64")
-      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    const b64 = bytesToBase64Url(digest.subarray(0, 16));
     return "th_" + b64;
   }
 

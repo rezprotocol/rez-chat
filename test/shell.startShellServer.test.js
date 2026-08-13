@@ -172,7 +172,8 @@ test("static file returns correct content-type and body", async (t) => {
       const { port } = shell.address;
       const res = await fetch(`http://127.0.0.1:${port}/app.js`);
       assert.equal(res.status, 200);
-      assert.ok(res.headers.get("content-type")?.includes("javascript"));
+      const contentType = res.headers.get("content-type");
+      assert.ok(contentType && contentType.includes("javascript"));
       assert.equal(await res.text(), jsContent);
     } finally {
       await shell.stop();
@@ -265,8 +266,10 @@ test("nonce is fresh per request and appears in injected <script>", async (t) =>
 
       // Extract nonce from CSP header (format: 'nonce-{base64}')
       const nonceRe = /nonce-([A-Za-z0-9+/=]+)/;
-      const nonce1 = nonceRe.exec(csp1)?.[1];
-      const nonce2 = nonceRe.exec(csp2)?.[1];
+      const nonceMatch1 = nonceRe.exec(csp1);
+      const nonceMatch2 = nonceRe.exec(csp2);
+      const nonce1 = nonceMatch1 && nonceMatch1[1];
+      const nonce2 = nonceMatch2 && nonceMatch2[1];
 
       assert.ok(nonce1, "nonce1 must be present in CSP");
       assert.ok(nonce2, "nonce2 must be present in CSP");

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   GroupUpdatedEvent,
   GroupRemovedEvent,
@@ -6,6 +5,7 @@ import {
 import { GroupOpPayloadV1 } from "../../records/payloads/GroupOpPayloadV1.js";
 import { verifyMemberJoinProof } from "../../records/payloads/memberJoinProof.js";
 import { SYSTEM_EVENT_KIND } from "../../records/payloads/ChatSystemEventPayloadV1.js";
+import { runtimeUuid } from "@rezprotocol/sdk/client";
 
 const CREATOR_ROLE = "creator";
 // REZ-2: cap how many co-member peer-link bootstraps a single inbound
@@ -21,7 +21,7 @@ const MAX_BOOTSTRAP_PER_CONTACT_OP = 64;
 const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 function nowOpId() {
-  return "gop_" + randomUUID().replace(/-/g, "");
+  return "gop_" + runtimeUuid().replace(/-/g, "");
 }
 
 /**

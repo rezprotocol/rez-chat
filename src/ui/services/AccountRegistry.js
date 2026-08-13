@@ -76,4 +76,13 @@ export class AccountRegistry {
     reg.hints[trimmedId] = { ...reg.hints[trimmedId], accountIdHint: String(accountIdHint || "").trim() || null };
     return this.setRegistry(reg);
   }
+
+  async removeAccount(id) {
+    const reg = await this.getRegistry();
+    const trimmedId = String(id || "").trim();
+    if (!trimmedId) throw new Error("AccountRegistry.removeAccount requires id");
+    reg.accountIds = reg.accountIds.filter((accountId) => accountId !== trimmedId);
+    delete reg.hints[trimmedId];
+    return this.setRegistry(reg);
+  }
 }

@@ -1,4 +1,3 @@
-import { WebSocket } from "ws";
 import { createRezClient, REZ_CONTRACT_TYPES } from "@rezprotocol/sdk/client";
 import { ConnectionStateEvent } from "../../records/index.js";
 import { BaseServerService } from "../base/BaseServerService.js";
@@ -44,6 +43,7 @@ export class ServerRuntimeService extends BaseServerService {
     peerLinkService = null,
     inboxClaimant = null,
     expectedNodePublicKeyB64 = "",
+    wsFactory = null,
     logger = console,
   } = {}) {
     super({ bus, logger });
@@ -65,12 +65,18 @@ export class ServerRuntimeService extends BaseServerService {
     // launched node identity (docs/SECURITY_AUDIT.md CRITICAL-2): the SDK
     // refuses to authenticate against any node whose challenge claims a
     // different pubkey, even if its self-signature is valid.
+    const resolvedWsFactory = typeof wsFactory === "function"
+      ? wsFactory
+      : (typeof globalThis.WebSocket === "function" ? (url) => new globalThis.WebSocket(url) : null);
+    if (!sdk && !resolvedWsFactory) {
+      throw new Error("ServerRuntimeService requires sdk or a WebSocket implementation");
+    }
     this.#sdk = sdk || createRezClient({
       identity,
       uplinks,
       peerLinkService,
       clientVersion: "rez-chat-server/2.0",
-      wsFactory: (url) => new WebSocket(url),
+      wsFactory: resolvedWsFactory,
       expectedNodePublicKeyB64: typeof expectedNodePublicKeyB64 === "string" ? expectedNodePublicKeyB64.trim() : "",
     });
     this.bus.runtime.sdk = this.#sdk;
@@ -159,7 +165,8 @@ export class ServerRuntimeService extends BaseServerService {
   }
 
   async #registerInboxClaim() {
-    const debug = process.env.REZ_INBOX_DEBUG === "1";
+    const processRef = typeof process !== "undefined" ? process : null;
+    const debug = Boolean(processRef && processRef.env && processRef.env.REZ_INBOX_DEBUG === "1");
     const claimStore = this.#inboxClaimant.claimStore;
     const inboxId = this.#inboxClaimant.inboxId;
     const nodeIdentity = this.#resolveNodeIdentity();

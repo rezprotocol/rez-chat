@@ -226,6 +226,10 @@ export class DesktopAccountAuthService {
     return this._account;
   }
 
+  runtimeDisconnectMustSucceed() {
+    return false;
+  }
+
   takePendingServerSyncEnvelope() {
     return null;
   }

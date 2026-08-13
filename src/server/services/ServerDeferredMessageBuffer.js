@@ -1,3 +1,5 @@
+import { runtimeEnvFlag } from "../runtime/runtimeEnvFlag.js";
+
 /**
  * ServerDeferredMessageBuffer: holds decrypted group messages whose
  * authenticated sender is not YET an active member, keyed `groupId:accountId`,
@@ -50,7 +52,7 @@ export class ServerDeferredMessageBuffer {
     }
     if (bucket.length >= this.#maxPerKey) bucket.shift();
     bucket.push(event);
-    if (process.env.REZ_PEERLINK_TRACE === "1") {
+    if (runtimeEnvFlag("REZ_PEERLINK_TRACE")) {
       this.#logger.log("[PLTRACE] gate DEFER group=" + groupId + " sender=" + accountId + " (held=" + bucket.length + ")");
     }
   }
@@ -71,7 +73,7 @@ export class ServerDeferredMessageBuffer {
     const bucket = this.#map.get(key);
     if (!bucket || bucket.length === 0) return;
     this.#map.delete(key);
-    if (process.env.REZ_PEERLINK_TRACE === "1") {
+    if (runtimeEnvFlag("REZ_PEERLINK_TRACE")) {
       this.#logger.log("[PLTRACE] gate FLUSH group=" + gid + " sender=" + acct + " (n=" + bucket.length + ")");
     }
     this.#redelivering = true;

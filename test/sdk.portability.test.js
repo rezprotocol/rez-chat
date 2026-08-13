@@ -5,14 +5,24 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { browserChatRuntimeDbName } from "../src/client/runtime/bootstrapBrowserChatRuntime.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+test("browser chat runtime storage is partitioned by account", () => {
+  const alice = browserChatRuntimeDbName("rez:acct:alice");
+  const bob = browserChatRuntimeDbName("rez:acct:bob");
+
+  assert.notEqual(alice, bob);
+  assert.equal(alice, "rez-chat-runtime:rez:acct:alice");
+  assert.throws(() => browserChatRuntimeDbName(""), /requires accountId/);
+});
 
 function runOrThrow(cmd, args, { cwd, timeoutMs = 30_000 }) {
   const out = spawnSync(cmd, args, { cwd, encoding: "utf8", timeout: timeoutMs });
   if (out.status !== 0) {
     const detail = `${out.stdout || ""}\n${out.stderr || ""}`.trim();
-    const timeoutHint = out.error?.code === "ETIMEDOUT" ? `\n(command timed out after ${timeoutMs}ms)` : "";
+    const timeoutHint = out.error && out.error.code === "ETIMEDOUT" ? `\n(command timed out after ${timeoutMs}ms)` : "";
     throw new Error(`${cmd} ${args.join(" ")} failed in ${cwd}${timeoutHint}\n${detail}`);
   }
   return out.stdout || "";
@@ -71,7 +81,7 @@ test("SDK tarball installs into isolated app without workspace links", { timeout
         { cwd: sampleDir, timeoutMs: 45_000 },
       );
     } catch (err) {
-      const msg = String(err?.message || "");
+      const msg = String(err && err.message ? err.message : "");
       if (/ETIMEDOUT|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|network|fetch|timed out/i.test(msg)) {
         t.skip("npm install unavailable in this environment");
         return;

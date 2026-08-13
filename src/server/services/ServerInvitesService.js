@@ -42,9 +42,20 @@ export class ServerInvitesService extends BaseServerService {
   }
 
   /** True when inviteId was minted here as a real direct (1:1) contact invite. */
-  isDirectContactInvite(inviteId) {
+  async isDirectContactInvite(inviteId) {
     const id = typeof inviteId === "string" ? inviteId.trim() : "";
-    return id.length > 0 && this.#directContactInviteIds.has(id);
+    if (!id) return false;
+    if (this.#directContactInviteIds.has(id)) return true;
+
+    const peerLinks = this._peerLinks();
+    if (typeof peerLinks.getStoredInviteEnvelope !== "function") return false;
+    const stored = await peerLinks.getStoredInviteEnvelope(peerLinks.ownerAccountId, id);
+    const envelope = stored && stored.envelope && typeof stored.envelope === "object"
+      ? stored.envelope
+      : null;
+    const direct = !!envelope && envelope.kind === "direct";
+    if (direct) this.#rememberDirectContactInvite(id);
+    return direct;
   }
 
   #rememberDirectContactInvite(inviteId) {

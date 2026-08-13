@@ -59,10 +59,13 @@ function makeApp() {
     ownerAccountId: OWNER,
     clock: () => 1_700_000_000_000,
     sdk,
+    deviceLinkServiceFactory: ({ bus, storageProvider, ownerAccountId, clock, logger }) => (
+      new ServerDeviceLinkService({ bus, storageProvider, ownerAccountId, clock, logger })
+    ),
   });
 }
 
-test("the app EXPOSES the device-link service with a recovery lifecycle", () => {
+test("the node/desktop adapter EXPOSES its injected device-link recovery lifecycle", () => {
   const app = makeApp();
   const svc = app.bus.services.deviceLink;
   assert.ok(svc, "deviceLink is registered on the bus");
@@ -106,6 +109,9 @@ test("start() does not throw when this runtime cannot link devices at all", asyn
     ownerAccountId: OWNER,
     clock: () => 1_700_000_000_000,
     sdk,
+    deviceLinkServiceFactory: ({ bus, storageProvider, ownerAccountId, clock, logger }) => (
+      new ServerDeviceLinkService({ bus, storageProvider, ownerAccountId, clock, logger })
+    ),
   });
   await app.start();
   try {
