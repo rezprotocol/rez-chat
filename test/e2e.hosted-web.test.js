@@ -48,6 +48,27 @@ async function unlockAccount(page, password) {
   await waitConnected(page);
 }
 
+async function observePage(page, label) {
+  await page.addInitScript((pageLabel) => {
+    globalThis.addEventListener("unhandledrejection", (event) => {
+      const reason = event.reason;
+      const detail = reason && reason.stack ? reason.stack : String(reason);
+      console.error("[hosted-e2e:" + pageLabel + ":unhandledrejection] " + detail);
+    });
+  }, label);
+  page.on("console", (message) => {
+    console.log("[hosted-e2e:" + label + ":console:" + message.type() + "] " + message.text());
+  });
+  page.on("pageerror", (error) => {
+    console.error("[hosted-e2e:" + label + ":pageerror] " + error.stack);
+  });
+  page.on("requestfailed", (request) => {
+    const failure = request.failure();
+    console.error("[hosted-e2e:" + label + ":requestfailed] " + request.url()
+      + " " + (failure ? failure.errorText : "unknown"));
+  });
+}
+
 test("hosted web app: PWA + two-browser invite + offline durable catch-up", { timeout: 180_000 }, async (t) => {
   const browser = await chromium.launch({ executablePath: chromePath, headless: true });
   t.after(() => browser.close());
@@ -57,6 +78,10 @@ test("hosted web app: PWA + two-browser invite + offline durable catch-up", { ti
   t.after(() => bobContext.close());
   const alice = await aliceContext.newPage();
   let bob = await bobContext.newPage();
+  await Promise.all([
+    observePage(alice, "alice"),
+    observePage(bob, "bob"),
+  ]);
   const suffix = String(Date.now());
   const alicePassword = "hosted-alice-" + suffix;
   const bobPassword = "hosted-bob-" + suffix;
@@ -83,6 +108,8 @@ test("hosted web app: PWA + two-browser invite + offline durable catch-up", { ti
   await bob.getByTestId("invite.accept.input").fill(inviteCode);
   await bob.getByTestId("invite.accept.button").click();
   await bob.getByTestId("thread.row").waitFor({ state: "visible", timeout: 45_000 });
+  await alice.getByText("Hosted Bob " + suffix, { exact: true }).waitFor({ state: "visible", timeout: 45_000 });
+  await alice.getByTestId("nav.chat").click();
   await alice.getByTestId("thread.row").waitFor({ state: "visible", timeout: 45_000 });
 
   await bob.close();
@@ -92,6 +119,7 @@ test("hosted web app: PWA + two-browser invite + offline durable catch-up", { ti
   await alice.getByText(offlineText, { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
 
   bob = await bobContext.newPage();
+  await observePage(bob, "bob-reopened");
   await unlockAccount(bob, bobPassword);
   await bob.getByTestId("thread.row").waitFor({ state: "visible", timeout: 45_000 });
   await bob.getByTestId("thread.row").click();
