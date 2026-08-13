@@ -33,7 +33,7 @@ pub struct ShellPaths {
 use rand::RngCore;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
@@ -104,11 +104,20 @@ fn resolve_chat_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
             return Ok(PathBuf::from(trimmed));
         }
     }
-    let dev_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    if dev_root.join("src/desktop/sidecar-main.js").exists() {
-        return dev_root
-            .canonicalize()
-            .map_err(|err| format!("failed to resolve chat root: {}", err));
+    // A release binary may be launched on the same machine that compiled it.
+    // Never let the compile-time checkout path win there: the bundled Node
+    // and native modules are signed and built as one release unit. Mixing the
+    // bundled Node with a checkout's better-sqlite3 makes macOS reject the
+    // module (and can also cross Node ABIs). Only debug shells use the source
+    // tree automatically; REZ_CHAT_ROOT remains the explicit override.
+    #[cfg(debug_assertions)]
+    {
+        let dev_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        if dev_root.join("src/desktop/sidecar-main.js").exists() {
+            return dev_root
+                .canonicalize()
+                .map_err(|err| format!("failed to resolve chat root: {}", err));
+        }
     }
     let resource_root = app
         .path()
@@ -215,21 +224,51 @@ fn create_main_window(app: &tauri::AppHandle, init_script: &str) -> Result<(), S
     Ok(())
 }
 
-/// Reveal the (hidden) main window once its renderer is ready, then close
-/// the splash — after honoring the minimum splash hold so a fast boot does
-/// not flash the splash open/closed.
-fn handoff_to_main_window(app: &tauri::AppHandle, splash_shown_at: Instant) {
+/// Build and reveal the main window, create the tray, then close the splash.
+/// Every native UI operation runs on the platform main thread. The boot
+/// sequence itself stays on its worker thread so update and sidecar startup
+/// cannot freeze the splash.
+fn create_and_handoff_main_window(
+    app: &tauri::AppHandle,
+    init_script: String,
+    chat_root: PathBuf,
+    splash_shown_at: Instant,
+) -> Result<(), String> {
     let elapsed = splash_shown_at.elapsed();
     if elapsed < MIN_SPLASH_VISIBLE {
         std::thread::sleep(MIN_SPLASH_VISIBLE - elapsed);
     }
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.show();
-        let _ = main.set_focus();
-    }
-    if let Some(splash) = app.get_webview_window("splash") {
-        let _ = splash.close();
-    }
+
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let main_app = app.clone();
+    app.run_on_main_thread(move || {
+        let result = (|| -> Result<(), String> {
+            create_main_window(&main_app, &init_script)?;
+            if let Err(err) = tray::create_tray(&main_app, &chat_root) {
+                // Tray failure is cosmetic — log and continue, same as Electron.
+                eprintln!("[rez-shell] {}", err);
+            }
+            let main = main_app
+                .get_webview_window("main")
+                .ok_or_else(|| "main window missing after creation".to_string())?;
+            main.show()
+                .map_err(|err| format!("failed to show main window: {}", err))?;
+            main.set_focus()
+                .map_err(|err| format!("failed to focus main window: {}", err))?;
+            if let Some(splash) = main_app.get_webview_window("splash") {
+                splash
+                    .close()
+                    .map_err(|err| format!("failed to close splash window: {}", err))?;
+            }
+            Ok(())
+        })();
+        let _ = result_tx.send(result);
+    })
+    .map_err(|err| format!("failed to schedule main-window handoff: {}", err))?;
+
+    result_rx
+        .recv()
+        .map_err(|_| "main-window handoff ended without a result".to_string())?
 }
 
 /// Sidecar crash monitor (inverse of the zombie layers): when the sidecar
@@ -389,16 +428,16 @@ fn run_boot_sequence(app: tauri::AppHandle) {
     let init_script = build_bootstrap_script(&app, sidecar.ready.port, &control_token);
     app.manage(Arc::clone(&sidecar));
     app.manage(ShellPaths { chat_root: chat_root.clone() });
-    if let Err(err) = create_main_window(&app, &init_script) {
+    if let Err(err) = create_and_handoff_main_window(
+        &app,
+        init_script,
+        chat_root.clone(),
+        splash_shown_at,
+    ) {
         set_splash_status(&app, "error", &format!("Couldn't open Rez: {}", err));
         return;
     }
-    if let Err(err) = tray::create_tray(&app, &chat_root) {
-        // Tray failure is cosmetic — log and continue, same as Electron.
-        eprintln!("[rez-shell] {}", err);
-    }
     start_crash_monitor(app.clone(), Arc::clone(&sidecar));
-    handoff_to_main_window(&app, splash_shown_at);
     updater::start_periodic_checks(app.clone());
 }
 

@@ -11,7 +11,7 @@ import { DesktopSupervisor, defaultDesktopPaths } from "./runtime/DesktopSupervi
 import { registerDesktopRuntimeIpc } from "./runtime/registerDesktopIpc.js";
 import { registerDesktopCryptoChannels } from "./runtime/registerDesktopCryptoChannels.js";
 import { DesktopControlUplink } from "./transport/DesktopControlUplink.js";
-import { HostChannel } from "./sidecar/HostChannel.js";
+import { HostChannel, writeHostEvent } from "./sidecar/HostChannel.js";
 import { ParentWatchdog } from "./sidecar/ParentWatchdog.js";
 import { InstanceLock } from "./sidecar/InstanceLock.js";
 
@@ -335,6 +335,16 @@ const isMain =
 
 if (isMain) {
   startSidecar().catch((err) => {
+    const message = err && err.message ? String(err.message) : "unknown startup failure";
+    try {
+      writeHostEvent(process.stdout, "boot.failed", { message });
+    } catch (reportErr) {
+      sidecarLog(
+        "error",
+        "failed to report startup error:",
+        reportErr && reportErr.message ? reportErr.message : reportErr,
+      );
+    }
     sidecarLog("error", "failed to start:", err && err.stack ? err.stack : err);
     process.exit(1);
   });

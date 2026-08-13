@@ -1,6 +1,19 @@
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
 
+const HOST_CHANNEL_MARKER = "@@REZ@@";
+
+function writeFrame(output, frame) {
+  output.write(HOST_CHANNEL_MARKER + JSON.stringify(frame) + "\n");
+}
+
+export function writeHostEvent(output, op, params = {}) {
+  if (!output || typeof output.write !== "function") {
+    throw new Error("writeHostEvent requires output stream");
+  }
+  writeFrame(output, { kind: "evt", op: String(op), params });
+}
+
 /**
  * Line-delimited JSON-RPC between the Node sidecar and its host process
  * (the Tauri shell) over the sidecar's own stdio.
@@ -22,7 +35,7 @@ import { randomUUID } from "node:crypto";
  * is the backstop.
  */
 export class HostChannel {
-  static MARKER = "@@REZ@@";
+  static MARKER = HOST_CHANNEL_MARKER;
 
   #input;
   #output;
@@ -200,7 +213,7 @@ export class HostChannel {
     // Once the host is gone the pipe is dead — further writes only EPIPE.
     if (this.#outputDead || this.#parentGoneFired) return;
     try {
-      this.#output.write(HostChannel.MARKER + JSON.stringify(frame) + "\n");
+      writeFrame(this.#output, frame);
     } catch (err) {
       this.#warn("write failed", err);
     }

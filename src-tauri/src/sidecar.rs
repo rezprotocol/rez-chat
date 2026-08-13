@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 pub const HOST_CHANNEL_MARKER: &str = "@@REZ@@";
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct SidecarReady {
@@ -36,6 +37,11 @@ pub struct SidecarReady {
     pub pid: u32,
     #[allow(dead_code)]
     pub instance_id: String,
+}
+
+enum BootSignal {
+    Ready(SidecarReady),
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +79,58 @@ fn write_frame(stdin: &Arc<Mutex<Option<ChildStdin>>>, frame: &serde_json::Value
             eprintln!("[rez-shell] host-channel write failed: {}", err);
         }
         let _ = writer.flush();
+    }
+}
+
+fn stop_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn await_ready(
+    child: &mut Child,
+    boot_rx: &mpsc::Receiver<BootSignal>,
+    timeout: Duration,
+) -> Result<SidecarReady, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            stop_child(child);
+            return Err(format!(
+                "sidecar did not report ready within {}s",
+                timeout.as_secs()
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let poll_for = remaining.min(READY_POLL_INTERVAL);
+        match boot_rx.recv_timeout(poll_for) {
+            Ok(BootSignal::Ready(ready)) => return Ok(ready),
+            Ok(BootSignal::Failed(message)) => {
+                stop_child(child);
+                return Err(format!("sidecar failed before ready: {}", message));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let detail = match child.try_wait() {
+                    Ok(Some(status)) => format!("sidecar exited before ready ({})", status),
+                    Ok(None) => "sidecar closed its output before ready".to_string(),
+                    Err(err) => format!("sidecar status check failed before ready: {}", err),
+                };
+                stop_child(child);
+                return Err(detail);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!("sidecar exited before ready ({})", status));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                stop_child(child);
+                return Err(format!("sidecar status check failed before ready: {}", err));
+            }
+        }
     }
 }
 
@@ -114,7 +172,7 @@ impl SidecarHandle {
 
         let stdin = Arc::new(Mutex::new(Some(stdin)));
         let reader_stdin = Arc::clone(&stdin);
-        let (ready_tx, ready_rx) = mpsc::channel::<SidecarReady>();
+        let (boot_tx, boot_rx) = mpsc::channel::<BootSignal>();
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
@@ -142,7 +200,20 @@ impl SidecarHandle {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let _ = ready_tx.send(SidecarReady { port, pid, instance_id });
+                        let _ = boot_tx.send(BootSignal::Ready(SidecarReady {
+                            port,
+                            pid,
+                            instance_id,
+                        }));
+                        continue;
+                    }
+                    if kind == "evt" && op == "boot.failed" {
+                        let message = params
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown sidecar startup failure")
+                            .to_string();
+                        let _ = boot_tx.send(BootSignal::Failed(message));
                         continue;
                     }
                     if kind == "req" {
@@ -170,15 +241,9 @@ impl SidecarHandle {
             }
         });
 
-        let ready = match ready_rx.recv_timeout(READY_TIMEOUT) {
-            Ok(value) => value,
-            Err(_) => {
-                let _ = child.kill();
-                return Err("sidecar did not report ready within 60s".to_string());
-            }
-        };
+        let ready = await_ready(&mut child, &boot_rx, READY_TIMEOUT)?;
         if ready.port == 0 {
-            let _ = child.kill();
+            stop_child(&mut child);
             return Err("sidecar ready handshake carried no port".to_string());
         }
 

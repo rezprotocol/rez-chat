@@ -22,7 +22,23 @@ function nextNodeWsPort() {
 }
 
 function makeDataDir(label) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "rez-sidecar-" + label + "-"));
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "rez-sidecar-" + label + "-"));
+  const nodeDataDir = path.join(dataDir, "node-data");
+  fs.mkdirSync(nodeDataDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dataDir, "rez.config.json"),
+    JSON.stringify({
+      node: {
+        ws: { host: "127.0.0.1", port: 0, path: "/ws" },
+        storage: {
+          dataDir: nodeDataDir,
+          defaultThreadId: "th_sidecar_lifecycle_" + label,
+        },
+        network: { participateInRouting: true, knownRelays: [] },
+      },
+    }),
+  );
+  return dataDir;
 }
 
 function sidecarEnv(dataDir, extra = {}) {
@@ -62,6 +78,14 @@ function waitForFrame(stream, op, timeoutMs = 60000) {
           resolve(frame);
           return;
         }
+        if (frame && frame.op === "boot.failed" && op !== "boot.failed") {
+          clearTimeout(timer);
+          const message = frame.params && frame.params.message
+            ? String(frame.params.message)
+            : "unknown startup failure";
+          reject(new Error("sidecar failed before '" + op + "': " + message));
+          return;
+        }
       }
     });
   });
@@ -79,6 +103,55 @@ function waitForExit(child, timeoutMs = 15000) {
     });
   });
 }
+
+function attachBootHostResponder(child) {
+  let buffer = "";
+  child.stdout.on("data", (chunk) => {
+    buffer += String(chunk);
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.startsWith(MARKER)) continue;
+      let frame = null;
+      try {
+        frame = JSON.parse(line.slice(MARKER.length));
+      } catch (err) {
+        continue;
+      }
+      if (!frame || frame.kind !== "req") continue;
+      if (frame.op !== "keychain.probe" && frame.op !== "biometric.isAvailable") {
+        child.stdin.write(MARKER + JSON.stringify({
+          kind: "res",
+          id: frame.id,
+          ok: false,
+          error: { code: "UNEXPECTED_HOST_OP", message: "Unexpected boot host op " + frame.op },
+        }) + "\n");
+        continue;
+      }
+      child.stdin.write(MARKER + JSON.stringify({
+        kind: "res",
+        id: frame.id,
+        ok: true,
+        result: { available: false },
+      }) + "\n");
+    }
+  });
+}
+
+test("sidecar reports a structured startup failure before exiting", async () => {
+  const env = { ...process.env };
+  delete env.REZ_CHAT_USER_DATA_DIR;
+  delete env.REZ_CONTROL_TOKEN;
+  const child = spawn(process.execPath, [SIDECAR_ENTRY, "--rez-sidecar"], {
+    cwd: CHAT_ROOT,
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const failure = await waitForFrame(child.stdout, "boot.failed", 5000);
+  assert.match(failure.params.message, /requires env REZ_CHAT_USER_DATA_DIR/);
+  const exited = await waitForExit(child, 5000);
+  assert.equal(exited.code, 1);
+});
 
 function pidAlive(pid) {
   try {
@@ -105,6 +178,7 @@ function spawnSidecar(dataDir, envExtra = {}) {
     cwd: CHAT_ROOT,
   });
   child.stderr.on("data", () => {});
+  attachBootHostResponder(child);
   return child;
 }
 
@@ -146,6 +220,7 @@ test("sidecar exits via ppid backstop when parent is SIGKILLed (stdin kept open)
     },
   );
   parent.stderr.on("data", () => {});
+  attachBootHostResponder(parent);
   const ready = await waitForFrame(parent.stdout, "ready");
   const sidecarPid = ready.params.pid;
   assert.ok(Number.isInteger(sidecarPid) && sidecarPid > 0);
