@@ -59,13 +59,10 @@ function makeApp() {
     ownerAccountId: OWNER,
     clock: () => 1_700_000_000_000,
     sdk,
-    deviceLinkServiceFactory: ({ bus, storageProvider, ownerAccountId, clock, logger }) => (
-      new ServerDeviceLinkService({ bus, storageProvider, ownerAccountId, clock, logger })
-    ),
   });
 }
 
-test("the node/desktop adapter EXPOSES its injected device-link recovery lifecycle", () => {
+test("the platform-neutral app always registers the device-link recovery lifecycle", () => {
   const app = makeApp();
   const svc = app.bus.services.deviceLink;
   assert.ok(svc, "deviceLink is registered on the bus");

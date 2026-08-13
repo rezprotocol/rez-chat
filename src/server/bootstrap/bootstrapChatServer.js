@@ -4,7 +4,6 @@ import { WebSocket } from "ws";
 import { base64ToBytes } from "@rezprotocol/sdk/client";
 import { ensureChatServerIdentity } from "../identity/ChatServerIdentity.js";
 import { ServerLinksService } from "../services/ServerLinksService.js";
-import { ServerDeviceLinkService } from "../services/ServerDeviceLinkService.js";
 import { LinkPreviewStore } from "../storage/LinkPreviewStore.js";
 import {
   bootstrapChatRuntime,
@@ -103,15 +102,6 @@ export async function bootstrapChatServer({
         bus,
         linkPreviewStore: new LinkPreviewStore({ storageProvider: provider, clock }),
         ownerAccountId,
-        clock,
-        logger: serviceLogger,
-      })
-    ),
-    deviceLinkServiceFactory: ({ bus, storageProvider: provider, ownerAccountId, clock, logger: serviceLogger }) => (
-      new ServerDeviceLinkService({
-        bus,
-        ownerAccountId,
-        storageProvider: provider,
         clock,
         logger: serviceLogger,
       })

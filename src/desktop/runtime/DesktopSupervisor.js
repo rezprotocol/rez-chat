@@ -208,22 +208,20 @@ export class DesktopSupervisor {
       wsUrl,
       expectedNodePublicKeyB64,
       logger: this.#logger,
+      persistDelegation: (linked) => this.#vault.createDelegatedAccount({
+        profileName,
+        password,
+        deviceKeyPair: linked.delegation.deviceKeyPair,
+        delegationBundle: {
+          accountSignPublicKeyB64: linked.delegation.accountSignPublicKeyB64,
+          accountDhKeyPair: linked.delegation.accountDhKeyPair,
+          certChain: linked.delegation.certChain,
+          cachedDeviceSet: linked.delegation.cachedDeviceSet,
+        },
+        inboxId: linked.inboxId,
+      }),
     });
-    return this.#vault.createDelegatedAccount({
-      profileName,
-      password,
-      deviceKeyPair: result.delegation.deviceKeyPair,
-      delegationBundle: {
-        accountSignPublicKeyB64: result.delegation.accountSignPublicKeyB64,
-        accountDhKeyPair: result.delegation.accountDhKeyPair,
-        certChain: result.delegation.certChain,
-        cachedDeviceSet: result.delegation.cachedDeviceSet,
-      },
-      // P1#2 L3.5: the EXACT inbox the ceremony pre-registered (device.add). Persisting it
-      // here (instead of letting first boot mint a fresh one) is what stops the
-      // device.add(A)+device.bind(B) ACCOUNT_DEVICE_CONFLICT.
-      inboxId: result.inboxId,
-    });
+    return result.persistence;
   }
 
   async unlock(params = {}) {

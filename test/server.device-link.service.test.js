@@ -187,6 +187,7 @@ test("full ceremony through the directives: start → pending(fingerprint) → a
     code: started.linkCode,
     crypto: CRYPTO,
     records: overlay,
+    persistDelegation: async () => null,
     ...FAST,
   });
 
@@ -241,7 +242,7 @@ test("approve with a mismatched newDeviceId is rejected and the ceremony stays p
   const { svc, bus } = makeService({ overlay, keys });
   const started = await svc.startCeremony({});
   const requesterRun = runDeviceLinkRequester({
-    code: started.linkCode, crypto: CRYPTO, records: overlay, ...FAST, deadlineMs: 20_000,
+    code: started.linkCode, crypto: CRYPTO, records: overlay, persistDelegation: async () => null, ...FAST, deadlineMs: 20_000,
   }).catch((err) => err);
 
   const pending = await waitForEvent(bus, "pending");
@@ -264,7 +265,7 @@ test("cancel while pending vetoes the ceremony; the requester never gets a bundl
   const { svc, bus } = makeService({ overlay, keys });
   const started = await svc.startCeremony({});
   const requesterRun = runDeviceLinkRequester({
-    code: started.linkCode, crypto: CRYPTO, records: overlay, ...FAST, deadlineMs: 2_000,
+    code: started.linkCode, crypto: CRYPTO, records: overlay, persistDelegation: async () => null, ...FAST, deadlineMs: 2_000,
   }).catch((err) => err);
 
   await waitForEvent(bus, "pending");
@@ -302,7 +303,7 @@ test("gates: delegated runtime, missing B-dh, double start, no pending approve",
 async function runFullCeremony({ overlay, keys, svc, bus }) {
   const started = await svc.startCeremony({});
   await waitForEvent(bus, "code-issued");
-  const requesterRun = runDeviceLinkRequester({ code: started.linkCode, crypto: CRYPTO, records: overlay, ...FAST });
+  const requesterRun = runDeviceLinkRequester({ code: started.linkCode, crypto: CRYPTO, records: overlay, persistDelegation: async () => null, ...FAST });
   const pending = await waitForEvent(bus, "pending");
   await svc.approveCeremony({ newDeviceId: pending.newDeviceId });
   const requester = await requesterRun;
@@ -344,7 +345,7 @@ test("L4 fail-closed: a home that commits a DIFFERENT device never releases the 
 
   const started = await svc.startCeremony({});
   await waitForEvent(bus, "code-issued");
-  const requesterRun = runDeviceLinkRequester({ code: started.linkCode, crypto: CRYPTO, records: overlay, deadlineMs: 1200, ...FAST })
+  const requesterRun = runDeviceLinkRequester({ code: started.linkCode, crypto: CRYPTO, records: overlay, persistDelegation: async () => null, deadlineMs: 1200, ...FAST })
     .then(() => null).catch((err) => err);
   const pending = await waitForEvent(bus, "pending");
   await svc.approveCeremony({ newDeviceId: pending.newDeviceId });
@@ -378,7 +379,7 @@ test("L4 fail-closed: a failing device.add fails the ceremony and releases nothi
 
   const started = await svc.startCeremony({});
   await waitForEvent(bus, "code-issued");
-  const requesterRun = runDeviceLinkRequester({ code: started.linkCode, crypto: CRYPTO, records: overlay, deadlineMs: 1200, ...FAST })
+  const requesterRun = runDeviceLinkRequester({ code: started.linkCode, crypto: CRYPTO, records: overlay, persistDelegation: async () => null, deadlineMs: 1200, ...FAST })
     .then(() => null).catch((err) => err);
   const pending = await waitForEvent(bus, "pending");
   await svc.approveCeremony({ newDeviceId: pending.newDeviceId });

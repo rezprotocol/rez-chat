@@ -215,7 +215,9 @@ test("linkDevice runs the injected runner against the local node and provisions 
     chatApp,
     deviceLinkRunner: async (params) => {
       runnerCalls.push(params);
-      return { delegation, deviceId: "rez:dev:linked", fingerprint: "aaaa-bbbb-cccc-dddd-eeee" };
+      const linked = { delegation, deviceId: "rez:dev:linked", inboxId: "inbox:" + "ab".repeat(12), fingerprint: "aaaa-bbbb-cccc-dddd-eeee" };
+      const persistence = await params.persistDelegation(linked);
+      return { ...linked, persistence };
     },
     logger: { warn() {} },
   });

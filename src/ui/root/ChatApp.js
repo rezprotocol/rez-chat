@@ -54,6 +54,7 @@ export class ChatApp {
     mountEl,
     theme = {},
     sdkFactory = null,
+    deviceLinkRunner = null,
     storageProvider = null,
     logger = console,
   } = {}) {
@@ -74,7 +75,7 @@ export class ChatApp {
     });
     this._accountBoundary.start();
     this._createQueries();
-    this._createServices(sdkFactory);
+    this._createServices(sdkFactory, deviceLinkRunner);
     this._createHost();
     this._updateBanner = new UpdateAvailableBannerView();
     this._updateBanner.start();
@@ -109,7 +110,7 @@ export class ChatApp {
     };
   }
 
-  _createServices(sdkFactory) {
+  _createServices(sdkFactory, deviceLinkRunner) {
     const storageProvider = this._storageProvider;
     const useDesktopRuntime = hasDesktopRuntimeBridge();
     const hasStorage = storageProvider && typeof storageProvider.get === "function" && typeof storageProvider.put === "function";
@@ -134,6 +135,7 @@ export class ChatApp {
         sessionStore: this.bus.stores.session,
         authBootstrapService,
         cryptoProvider: createAuthCryptoProvider(),
+        deviceLinkRunner,
         logger: this._logger,
       });
     const sdkSessionService = new SdkSessionService({

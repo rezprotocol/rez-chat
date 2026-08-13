@@ -13,6 +13,7 @@ export function createAuthHarness({
   sdkClientFactory = null,
   sdkClient = null,
   cryptoProvider = null,
+  deviceLinkRunner = null,
   logger = console,
 } = {}) {
   // The auth lifecycle now writes the single SessionStore directly (AuthStore
@@ -35,6 +36,7 @@ export function createAuthHarness({
     sessionStore: resolvedStore,
     authBootstrapService,
     cryptoProvider,
+    deviceLinkRunner,
     logger,
   });
   const sdkSessionService = new SdkSessionService({
@@ -67,6 +69,9 @@ export function createAuthHarness({
     },
     async unlock(payload) {
       return accountAuthService.unlock(payload);
+    },
+    async linkDevice(payload) {
+      return accountAuthService.linkDevice(payload);
     },
     async logout() {
       await sdkSessionService.disconnect();

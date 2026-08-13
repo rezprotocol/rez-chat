@@ -29,6 +29,7 @@ import { ServerFileTransferService } from "../services/ServerFileTransferService
 import { ServerProfileService } from "../services/ServerProfileService.js";
 import { InboxCatchupService } from "../services/InboxCatchupService.js";
 import { GlobalGroupLookup } from "../services/GlobalGroupLookup.js";
+import { ServerDeviceLinkService } from "../services/ServerDeviceLinkService.js";
 
 export class ChatServerApp {
   #started;
@@ -387,19 +388,25 @@ export class ChatServerApp {
       }
       services.links = links;
     }
-    if (typeof deviceLinkServiceFactory === "function") {
-      const deviceLink = deviceLinkServiceFactory({
+    const deviceLink = typeof deviceLinkServiceFactory === "function"
+      ? deviceLinkServiceFactory({
+        bus: this.bus,
+        storageProvider: this.#storageProvider,
+        ownerAccountId: this.#ownerAccountId,
+        clock,
+        logger,
+      })
+      : new ServerDeviceLinkService({
         bus: this.bus,
         storageProvider: this.#storageProvider,
         ownerAccountId: this.#ownerAccountId,
         clock,
         logger,
       });
-      if (!deviceLink || typeof deviceLink !== "object") {
-        throw new Error("ChatServerApp deviceLinkServiceFactory returned invalid service");
-      }
-      services.deviceLink = deviceLink;
+    if (!deviceLink || typeof deviceLink !== "object") {
+      throw new Error("ChatServerApp deviceLinkServiceFactory returned invalid service");
     }
+    services.deviceLink = deviceLink;
     // The single serialized inbound path. Both the live SDK push
     // (MailboxPushBridge) and the catch-up drain (InboxCatchupService) feed
     // deposits through this one pipeline so each is fully applied before the

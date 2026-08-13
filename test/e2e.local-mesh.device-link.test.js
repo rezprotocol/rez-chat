@@ -231,6 +231,7 @@ test("live local mesh: the full PSK device-link ceremony provisions a delegated 
       wsUrl: newdevNode.wsUrl,
       timeoutMs: 60_000,
       logger: silentLogger,
+      persistDelegation: async () => null,
     });
 
     // The primary sees the request pending with the new device's fingerprint.

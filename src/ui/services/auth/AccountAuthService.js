@@ -1,5 +1,6 @@
 import {
   createKeystoreAccount,
+  createDelegatedKeystoreAccount,
   deriveBrowserAccountRecovery,
   generateBrowserMnemonic,
   openBrowserRecoveryMnemonic,
@@ -17,6 +18,7 @@ export class AccountAuthService {
     sessionStore,
     authBootstrapService,
     cryptoProvider = null,
+    deviceLinkRunner = null,
     logger = console,
   } = {}) {
     if (!sessionStore || !authBootstrapService) {
@@ -25,6 +27,7 @@ export class AccountAuthService {
     this._sessionStore = sessionStore;
     this._authBootstrapService = authBootstrapService;
     this._cryptoProvider = cryptoProvider;
+    this._deviceLinkRunner = typeof deviceLinkRunner === "function" ? deviceLinkRunner : null;
     this._logger = logger;
     this._account = null;
     this._pendingServerSyncEnvelope = null;
@@ -103,6 +106,87 @@ export class AccountAuthService {
     const result = await this.unlock({ accountId, password: pwd });
     this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
     return result;
+  }
+
+  async linkDevice({ linkCode = "", password = "", profileName = "" } = {}) {
+    const code = String(linkCode || "").trim();
+    const pwd = String(password || "");
+    const name = nonEmptyString(profileName);
+    if (!code) throw new Error("Enter the link code from your primary device.");
+    if (!name) throw new Error("Enter a name for this device.");
+    if (pwd.length < 8) throw new Error("Password must be at least 8 characters.");
+    if (!this._deviceLinkRunner) {
+      throw new Error("Browser device linking is unavailable in this build.");
+    }
+    if (this._authBootstrapService.hasLegacyStore() || !this._authBootstrapService.hasAccountRegistry()) {
+      throw new Error("Browser device linking requires account-partitioned browser storage.");
+    }
+
+    const accounts = await this._authBootstrapService.listAccounts();
+    const storeKey = accounts.length === 0
+      ? this._authBootstrapService.defaultAccountKey
+      : `account-${Date.now()}`;
+    const store = this._authBootstrapService.getKeystoreStore(storeKey);
+    if (await store.hasKeystore()) throw new Error("Account storage slot already exists.");
+
+    let linked;
+    try {
+      linked = await this._deviceLinkRunner({
+        linkCode: code,
+        persistDelegation: (result) => this.#persistLinkedDevice({
+          result,
+          storeKey,
+          store,
+          password: pwd,
+          profileName: name,
+        }),
+      });
+    } catch (err) {
+      // A failure after persistence but before confirmation must not leave a
+      // browser account that looks usable. The primary's durable ceremony
+      // journal owns the corresponding compensating revoke.
+      if (await store.hasKeystore()) {
+        await this._cleanupFailedBrowserAccount(storeKey, store, null, true);
+      }
+      throw err;
+    }
+    if (!linked || !linked.persistence || linked.persistence.storeKey !== storeKey) {
+      throw new Error("Device linking completed without a durable browser keystore.");
+    }
+    const result = await this.unlock({ accountId: linked.persistence.storeKey, password: pwd });
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
+    return result;
+  }
+
+  async #persistLinkedDevice({ result, storeKey, store, password, profileName } = {}) {
+    const delegation = result && result.delegation && typeof result.delegation === "object"
+      ? result.delegation
+      : null;
+    if (!delegation) throw new Error("Device linking returned no delegation bundle.");
+    let registryAdded = false;
+    try {
+      const created = await createDelegatedKeystoreAccount({
+        password,
+        profileName,
+        keystoreStore: store,
+        cryptoProvider: this._cryptoProvider,
+        delegation: {
+          accountSignPublicKeyB64: delegation.accountSignPublicKeyB64,
+          accountDhKeyPair: delegation.accountDhKeyPair,
+          deviceKeyPair: delegation.deviceKeyPair,
+          certChain: delegation.certChain,
+          cachedDeviceSet: delegation.cachedDeviceSet === undefined ? null : delegation.cachedDeviceSet,
+          inboxId: result.inboxId === undefined ? null : result.inboxId,
+        },
+      });
+      await this._authBootstrapService.addAccount(storeKey, profileName);
+      registryAdded = true;
+      await this._authBootstrapService.setAccountIdHint(storeKey, created.accountId);
+      return { storeKey, accountId: created.accountId };
+    } catch (err) {
+      await this._cleanupFailedBrowserAccount(storeKey, store, null, registryAdded);
+      throw err;
+    }
   }
 
   async unlock({ accountId = null, password = "" } = {}) {
@@ -383,8 +467,8 @@ export class AccountAuthService {
   async _cleanupFailedBrowserAccount(storeKey, mainStore, recoveryStore, registryAdded) {
     const cleanupTasks = [
       ["main keystore", () => mainStore.clearKeystore()],
-      ["recovery envelope", () => recoveryStore.clearKeystore()],
     ];
+    if (recoveryStore) cleanupTasks.push(["recovery envelope", () => recoveryStore.clearKeystore()]);
     if (registryAdded) {
       cleanupTasks.push(["account registry", () => this._authBootstrapService.removeAccount(storeKey)]);
     }

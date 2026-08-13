@@ -22,6 +22,7 @@ export async function runDeviceLinkRequester({
   expectedNodePublicKeyB64 = "",
   timeoutMs = 180_000,
   logger = console,
+  persistDelegation = null,
 } = {}) {
   if (typeof linkCode !== "string" || linkCode.trim().length === 0) {
     throw new Error("runDeviceLinkRequester requires linkCode");
@@ -55,6 +56,7 @@ export async function runDeviceLinkRequester({
       crypto: cryptoProvider,
       records: sdk.durableRecords,
       deadlineMs: timeoutMs,
+      persistDelegation,
     });
   } finally {
     try {

@@ -75,10 +75,11 @@ or plaintext into the hosted node.
 The web build is installable as a PWA. Its service worker may cache only the static application
 shell. `/ws`, `/config`, `/health`, `/ready`, and protocol responses are always network-owned.
 
-Browser-to-browser device linking is not in the hosted beta: the current approval/join ceremony
-still depends on desktop-only seed tooling. The browser must fail this path explicitly rather than
-shipping a Node crypto shim. Phrase recovery creates a fresh authorized root device; delegated
-device linking remains desktop-primary until the ceremony stack is browser-safe.
+Browser-to-browser device linking uses the same account-blind durable-record rendezvous as desktop.
+The primary browser authors the root-signed delegation, while the new browser generates and retains
+its device key locally, persists the seedless delegated keystore, and then boots the normal client-
+owned runtime. No Node crypto shim or hosted-node key custody is involved. Phrase recovery remains
+the separate root-device recovery path.
 
 ### Browser recovery
 

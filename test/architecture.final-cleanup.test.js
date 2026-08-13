@@ -79,3 +79,10 @@ test("client auth scene surface uses split login scenes and no scene-local mode 
   assert.equal(fs.existsSync(path.join(SRC_DIR, "ui/scenes/LoginCreateAccountScene.js")), true);
   assert.equal(fs.existsSync(path.join(SRC_DIR, "ui/scenes/LoginScene.js")), false);
 });
+
+test("ChatApp forwards the hosted device-link runner into browser auth", () => {
+  const content = readFile("ui/root/ChatApp.js");
+  assert.match(content, /this\._createServices\(sdkFactory, deviceLinkRunner\)/);
+  assert.match(content, /_createServices\(sdkFactory, deviceLinkRunner\)/);
+  assert.match(content, /new AccountAuthService\([\s\S]*?deviceLinkRunner,/);
+});

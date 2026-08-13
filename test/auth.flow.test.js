@@ -1,10 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 
-import { KeystoreStore } from "@rezprotocol/sdk/client";
+import {
+  BrowserCryptoProvider,
+  KeystoreStore,
+} from "@rezprotocol/sdk/client";
+import { DEVICE_LINK_LEAF_CAPABILITIES } from "@rezprotocol/sdk/device-link";
+import {
+  AccountDeviceCapabilityV1,
+  ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
+  DeviceRegistrationV1,
+} from "@rezprotocol/core";
 import { SessionStore, SESSION_STATUS } from "../src/ui/stores/SessionStore.js";
 import { AccountRegistry } from "../src/ui/services/AccountRegistry.js";
 import { createAuthHarness } from "./_helpers/createAuthHarness.js";
+import { runBrowserDeviceLinkRequester } from "../src/client/runtime/BrowserDeviceLinkRunner.js";
 
 function createMemoryStorage() {
   const mem = new Map();
@@ -43,6 +54,64 @@ function createSdkFactory(metrics) {
       };
     },
   });
+}
+
+function keyPair(alg) {
+  const generated = crypto.generateKeyPairSync(alg);
+  return {
+    publicKeyB64: Buffer.from(generated.publicKey.export({ format: "der", type: "spki" })).toString("base64"),
+    privateKeyB64: Buffer.from(generated.privateKey.export({ format: "der", type: "pkcs8" })).toString("base64"),
+    privateKey: generated.privateKey,
+  };
+}
+
+function deviceLinkResult() {
+  const account = keyPair("ed25519");
+  const accountDh = keyPair("x25519");
+  const device = keyPair("ed25519");
+  const issuedAtMs = Date.now();
+  const fields = {
+    v: 1,
+    purpose: ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
+    accountIdentityPublicKeyB64: account.publicKeyB64,
+    parentCertId: null,
+    granteeDevicePublicKeyB64: device.publicKeyB64,
+    granteeDeviceId: DeviceRegistrationV1.deviceIdFor(device.publicKeyB64),
+    capabilities: [...DEVICE_LINK_LEAF_CAPABILITIES],
+    maxDelegationDepth: 0,
+    issuedAtMs,
+    expiresAtMs: issuedAtMs + 3_600_000,
+    signerPublicKeyB64: account.publicKeyB64,
+  };
+  const certId = AccountDeviceCapabilityV1.deriveCertId(fields);
+  const sigB64 = Buffer.from(crypto.sign(
+    null,
+    Buffer.from(AccountDeviceCapabilityV1.signableBytes({ ...fields, certId })),
+    account.privateKey,
+  )).toString("base64");
+  const cert = new AccountDeviceCapabilityV1({
+    ...fields,
+    certId,
+    sig: { alg: "ed25519", sigB64 },
+  });
+  return {
+    delegation: {
+      accountSignPublicKeyB64: account.publicKeyB64,
+      accountDhKeyPair: {
+        publicKeyB64: accountDh.publicKeyB64,
+        privateKeyB64: accountDh.privateKeyB64,
+      },
+      deviceKeyPair: {
+        publicKeyB64: device.publicKeyB64,
+        privateKeyB64: device.privateKeyB64,
+      },
+      certChain: [cert.toJSON()],
+      cachedDeviceSet: null,
+    },
+    deviceId: fields.granteeDeviceId,
+    inboxId: "inbox:" + "ab".repeat(12),
+    fingerprint: "aaaa-bbbb-cccc-dddd-eeee",
+  };
 }
 
 test("auth init with empty storage starts in NO_KEYSTORE", async () => {
@@ -84,6 +153,164 @@ test("createAccount persists keystore and transitions to UNLOCKED", async () => 
 
   const envelope = await new KeystoreStore({ storageProvider: storage }).getKeystoreEnvelope();
   assert.equal(envelope != null, true);
+});
+
+test("browser device linking persists a seedless delegated keystore and unlocks it", async () => {
+  const storage = createMemoryStorage();
+  const linked = deviceLinkResult();
+  const calls = [];
+  const service = createAuthHarness({
+    storageProvider: storage,
+    accountRegistry: new AccountRegistry({ storageProvider: storage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    deviceLinkRunner: async (params) => {
+      calls.push(params);
+      const persistence = await params.persistDelegation(linked);
+      return { ...linked, persistence };
+    },
+    logger: console,
+  });
+
+  await service.init();
+  await service.linkDevice({
+    linkCode: "rez:link:v1:test",
+    profileName: "Phone",
+    password: "password-phone",
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].linkCode, "rez:link:v1:test");
+  assert.equal(typeof calls[0].persistDelegation, "function");
+  const account = service.getAccount();
+  assert.equal(account.hasAdminRoot, false);
+  assert.equal(account.identityKeyPair, null);
+  assert.equal(account.deviceId, linked.deviceId);
+  assert.equal(account.inboxId, linked.inboxId);
+  assert.deepEqual(account.accountIdentityDhKeyPair, linked.delegation.accountDhKeyPair);
+  assert.equal((await service.listAccounts())[0].label, "Phone");
+  assert.equal(await service.authBootstrapService.getRecoveryStore("default").hasKeystore(), false);
+
+  await service.logout();
+  await service.init();
+  await service.unlock({ password: "password-phone" });
+  assert.equal(service.getAccount().hasAdminRoot, false, "delegated mode survives a cold unlock");
+  assert.equal(service.getAccount().inboxId, linked.inboxId, "the pre-registered inbox survives a cold unlock");
+});
+
+test("browser device linking cleans up the delegated keystore when registry admission fails", async () => {
+  const storage = createMemoryStorage();
+  const registry = new AccountRegistry({ storageProvider: storage });
+  registry.addAccount = async () => {
+    throw new Error("registry unavailable");
+  };
+  const service = createAuthHarness({
+    storageProvider: storage,
+    accountRegistry: registry,
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    deviceLinkRunner: async ({ persistDelegation }) => {
+      const linked = deviceLinkResult();
+      const persistence = await persistDelegation(linked);
+      return { ...linked, persistence };
+    },
+    logger: console,
+  });
+  await service.init();
+
+  await assert.rejects(
+    () => service.linkDevice({
+      linkCode: "rez:link:v1:test",
+      profileName: "Orphan phone",
+      password: "password-phone",
+    }),
+    /registry unavailable/,
+  );
+  assert.equal(await service.authBootstrapService.getKeystoreStore("default").hasKeystore(), false);
+});
+
+test("browser device linking removes a persisted keystore when confirmation fails", async () => {
+  const storage = createMemoryStorage();
+  const service = createAuthHarness({
+    storageProvider: storage,
+    accountRegistry: new AccountRegistry({ storageProvider: storage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    deviceLinkRunner: async ({ persistDelegation }) => {
+      await persistDelegation(deviceLinkResult());
+      throw new Error("confirmation publish failed");
+    },
+    logger: console,
+  });
+  await service.init();
+
+  await assert.rejects(
+    () => service.linkDevice({
+      linkCode: "rez:link:v1:test",
+      profileName: "Interrupted phone",
+      password: "password-phone",
+    }),
+    /confirmation publish failed/,
+  );
+  assert.equal(await service.authBootstrapService.getKeystoreStore("default").hasKeystore(), false);
+  assert.deepEqual(await service.listAccounts(), []);
+});
+
+test("browser device-link runner uses an account-blind temporary session and always closes it", async () => {
+  const cryptoProvider = new BrowserCryptoProvider();
+  const durableRecords = { put() {}, get() {} };
+  const calls = [];
+  let connects = 0;
+  let closes = 0;
+  const expected = { delegation: {}, inboxId: "inbox:test" };
+  const result = await runBrowserDeviceLinkRequester({
+    linkCode: " rez:link:v1:test ",
+    uplinks: ["wss://chat.example/ws"],
+    cryptoProvider,
+    sdkFactory: (options) => {
+      calls.push(options);
+      return {
+        durableRecords,
+        async connect() { connects += 1; },
+        async close() { closes += 1; },
+      };
+    },
+    requester: async (params) => {
+      assert.equal(params.code, "rez:link:v1:test");
+      assert.equal(params.records, durableRecords);
+      return expected;
+    },
+    wsFactory: () => ({}),
+  });
+
+  assert.equal(result, expected);
+  assert.equal(connects, 1);
+  assert.equal(closes, 1);
+  assert.match(calls[0].identity.accountId, /^rez:acct:/);
+  assert.match(calls[0].identity.deviceId, /^rez:dev:[0-9a-f]{64}$/);
+  assert.equal(calls[0].identity.publicKeyB64.length > 0, true);
+  assert.equal(calls[0].identity.privateKeyB64.length > 0, true);
+  assert.deepEqual(calls[0].uplinks, ["wss://chat.example/ws"]);
+});
+
+test("browser device-link runner closes its temporary client when the ceremony fails", async () => {
+  let closes = 0;
+  await assert.rejects(
+    () => runBrowserDeviceLinkRequester({
+      linkCode: "rez:link:v1:test",
+      uplinks: ["wss://chat.example/ws"],
+      cryptoProvider: new BrowserCryptoProvider(),
+      sdkFactory: () => ({
+        durableRecords: {},
+        async connect() {},
+        async close() { closes += 1; },
+      }),
+      requester: async () => { throw new Error("ceremony failed"); },
+      wsFactory: () => ({}),
+    }),
+    /ceremony failed/,
+  );
+  assert.equal(closes, 1);
 });
 
 test("reload with existing keystore starts LOCKED; wrong password fails closed", async () => {
