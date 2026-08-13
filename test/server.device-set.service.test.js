@@ -261,9 +261,10 @@ test("Audit R2 #2: a re-PUBLISHED (re-sealed, same revision) set does NOT reset 
   const { encryptedPacket: m1 } = await bob.svc.encryptDirectMessageForDevice({ peerAccountId: alice.accountId, peerLinkId: "pl_bob_alice", peerDeviceId: alice.deviceId, plaintextBytes: enc("one") });
   assert.equal(dec((await alice.svc.decryptFromDevice({ peerAccountId: bob.accountId, peerLinkId: "pl_alice_bob", peerDeviceId: bob.deviceId, packetBytes: m1.toBytes() })).plaintextBytes), "one");
 
-  // Alice re-publishes — same devices + same revision, but a FRESH seal nonce, so
-  // the sealed ciphertext at the slot is byte-different. The old ciphertext-key
-  // compare would treat this as "changed" and re-ingest, resetting Bob's session.
+  // Alice re-publishes LATER — same devices + same revision, but fresh timestamps,
+  // inner signature, prekey, and seal. This is the production reconnect path that
+  // previously looked like same-revision equivocation.
+  now += 60 * 1000;
   await aliceDeviceSet.publishForPeer({ peerAccountId: bob.accountId });
 
   now += 6 * 60 * 1000; // past the 5-minute cache TTL ⇒ Bob re-fetches + re-ingests
