@@ -26,7 +26,9 @@ export class ServerRuntimeService extends BaseServerService {
   #connected;
   #lastStatus;
   #offState;
+  #offReconnect;
   #offMailboxPushBridge;
+  #reconnectPromise;
 
   #inboxClaimant;
 
@@ -56,7 +58,9 @@ export class ServerRuntimeService extends BaseServerService {
     this.#connected = false;
     this.#lastStatus = "";
     this.#offState = null;
+    this.#offReconnect = null;
     this.#offMailboxPushBridge = null;
+    this.#reconnectPromise = null;
     this.#hasAccountKey = Boolean(identity.privateKeyB64);
     // Tests inject a fake `sdk`; production wires via createRezClient.
     // peerLinkService is injected by ChatServerApp so the SDK can encrypt
@@ -89,14 +93,24 @@ export class ServerRuntimeService extends BaseServerService {
     this.bus.runtime.inboxClaimant = inboxClaimant;
     this._register("runtime", "connect", () => this.connect());
     this._register("runtime", "disconnect", () => this.disconnect());
-    if (typeof this.#sdk.onState === "function") {
+    if (typeof this.#sdk.onPoolState === "function") {
+      this.#offState = this.#sdk.onPoolState((state) => this.#handlePoolState(state));
+    } else if (typeof this.#sdk.onState === "function") {
       this.#offState = this.#sdk.onState((state) => this.#handlePoolState(state));
+    }
+    const connectivity = this.#sdk && this.#sdk.connectivity ? this.#sdk.connectivity : null;
+    if (connectivity && typeof connectivity.onReconnected === "function") {
+      this.#offReconnect = connectivity.onReconnected(() => this.#restoreAfterReconnect());
     }
   }
 
   #handlePoolState(state) {
     const status = mapPoolPhaseToStatus(state && state.phase);
     if (!status) return;
+    // A replacement transport has a fresh server-side session. Keep the app in
+    // reconnecting state until the awaited onReconnected hook has replayed the
+    // inbox claim and device binding for that session.
+    if (status === "connected") return;
     if (status === this.#lastStatus) return;
     this.#lastStatus = status;
     const event = new ConnectionStateEvent({
@@ -124,6 +138,26 @@ export class ServerRuntimeService extends BaseServerService {
     // it (Audit R3 #3). Without this the node could flip its E6 gate at Slice 8
     // and the sender would still silently take the legacy single-device path.
     // Defaults false ⇒ fs / DO-relay / gate-closed pg nodes are unchanged.
+    await this.#bindCurrentSession();
+    // Single owner of the SDK's onMailboxDeposited subscription. Forwards
+    // each push frame onto the chat bus so ServerEventService,
+    // ServerPeerLinkProtocolService, and the InboxCatchupService all
+    // dispatch through one canonical bus event.
+    this.#offMailboxPushBridge = MailboxPushBridge.attach({
+      sdk: this.#sdk,
+      bus: this.bus,
+      logger: this.logger,
+    });
+    this.#connected = true;
+    this.#lastStatus = "connected";
+    const event = new ConnectionStateEvent({ status: "connected" });
+    this.bus.resolveReady.runtime();
+    this._emit("runtime.connected", event);
+    this._emit("connection.state", event);
+    return this.#sdk;
+  }
+
+  async #bindCurrentSession() {
     this.bus.runtime.multiDeviceFanout = nodeEnablesMultiDeviceFanout(this.#sdk);
     // Register chat-server's persistent inbox claim with the node. The node
     // persists the inboxId → claimantPublicKey mapping in its
@@ -146,22 +180,29 @@ export class ServerRuntimeService extends BaseServerService {
         await this.#publishMultiDeviceSet();
       }
     }
-    // Single owner of the SDK's onMailboxDeposited subscription. Forwards
-    // each push frame onto the chat bus so ServerEventService,
-    // ServerPeerLinkProtocolService, and the InboxCatchupService all
-    // dispatch through one canonical bus event.
-    this.#offMailboxPushBridge = MailboxPushBridge.attach({
-      sdk: this.#sdk,
-      bus: this.bus,
-      logger: this.logger,
-    });
-    this.#connected = true;
-    this.#lastStatus = "connected";
-    const event = new ConnectionStateEvent({ status: "connected" });
-    this.bus.resolveReady.runtime();
-    this._emit("runtime.connected", event);
-    this._emit("connection.state", event);
-    return this.#sdk;
+  }
+
+  async #restoreAfterReconnect() {
+    if (!this.#connected) return;
+    if (this.#reconnectPromise) return this.#reconnectPromise;
+    this.#reconnectPromise = (async () => {
+      await this.#bindCurrentSession();
+      this.#lastStatus = "connected";
+      const event = new ConnectionStateEvent({ status: "connected" });
+      this._emit("runtime.connected", event);
+      this._emit("connection.state", event);
+    })();
+    try {
+      await this.#reconnectPromise;
+    } catch (err) {
+      this.#lastStatus = "offline";
+      const reason = err && err.message ? err.message : "session restore failed";
+      this._emit("connection.state", new ConnectionStateEvent({ status: "offline", reason }));
+      this.logger.error("[ServerRuntimeService] reconnect session restore failed: " + reason);
+      throw err;
+    } finally {
+      this.#reconnectPromise = null;
+    }
   }
 
   async #registerInboxClaim() {
@@ -325,6 +366,10 @@ export class ServerRuntimeService extends BaseServerService {
   }
 
   async stop() {
+    if (typeof this.#offReconnect === "function") {
+      try { this.#offReconnect(); } catch { /* ignore */ }
+      this.#offReconnect = null;
+    }
     if (typeof this.#offState === "function") {
       try { this.#offState(); } catch { /* ignore */ }
       this.#offState = null;

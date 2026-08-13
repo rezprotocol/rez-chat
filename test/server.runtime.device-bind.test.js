@@ -13,7 +13,9 @@ const INBOX = "rez:inbox:chat-server";
 
 function makeBus() {
   const handlers = new Map();
+  const events = [];
   return {
+    events,
     runtime: {},
     stores: {},
     // MailboxPushBridge.attach requires an inboundPipeline with submit(); no
@@ -25,7 +27,12 @@ function makeBus() {
       handlers.get(name).add(fn);
       return () => handlers.get(name).delete(fn);
     },
-    emit() {},
+    emit(name, payload) {
+      events.push({ name, payload });
+      const listeners = handlers.get(name);
+      if (!listeners) return;
+      for (const listener of [...listeners]) listener(payload);
+    },
     registerFunction() {},
     call() { return Promise.resolve(null); },
   };
@@ -47,9 +54,16 @@ function makeInboxClaimant() {
 
 function makeSdk({ durable = true, deviceKeyPub = "device-pub", bindImpl = null, gateOpen = false } = {}) {
   const calls = { bind: [], buildReg: 0, buildBinding: [], sendRequest: [] };
+  let reconnectHandler = null;
   const REGISTRATION = { __kind: "DeviceRegistrationV1" };
   const sdk = {
     async connect() {},
+    connectivity: {
+      onReconnected(handler) {
+        reconnectHandler = handler;
+        return () => { reconnectHandler = null; };
+      },
+    },
     onState() { return () => {}; },
     getSessionInfo() {
       return {
@@ -76,7 +90,15 @@ function makeSdk({ durable = true, deviceKeyPub = "device-pub", bindImpl = null,
       },
     },
   };
-  return { sdk, calls, REGISTRATION };
+  return {
+    sdk,
+    calls,
+    REGISTRATION,
+    async reconnect() {
+      if (!reconnectHandler) throw new Error("reconnect handler unavailable");
+      return reconnectHandler();
+    },
+  };
 }
 
 function makeService({ sdk, identity = null }) {
@@ -116,6 +138,33 @@ test("durable node + device key: device.bind is called once with the built recor
   assert.deepEqual(calls.buildBinding, [INBOX], "binding built for the claimed inbox");
   assert.equal(calls.bind[0].deviceRegistration, REGISTRATION, "the built registration is forwarded verbatim");
   assert.deepEqual(calls.bind[0].deviceInboxBinding, { __kind: "DeviceInboxBindingV1", inboxId: INBOX });
+});
+
+test("replacement transport replays session-scoped claim and device binding before reporting connected", async () => {
+  const fixture = makeSdk({ durable: true, deviceKeyPub: "device-pub" });
+  const { svc, bus } = makeService({ sdk: fixture.sdk });
+  await svc.connect();
+  bus.events.length = 0;
+
+  await fixture.reconnect();
+
+  assert.equal(fixture.calls.sendRequest.length, 2, "inbox claim replayed onto the replacement session");
+  assert.equal(fixture.calls.bind.length, 2, "device binding replayed onto the replacement session");
+  assert.deepEqual(bus.events.map((entry) => entry.name), ["runtime.connected", "connection.state"]);
+  assert.equal(bus.events[1].payload.status, "connected");
+});
+
+test("replacement transport restoration rejects when its inbox claim cannot be rebound", async () => {
+  const fixture = makeSdk({ durable: true, deviceKeyPub: "device-pub" });
+  const { svc, bus } = makeService({ sdk: fixture.sdk });
+  await svc.connect();
+  fixture.sdk.sendRequest = async () => { throw new Error("claim backend unavailable"); };
+  bus.events.length = 0;
+
+  await assert.rejects(() => fixture.reconnect(), /claim backend unavailable/);
+  assert.equal(bus.events.length, 1);
+  assert.equal(bus.events[0].name, "connection.state");
+  assert.equal(bus.events[0].payload.status, "offline");
 });
 
 test("R3 #3: gate OPEN bridges multiDeviceFanout onto bus.runtime (send-path gate can engage)", async () => {
