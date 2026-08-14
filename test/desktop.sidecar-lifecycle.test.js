@@ -307,28 +307,40 @@ test("instance lock cleanup kills a verified abandoned sidecar", async () => {
   orphan.kill("SIGKILL");
 });
 
-test("parent watchdog unit: fires on ppid change", () => {
+function waitForParentGone(processRef, afterStart) {
+  return new Promise((resolve, reject) => {
+    let watchdog = null;
+    const deadline = setTimeout(() => {
+      if (watchdog) watchdog.stop();
+      reject(new Error("ParentWatchdog did not fire before the test deadline"));
+    }, 1000);
+    watchdog = new ParentWatchdog({
+      pollMs: 20,
+      onParentGone: (reason) => {
+        watchdog.stop();
+        clearTimeout(deadline);
+        resolve(reason);
+      },
+      processRef,
+      logger: { warn() {} },
+    });
+    watchdog.start();
+    if (afterStart) afterStart();
+  });
+}
+
+test("parent watchdog unit: fires on ppid change", async () => {
   const fakeProcess = {
     ppid: 100,
     kill() {},
   };
-  return new Promise((resolve) => {
-    const wd = new ParentWatchdog({
-      pollMs: 20,
-      onParentGone: (reason) => {
-        wd.stop();
-        assert.match(reason, /ppid changed/);
-        resolve();
-      },
-      processRef: fakeProcess,
-      logger: { warn() {} },
-    });
-    wd.start();
+  const reason = await waitForParentGone(fakeProcess, () => {
     fakeProcess.ppid = 1;
   });
+  assert.match(reason, /ppid changed/);
 });
 
-test("parent watchdog unit: fires when the parent pid stops existing", () => {
+test("parent watchdog unit: fires when the parent pid stops existing", async () => {
   const fakeProcess = {
     ppid: 4242,
     kill() {
@@ -337,17 +349,6 @@ test("parent watchdog unit: fires when the parent pid stops existing", () => {
       throw err;
     },
   };
-  return new Promise((resolve) => {
-    const wd = new ParentWatchdog({
-      pollMs: 20,
-      onParentGone: (reason) => {
-        wd.stop();
-        assert.match(reason, /no longer exists/);
-        resolve();
-      },
-      processRef: fakeProcess,
-      logger: { warn() {} },
-    });
-    wd.start();
-  });
+  const reason = await waitForParentGone(fakeProcess);
+  assert.match(reason, /no longer exists/);
 });
