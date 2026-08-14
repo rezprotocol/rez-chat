@@ -488,6 +488,10 @@ export class DesktopSupervisor {
         chatServerIdentity,
         deviceKey,
         allowChatServerIdentityRotation: true,
+        allowLegacyAccountIdentityDhAdoption: chatServerIdentity.hasAdminRoot !== false,
+        onLegacyAccountIdentityDhAdopted: async ({ ownerAccountId, accountIdentityDhKeyPair } = {}) => (
+          this.#vault.adoptLegacyAccountIdentityDhKeyPair({ ownerAccountId, accountIdentityDhKeyPair })
+        ),
       });
       chatServerStarted = true;
     }

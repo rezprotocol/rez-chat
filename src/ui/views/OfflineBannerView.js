@@ -28,9 +28,12 @@ export class OfflineBannerView extends BusComponent {
       this._rootEl.replaceChildren();
       return;
     }
+    const lastError = connection && connection.lastError ? String(connection.lastError).trim() : "";
     const message = status === "connecting"
       ? "Connecting to Rez…"
-      : "You're offline — reconnecting to Rez…";
+      : status === "error" && lastError
+        ? lastError
+        : "You're offline — reconnecting to Rez…";
     this._rootEl.replaceChildren(h("div", {
       className: "w-full bg-error text-on-error text-center text-sm font-semibold py-2 px-4 shadow-lg select-none z-30",
       role: "alert",

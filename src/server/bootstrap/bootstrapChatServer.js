@@ -29,6 +29,8 @@ export async function bootstrapChatServer({
   expectedChatServerIdentity = null,
   deviceKey = null,
   allowChatServerIdentityRotation = false,
+  allowLegacyAccountIdentityDhAdoption = false,
+  onLegacyAccountIdentityDhAdopted = null,
 } = {}) {
   if (typeof nodeDataDir !== "string" || nodeDataDir.trim().length === 0) {
     throw new Error("bootstrapChatServer requires nodeDataDir");
@@ -106,6 +108,8 @@ export async function bootstrapChatServer({
         logger: serviceLogger,
       })
     ),
+    allowLegacyAccountIdentityDhAdoption: hasAdminRoot && allowLegacyAccountIdentityDhAdoption === true,
+    onLegacyAccountIdentityDhAdopted,
     logger,
   });
   return { ...bootstrapped, identity };

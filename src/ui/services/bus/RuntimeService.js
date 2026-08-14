@@ -7,6 +7,17 @@ function hasMeshSnapshot(status) {
   return !!(status && status.mesh && typeof status.mesh === "object");
 }
 
+function runtimeConnectFailureMessage(err) {
+  const code = err && err.code ? String(err.code) : "";
+  if (code === "ACCOUNT_IDENTITY_DH_MISMATCH"
+    || code === "ACCOUNT_IDENTITY_DH_MIGRATION_INVALID"
+    || code === "ACCOUNT_IDENTITY_DH_MIGRATION_PERSISTENCE_REQUIRED"
+    || code === "ACCOUNT_IDENTITY_DH_MIGRATION_CONFLICT") {
+    return "Account upgrade could not complete safely. Your data was not changed; restart Rez or export a backup before retrying.";
+  }
+  return "Couldn't start Rez. Restart the app and try again.";
+}
+
 export class RuntimeService extends BaseBusService {
   constructor({ bus, sdkSessionService, connectionStore, logger = console } = {}) {
     super({ bus });
@@ -28,7 +39,18 @@ export class RuntimeService extends BaseBusService {
   }
 
   async connect() {
-    const connected = await this._sdkSessionService.connectClient();
+    let connected;
+    try {
+      connected = await this._sdkSessionService.connectClient();
+    } catch (err) {
+      this._connectionStore.setConnection({
+        status: "error",
+        activeNode: "",
+        nodes: [],
+        lastError: runtimeConnectFailureMessage(err),
+      });
+      throw err;
+    }
     const client = this._sdkSessionService.getClient();
     if (!client) {
       throw new Error("RuntimeService connect did not produce a client");

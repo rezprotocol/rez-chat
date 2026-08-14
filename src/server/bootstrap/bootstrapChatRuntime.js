@@ -101,6 +101,8 @@ export async function bootstrapChatRuntime({
   wsFactory = null,
   linksServiceFactory = null,
   deviceLinkServiceFactory = null,
+  allowLegacyAccountIdentityDhAdoption = false,
+  onLegacyAccountIdentityDhAdopted = null,
   logger = console,
 } = {}) {
   if (!identity || typeof identity !== "object") {
@@ -159,6 +161,7 @@ export async function bootstrapChatRuntime({
     deviceKeyPair: deviceKey && deviceKey.deviceKeyPair ? deviceKey.deviceKeyPair : null,
     deviceId: deviceKey && deviceKey.deviceId ? deviceKey.deviceId : null,
     accountIdentityDhKeyPair: identity.accountIdentityDhKeyPair || null,
+    allowLegacyAccountIdentityDhAdoption: allowLegacyAccountIdentityDhAdoption === true,
     accountCapabilityCertChain: hasAdminRoot ? null : identity.certChain,
     hasAdminRoot,
   });
@@ -169,6 +172,22 @@ export async function bootstrapChatRuntime({
     cryptoProvider,
     hasAdminRoot,
   });
+
+  const adoptedLegacyAccountIdentityDhKeyPair = peerLinkService.getAdoptedLegacyAccountIdentityDhKeyPair();
+  if (adoptedLegacyAccountIdentityDhKeyPair) {
+    if (hasAdminRoot !== true || typeof onLegacyAccountIdentityDhAdopted !== "function") {
+      const err = new Error("chat runtime cannot persist the validated legacy account identity-DH key");
+      err.code = "ACCOUNT_IDENTITY_DH_MIGRATION_PERSISTENCE_REQUIRED";
+      throw err;
+    }
+    await onLegacyAccountIdentityDhAdopted({
+      ownerAccountId,
+      accountIdentityDhKeyPair: adoptedLegacyAccountIdentityDhKeyPair,
+    });
+  }
+  const effectiveAccountIdentityDhKeyPair = adoptedLegacyAccountIdentityDhKeyPair
+    || identity.accountIdentityDhKeyPair
+    || null;
 
   const clientIdentity = {
     accountId: ownerAccountId,
@@ -189,7 +208,7 @@ export async function bootstrapChatRuntime({
     inboxClaimant,
     expectedNodePublicKeyB64,
     accountAuthority: inviteAuthority,
-    accountIdentityDhKeyPair: identity.accountIdentityDhKeyPair || null,
+    accountIdentityDhKeyPair: effectiveAccountIdentityDhKeyPair,
     wsFactory,
     linksServiceFactory,
     deviceLinkServiceFactory,

@@ -73,3 +73,25 @@ test("RuntimeService seeds mesh state from the runtime client snapshot", async (
   assert.equal(connection.mesh.peerCount, 4);
   assert.equal(connection.mesh.seedReachable["https://r1.rezprotocol.io"], true);
 });
+
+test("RuntimeService surfaces a typed startup failure instead of presenting it as ordinary offline reconnect", async () => {
+  const bus = new ChatBus({});
+  const connectionStore = new ConnectionStore();
+  bus.stores.connection = connectionStore;
+  const failure = new Error("legacy key refused");
+  failure.code = "ACCOUNT_IDENTITY_DH_MIGRATION_INVALID";
+  const runtime = new RuntimeService({
+    bus,
+    sdkSessionService: {
+      async connectClient() { throw failure; },
+      getClient() { return null; },
+      async disconnect() {},
+    },
+    connectionStore,
+  });
+
+  await assert.rejects(() => runtime.connect(), (err) => err === failure);
+  const connection = connectionStore.getConnection();
+  assert.equal(connection.status, "error");
+  assert.match(connection.lastError, /Account upgrade could not complete safely/);
+});

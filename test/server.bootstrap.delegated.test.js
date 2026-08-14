@@ -208,3 +208,68 @@ test("direct regression: a primary identity boots exactly as before (admin root,
   assert.equal("certChain" in stored.envelope, false);
   assert.equal(created.durableRecord.v, 1, "the direct durable record stays DurableRecordV1");
 });
+
+test("a primary account explicitly adopts its validated pre-seed identity-DH key without rotating peers", async () => {
+  const b = CRYPTO.generateSigningKeyPair();
+  const legacyDh = CRYPTO.dhGenerateKeyPair();
+  const seedDh = CRYPTO.dhGenerateKeyPair();
+  const nodeDataDir = tmpDir("rez-boot-legacy-dh-1-");
+  const baseIdentity = {
+    accountId: deriveAccountIdFromPublicKey(b.publicKey),
+    publicKeyB64: bytesToBase64(b.publicKey),
+    privateKeyB64: bytesToBase64(b.privateKey),
+  };
+  const legacyIdentityDhKeyPair = {
+    publicKeyB64: bytesToBase64(legacyDh.publicKey),
+    privateKeyB64: bytesToBase64(legacyDh.privateKey),
+  };
+  const seedIdentityDhKeyPair = {
+    publicKeyB64: bytesToBase64(seedDh.publicKey),
+    privateKeyB64: bytesToBase64(seedDh.privateKey),
+  };
+
+  await bootstrapChatServer({
+    nodeDataDir,
+    wsUrl: "ws://127.0.0.1:1/ws",
+    expectedChatServerIdentity: {
+      ...baseIdentity,
+      accountIdentityDhKeyPair: legacyIdentityDhKeyPair,
+    },
+  });
+
+  await assert.rejects(
+    () => bootstrapChatServer({
+      nodeDataDir,
+      wsUrl: "ws://127.0.0.1:1/ws",
+      expectedChatServerIdentity: {
+        ...baseIdentity,
+        accountIdentityDhKeyPair: seedIdentityDhKeyPair,
+      },
+    }),
+    (err) => err && err.code === "ACCOUNT_IDENTITY_DH_MISMATCH",
+  );
+
+  let adopted = null;
+  const bootstrapped = await bootstrapChatServer({
+    nodeDataDir,
+    wsUrl: "ws://127.0.0.1:1/ws",
+    expectedChatServerIdentity: {
+      ...baseIdentity,
+      accountIdentityDhKeyPair: seedIdentityDhKeyPair,
+    },
+    allowLegacyAccountIdentityDhAdoption: true,
+    onLegacyAccountIdentityDhAdopted: async (migration) => {
+      adopted = migration;
+    },
+  });
+
+  assert.deepEqual(adopted, {
+    ownerAccountId: baseIdentity.accountId,
+    accountIdentityDhKeyPair: legacyIdentityDhKeyPair,
+  });
+  assert.deepEqual(
+    bootstrapped.chatServer.bus.runtime.accountIdentityDhKeyPair,
+    legacyIdentityDhKeyPair,
+    "the running chat stack must keep the established peer identity instead of the seed candidate",
+  );
+});

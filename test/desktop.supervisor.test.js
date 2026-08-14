@@ -59,6 +59,26 @@ class FakeVault {
   getActiveIdentitySummary() {
     return this.locked ? null : this.identity;
   }
+
+  getChatServerIdentity() {
+    if (this.locked) return null;
+    return {
+      accountId: "acct-chat-server",
+      publicKeyB64: "chat-public",
+      privateKeyB64: "chat-private",
+      hasAdminRoot: true,
+      accountIdentityDhKeyPair: { publicKeyB64: "seed-dh-public", privateKeyB64: "seed-dh-private" },
+    };
+  }
+
+  getActiveDeviceKey() {
+    return null;
+  }
+
+  async adoptLegacyAccountIdentityDhKeyPair(params) {
+    this.adoptedLegacyAccountIdentityDh = params;
+    return { adopted: true };
+  }
 }
 
 // Minimal bus shim that mirrors ChatServerBus surface needed by ChatBridge +
@@ -184,6 +204,45 @@ test("supervisor #runtimeSummary reports chat-server accountId as ownerAccountId
   assert.equal(summary.accountId, "acct-supervisor");
   assert.equal(summary.ownerAccountId, "acct-chat-server");
   assert.equal(summary.localInboxId, "inbox-supervisor");
+  await supervisor.stop();
+});
+
+test("supervisor enables root-only legacy identity-DH adoption and persists the validated key through the vault", async () => {
+  const vault = new FakeVault();
+  const bus = createMiniBus();
+  bus.services = {
+    session: {
+      getSessionInfo() {
+        return { accountId: "acct-chat-server", deviceId: "server", localInboxId: "inbox-supervisor" };
+      },
+    },
+  };
+  const chatBridge = new ChatBridge({ bus, ownerAccountId: "acct-chat-server" });
+  let chatServer = null;
+  const legacyDh = { publicKeyB64: "legacy-dh-public", privateKeyB64: "legacy-dh-private" };
+  const chatApp = {
+    get chatServer() { return chatServer; },
+    async startChatServer(options) {
+      assert.equal(options.allowLegacyAccountIdentityDhAdoption, true);
+      assert.equal(typeof options.onLegacyAccountIdentityDhAdopted, "function");
+      await options.onLegacyAccountIdentityDhAdopted({
+        ownerAccountId: "acct-chat-server",
+        accountIdentityDhKeyPair: legacyDh,
+      });
+      chatServer = { bus, bridge: chatBridge, ownerAccountId: "acct-chat-server" };
+    },
+    async stopChatServer() { chatServer = null; },
+    async stop() {},
+  };
+  const supervisor = new DesktopSupervisor({ vault, chatApp, logger: { warn() {} } });
+  await supervisor.start();
+  await supervisor.unlock({});
+  const connected = await supervisor.connect();
+  assert.equal(connected.connected, true);
+  assert.deepEqual(vault.adoptedLegacyAccountIdentityDh, {
+    ownerAccountId: "acct-chat-server",
+    accountIdentityDhKeyPair: legacyDh,
+  });
   await supervisor.stop();
 });
 

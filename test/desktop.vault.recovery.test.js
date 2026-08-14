@@ -248,6 +248,43 @@ test("exportBackup → importBackup roundtrip recovers the random app-data key o
   dst.close();
 });
 
+test("legacy account identity-DH adoption persists encrypted and survives backup restore", async () => {
+  const sourceDbPath = tmpPath("legacy-dh-vault.sqlite");
+  const src = new DesktopVaultService({
+    dbPath: sourceDbPath,
+    safeStorage: createSafeStorage(),
+  }).open();
+  const created = await src.createAccount({ profileName: "Legacy", password: "src-pass-12345" });
+  const chatIdentity = src.getChatServerIdentity();
+  const legacyDh = SeedKeys.deriveX25519({
+    seed: Buffer.alloc(64, 0x5a),
+    label: "rez/test/legacy-account-dh/v1",
+  });
+  assert.notEqual(legacyDh.publicKeyB64, chatIdentity.accountIdentityDhKeyPair.publicKeyB64);
+
+  await src.adoptLegacyAccountIdentityDhKeyPair({
+    ownerAccountId: chatIdentity.accountId,
+    accountIdentityDhKeyPair: legacyDh,
+  });
+  assert.deepEqual(src.getChatServerIdentity().accountIdentityDhKeyPair, legacyDh);
+  const rawDb = fs.readFileSync(sourceDbPath);
+  assert.equal(rawDb.includes(Buffer.from(legacyDh.publicKeyB64)), false, "legacy DH public key is not plaintext in the vault DB");
+  assert.equal(rawDb.includes(Buffer.from(legacyDh.privateKeyB64)), false, "legacy DH private key is not plaintext in the vault DB");
+
+  src.lock();
+  await src.unlock({ accountId: created.accountId, password: "src-pass-12345" });
+  assert.deepEqual(src.getChatServerIdentity().accountIdentityDhKeyPair, legacyDh, "unlock uses the adopted key");
+  const { mnemonic } = await src.revealMnemonic({ accountId: created.accountId, password: "src-pass-12345" });
+  const envelope = await src.exportBackup({ accountId: created.accountId, password: "src-pass-12345" });
+  assert.equal(JSON.stringify(envelope).includes(legacyDh.privateKeyB64), false, "backup outer envelope does not expose the key");
+  src.close();
+
+  const dst = openVault();
+  await dst.importBackup({ encryptedBackup: envelope, mnemonic, newPassword: "dst-pass-67890" });
+  assert.deepEqual(dst.getChatServerIdentity().accountIdentityDhKeyPair, legacyDh, "backup restore preserves compatibility key");
+  dst.close();
+});
+
 test("importBackup rejects a wrong recovery phrase", async () => {
   const src = openVault();
   const created = await src.createAccount({ profileName: "Restorable", password: "src-pass-12345" });

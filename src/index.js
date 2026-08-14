@@ -175,7 +175,13 @@ export async function startRezChat(options = {}) {
      * `chatServerIdentity` MUST come from `DesktopVaultService.getChatServerIdentity()`
      * — that's the only source that derives it from the user's mnemonic.
      */
-    async startChatServer({ chatServerIdentity = null, deviceKey = null, allowChatServerIdentityRotation = false } = {}) {
+    async startChatServer({
+      chatServerIdentity = null,
+      deviceKey = null,
+      allowChatServerIdentityRotation = false,
+      allowLegacyAccountIdentityDhAdoption = false,
+      onLegacyAccountIdentityDhAdopted = null,
+    } = {}) {
       if (chatServerState) return chatServerState;
       // S9 dual-mode gate: PRIMARY carries the account private key; DELEGATED
       // (seedless, hasAdminRoot=false) carries the capability chain instead
@@ -201,6 +207,8 @@ export async function startRezChat(options = {}) {
         // the legacy single-device path.
         deviceKey,
         allowChatServerIdentityRotation: allowChatServerIdentityRotation === true,
+        allowLegacyAccountIdentityDhAdoption: allowLegacyAccountIdentityDhAdoption === true,
+        onLegacyAccountIdentityDhAdopted,
       });
       await bootstrapped.chatServer.start();
       shell.attachChatServer(bootstrapped.chatServer);

@@ -42,6 +42,7 @@ const SEED_LABEL_BACKUP = "rez/backup/v1";
 // AAD prefix binding a backup ciphertext to its version + account id, so a
 // swapped/forged envelope header fails AES-GCM authentication.
 const BACKUP_AAD_PREFIX = "rez-backup/v1:";
+const IDENTITY_DH_OVERRIDE_AAD_PREFIX = "rez-vault/identity-dh-override/v1:";
 
 function seedFingerprintB64(seed) {
   return createHash("sha256").update(seed).digest().slice(0, 8).toString("base64");
@@ -130,6 +131,16 @@ function bufferToBase64(value) {
 
 function base64ToBuffer(value) {
   return Buffer.from(String(value || ""), "base64");
+}
+
+function constantTimeBytesEqual(left, right) {
+  if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array)) return false;
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    diff |= left[index] ^ right[index];
+  }
+  return diff === 0;
 }
 
 export class DesktopVaultService {
@@ -446,6 +457,10 @@ export class DesktopVaultService {
       this.#pendingChatServerIdentity = null;
     } else if (typeof row.mnemonicEnvelopeJson === "string" && row.mnemonicEnvelopeJson.length > 0) {
       chatServerIdentity = await this.#deriveChatServerIdentityFromVaultRow({ password: pwd, row });
+      const identityDhOverride = await this.#decryptIdentityDhOverride({ row, appDataKeyBytes });
+      if (identityDhOverride) {
+        chatServerIdentity.accountIdentityDhKeyPair = identityDhOverride;
+      }
     }
     this.#activeAccount = {
       accountId: unlocked.accountId,
@@ -683,8 +698,10 @@ export class DesktopVaultService {
   }
 
   /**
-   * Returns the BIP39-seed-derived chat-server identity for the active
-   * account, or `null` if the vault is locked or the account predates BIP39.
+   * Returns the chat-server identity rooted in the active account's BIP39
+   * seed, or `null` if the vault is locked or the account predates BIP39. Its
+   * account identity-DH key is seed-derived for fresh accounts and may be the
+   * encrypted, validated compatibility key for a migrated legacy account.
    *
    * Caller (bootstrapChatServer / DesktopSupervisor) passes this as the
    * `expectedIdentity` to ensureChatServerIdentity, which (a) persists it on
@@ -707,12 +724,58 @@ export class DesktopVaultService {
       ...(delegated ? { certChain: cloneJson(ident.certChain) } : {}),
       // Account identity-DH key (X25519), shared across all of the account's
       // devices — threaded into PeerLinkService for the device-set peer-scoped
-      // seal (Audit P1). Seed-derived on a primary, bundle-carried on a
-      // delegated device. Null on a pre-migration vault.
+      // seal (Audit P1). Seed-derived or compatibility-preserved on a primary,
+      // bundle-carried on a delegated device. Null on a pre-migration vault.
       accountIdentityDhKeyPair: ident.accountIdentityDhKeyPair
         ? { publicKeyB64: ident.accountIdentityDhKeyPair.publicKeyB64, privateKeyB64: ident.accountIdentityDhKeyPair.privateKeyB64 }
         : null,
     };
+  }
+
+  /**
+   * One-time compatibility migration for accounts created before the account
+   * identity-DH key became seed-derived. The caller must first validate the
+   * legacy key against the encrypted peer-link record and its root-signed
+   * binding. This vault boundary independently validates the X25519 keypair,
+   * seals it under the account's random app-data key, persists it atomically,
+   * and makes it the active account's canonical DH key.
+   */
+  async adoptLegacyAccountIdentityDhKeyPair({ ownerAccountId = "", accountIdentityDhKeyPair = null } = {}) {
+    if (!this.#activeAccount) throw new Error("Vault is locked");
+    const activeIdentity = this.#activeAccount.chatServerIdentity;
+    if (!activeIdentity || activeIdentity.hasAdminRoot === false) {
+      throw new Error("Legacy account identity-DH adoption requires the primary account device");
+    }
+    const owner = normalizeString(ownerAccountId);
+    if (!owner || owner !== activeIdentity.accountId) {
+      throw new Error("Legacy account identity-DH adoption owner mismatch");
+    }
+    const keyPair = await this.#validateIdentityDhKeyPair(accountIdentityDhKeyPair);
+    const row = this.#loadAccountRow(this.#activeAccount.accountId);
+    if (!row) throw new Error("No vault account found");
+    const existing = await this.#decryptIdentityDhOverride({
+      row,
+      appDataKeyBytes: this.#activeAccount.appDataKeyBytes,
+    });
+    if (existing && (existing.publicKeyB64 !== keyPair.publicKeyB64
+      || existing.privateKeyB64 !== keyPair.privateKeyB64)) {
+      const err = new Error("Vault already contains a different account identity-DH compatibility key");
+      err.code = "ACCOUNT_IDENTITY_DH_MIGRATION_CONFLICT";
+      throw err;
+    }
+    if (!existing) {
+      const envelope = await this.#encryptIdentityDhOverride({
+        accountId: row.accountId,
+        appDataKeyBytes: this.#activeAccount.appDataKeyBytes,
+        accountIdentityDhKeyPair: keyPair,
+      });
+      this.#requireDb().prepare(`
+        UPDATE vault_accounts SET accountIdentityDhOverrideEnvelopeJson = ?, updatedAtMs = ?
+        WHERE accountId = ?
+      `).run(JSON.stringify(envelope), this.#clock(), row.accountId);
+    }
+    activeIdentity.accountIdentityDhKeyPair = cloneJson(keyPair);
+    return { adopted: true, ownerAccountId: owner };
   }
 
   /**
@@ -903,8 +966,10 @@ export class DesktopVaultService {
     });
     const seed = await Bip39.mnemonicToSeed(mnemonicText);
     let kek = null;
+    let plaintext = null;
     try {
       kek = SeedKeys.deriveBytes({ seed, label: SEED_LABEL_BACKUP, length: 32 });
+      const accountIdentityDhKeyPair = await this.#decryptIdentityDhOverride({ row, appDataKeyBytes });
       const bundle = {
         v: 1,
         accountId: row.accountId,
@@ -914,8 +979,9 @@ export class DesktopVaultService {
         appDataKeyB64: toBase64(appDataKeyBytes),
         seedFingerprintB64: row.seedFingerprintB64,
         createdAtMs: Number(row.createdAtMs) || this.#clock(),
+        accountIdentityDhKeyPair,
       };
-      const plaintext = new TextEncoder().encode(JSON.stringify(bundle));
+      plaintext = new TextEncoder().encode(JSON.stringify(bundle));
       const nonce = randomBytes(12, this.#cryptoProvider);
       const aad = new TextEncoder().encode(BACKUP_AAD_PREFIX + row.accountId);
       const ciphertext = await this.#requireBackupAead().aeadEncrypt({
@@ -936,6 +1002,7 @@ export class DesktopVaultService {
     } finally {
       if (appDataKeyBytes instanceof Uint8Array) appDataKeyBytes.fill(0);
       if (kek && typeof kek.fill === "function") kek.fill(0);
+      if (plaintext instanceof Uint8Array) plaintext.fill(0);
       seed.fill(0);
     }
   }
@@ -988,7 +1055,12 @@ export class DesktopVaultService {
         // AEAD auth failure: surface a clear, non-leaky error (no swallow).
         throw new Error("Backup decryption failed: recovery phrase or file is invalid");
       }
-      const bundle = JSON.parse(new TextDecoder().decode(plaintext));
+      let bundle;
+      try {
+        bundle = JSON.parse(new TextDecoder().decode(plaintext));
+      } finally {
+        if (plaintext instanceof Uint8Array) plaintext.fill(0);
+      }
       if (!bundle || bundle.v !== 1) throw new Error("Unsupported backup bundle version");
       appDataKeyBytes = fromBase64(bundle.appDataKeyB64);
       if (!(appDataKeyBytes instanceof Uint8Array) || appDataKeyBytes.length !== 32) {
@@ -1009,6 +1081,9 @@ export class DesktopVaultService {
         privateKeyB64: chatServerKeys.privateKeyB64,
       });
       const profileName = normalizeString(bundle.profileNameHint) || "Account";
+      const accountIdentityDhKeyPair = bundle.accountIdentityDhKeyPair
+        ? await this.#validateIdentityDhKeyPair(bundle.accountIdentityDhKeyPair)
+        : null;
       const keystoreStore = new MemoryKeystoreStore();
       const created = await createKeystoreAccount({
         password: newPwd,
@@ -1023,12 +1098,20 @@ export class DesktopVaultService {
       const appKeyEnvelope = await this.#encryptAppDataKey({ password: newPwd, appDataKeyBytes });
       const safeWrappedAppKeyB64 = await this.#safeWrapAppDataKey(appDataKeyBytes);
       const mnemonicEnvelope = await this.#encryptMnemonic({ password: newPwd, mnemonic: mnemonicText });
+      const accountIdentityDhOverrideEnvelope = accountIdentityDhKeyPair
+        ? await this.#encryptIdentityDhOverride({
+            accountId: created.accountId,
+            appDataKeyBytes,
+            accountIdentityDhKeyPair,
+          })
+        : null;
       const now = this.#clock();
       this.#requireDb().prepare(`
         INSERT INTO vault_accounts (
           accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64,
-          avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64, createdAtMs, updatedAtMs
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64,
+          accountIdentityDhOverrideEnvelopeJson, createdAtMs, updatedAtMs
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         created.accountId,
         profileName,
@@ -1039,6 +1122,7 @@ export class DesktopVaultService {
         typeof bundle.avatarDataB64 === "string" && bundle.avatarDataB64.length > 0 ? bundle.avatarDataB64 : null,
         JSON.stringify(mnemonicEnvelope),
         fingerprint,
+        accountIdentityDhOverrideEnvelope ? JSON.stringify(accountIdentityDhOverrideEnvelope) : null,
         Number(bundle.createdAtMs) || now,
         now,
       );
@@ -1048,7 +1132,8 @@ export class DesktopVaultService {
         accountId: chatServerIdentity.getAccountId(),
         publicKeyB64: chatServerKeys.publicKeyB64,
         privateKeyB64: chatServerKeys.privateKeyB64,
-        accountIdentityDhKeyPair: SeedKeys.deriveX25519({ seed, label: SEED_LABEL_X3DH_DH }),
+        accountIdentityDhKeyPair: accountIdentityDhKeyPair
+          || SeedKeys.deriveX25519({ seed, label: SEED_LABEL_X3DH_DH }),
       };
       return this.unlock({ accountId: created.accountId, password: newPwd });
     } finally {
@@ -1413,12 +1498,12 @@ export class DesktopVaultService {
     const id = normalizeString(accountId);
     if (id) {
       return db.prepare(`
-        SELECT accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64, safeWrappedPasswordB64, avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64, hasAdminRoot
+        SELECT accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64, safeWrappedPasswordB64, avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64, hasAdminRoot, accountIdentityDhOverrideEnvelopeJson
         FROM vault_accounts WHERE accountId = ?
       `).get(id);
     }
     return db.prepare(`
-      SELECT accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64, safeWrappedPasswordB64, avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64, hasAdminRoot
+      SELECT accountId, profileNameHint, keystoreEnvelopeJson, appKeyEnvelopeJson, safeWrappedAppKeyB64, safeWrappedPasswordB64, avatarFileHash, avatarDataB64, mnemonicEnvelopeJson, seedFingerprintB64, hasAdminRoot, accountIdentityDhOverrideEnvelopeJson
       FROM vault_accounts ORDER BY updatedAtMs DESC, accountId ASC LIMIT 1
     `).get();
   }
@@ -1506,6 +1591,108 @@ export class DesktopVaultService {
       };
     } finally {
       seed.fill(0);
+    }
+  }
+
+  async #validateIdentityDhKeyPair(value) {
+    const keyPair = value && typeof value === "object" ? value : null;
+    const publicKeyB64 = normalizeString(keyPair && keyPair.publicKeyB64);
+    const privateKeyB64 = normalizeString(keyPair && keyPair.privateKeyB64);
+    if (!publicKeyB64 || !privateKeyB64) {
+      throw new Error("Account identity-DH compatibility key is incomplete");
+    }
+    let publicKey = null;
+    let privateKey = null;
+    let probe = null;
+    let fromCandidatePrivate = null;
+    let fromProbePrivate = null;
+    try {
+      publicKey = fromBase64(publicKeyB64);
+      privateKey = fromBase64(privateKeyB64);
+      if (toBase64(publicKey) !== publicKeyB64 || toBase64(privateKey) !== privateKeyB64) {
+        throw new Error("Account identity-DH compatibility key is not canonical base64");
+      }
+      const cryptoProvider = this.#requireBackupAead();
+      probe = await cryptoProvider.dhGenerateKeyPair({ alg: "X25519", fmt: "spki" });
+      fromCandidatePrivate = await cryptoProvider.dhDerive({
+        privateKey,
+        publicKey: probe.publicKey,
+        alg: "X25519",
+        fmt: "spki",
+      });
+      fromProbePrivate = await cryptoProvider.dhDerive({
+        privateKey: probe.privateKey,
+        publicKey,
+        alg: "X25519",
+        fmt: "spki",
+      });
+      if (!constantTimeBytesEqual(fromCandidatePrivate, fromProbePrivate)) {
+        throw new Error("Account identity-DH compatibility key public/private mismatch");
+      }
+      return { publicKeyB64, privateKeyB64 };
+    } catch (err) {
+      const invalid = new Error("Account identity-DH compatibility key is invalid");
+      invalid.code = "ACCOUNT_IDENTITY_DH_MIGRATION_INVALID";
+      invalid.cause = err;
+      throw invalid;
+    } finally {
+      if (privateKey instanceof Uint8Array) privateKey.fill(0);
+      if (probe && probe.privateKey instanceof Uint8Array) probe.privateKey.fill(0);
+      if (fromCandidatePrivate instanceof Uint8Array) fromCandidatePrivate.fill(0);
+      if (fromProbePrivate instanceof Uint8Array) fromProbePrivate.fill(0);
+    }
+  }
+
+  async #encryptIdentityDhOverride({ accountId, appDataKeyBytes, accountIdentityDhKeyPair } = {}) {
+    const nonce = randomBytes(12, this.#cryptoProvider);
+    const plaintext = new TextEncoder().encode(JSON.stringify({
+      v: 1,
+      publicKeyB64: accountIdentityDhKeyPair.publicKeyB64,
+      privateKeyB64: accountIdentityDhKeyPair.privateKeyB64,
+    }));
+    try {
+      const ciphertext = await this.#requireBackupAead().aeadEncrypt({
+        key: new Uint8Array(appDataKeyBytes),
+        nonce,
+        plaintext,
+        aad: new TextEncoder().encode(IDENTITY_DH_OVERRIDE_AAD_PREFIX + accountId),
+      });
+      return { v: 1, nonceB64: toBase64(nonce), ciphertextB64: toBase64(ciphertext) };
+    } finally {
+      plaintext.fill(0);
+    }
+  }
+
+  async #decryptIdentityDhOverride({ row, appDataKeyBytes } = {}) {
+    const raw = row && typeof row.accountIdentityDhOverrideEnvelopeJson === "string"
+      ? row.accountIdentityDhOverrideEnvelopeJson.trim()
+      : "";
+    if (!raw) return null;
+    let envelope = null;
+    try {
+      envelope = JSON.parse(raw);
+    } catch {
+      throw new Error("Stored account identity-DH compatibility envelope is malformed");
+    }
+    if (!envelope || envelope.v !== 1 || typeof envelope.nonceB64 !== "string"
+      || typeof envelope.ciphertextB64 !== "string") {
+      throw new Error("Stored account identity-DH compatibility envelope is invalid");
+    }
+    let plaintext = null;
+    try {
+      plaintext = await this.#requireBackupAead().aeadDecrypt({
+        key: new Uint8Array(appDataKeyBytes),
+        nonce: fromBase64(envelope.nonceB64),
+        ciphertext: fromBase64(envelope.ciphertextB64),
+        aad: new TextEncoder().encode(IDENTITY_DH_OVERRIDE_AAD_PREFIX + row.accountId),
+      });
+      const decoded = JSON.parse(new TextDecoder().decode(plaintext));
+      if (!decoded || decoded.v !== 1) {
+        throw new Error("Stored account identity-DH compatibility payload version is unsupported");
+      }
+      return this.#validateIdentityDhKeyPair(decoded);
+    } finally {
+      if (plaintext instanceof Uint8Array) plaintext.fill(0);
     }
   }
 
@@ -1648,6 +1835,10 @@ export class DesktopVaultService {
     const hasAdminRootCol = columns.some((c) => c.name === "hasAdminRoot");
     if (!hasAdminRootCol) {
       db.exec(`ALTER TABLE vault_accounts ADD COLUMN hasAdminRoot INTEGER`);
+    }
+    const hasIdentityDhOverride = columns.some((c) => c.name === "accountIdentityDhOverrideEnvelopeJson");
+    if (!hasIdentityDhOverride) {
+      db.exec(`ALTER TABLE vault_accounts ADD COLUMN accountIdentityDhOverrideEnvelopeJson TEXT`);
     }
   }
 
