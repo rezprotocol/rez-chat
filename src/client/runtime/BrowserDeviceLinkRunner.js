@@ -8,6 +8,31 @@ import {
 import { runDeviceLinkRequester as runSdkRequester } from "@rezprotocol/sdk/device-link";
 
 /**
+ * Bind hosted-runtime dependencies without narrowing the requester contract.
+ * Persistence is part of the ceremony's safety boundary: the new device must
+ * durably store its delegation before it confirms possession to the primary.
+ */
+export function createBrowserDeviceLinkRunner({
+  uplinks,
+  logger = console,
+  runner = runBrowserDeviceLinkRequester,
+} = {}) {
+  if (!Array.isArray(uplinks) || uplinks.length === 0) {
+    throw new Error("createBrowserDeviceLinkRunner requires uplinks");
+  }
+  if (typeof runner !== "function") {
+    throw new Error("createBrowserDeviceLinkRunner requires runner");
+  }
+  return ({ linkCode, persistDelegation = null, onStatus = null } = {}) => runner({
+    linkCode,
+    uplinks,
+    logger,
+    persistDelegation,
+    onStatus,
+  });
+}
+
+/**
  * Run the NEW-device half of the link ceremony before a browser account exists.
  *
  * The temporary SDK identity is used only to reach the account-blind durable

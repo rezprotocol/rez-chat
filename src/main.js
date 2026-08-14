@@ -11,7 +11,7 @@ import "@rezprotocol/ui/framework/theme.css";
 import "./ui/styles.css";
 import { ChatRuntimeConfig } from "./ui/records/ChatRuntimeConfig.js";
 import { BrowserChatRuntimeClient } from "./client/runtime/BrowserChatRuntimeClient.js";
-import { runBrowserDeviceLinkRequester } from "./client/runtime/BrowserDeviceLinkRunner.js";
+import { createBrowserDeviceLinkRunner } from "./client/runtime/BrowserDeviceLinkRunner.js";
 import { DesktopRuntimeClient } from "./client/runtime/DesktopRuntimeClient.js";
 import { ChatApp } from "./ui/root/ChatApp.js";
 
@@ -73,16 +73,16 @@ const sdkFactory = ({ account } = {}) => new BrowserChatRuntimeClient({
   logger: console,
 });
 const desktopSdkFactory = () => new DesktopRuntimeClient({ desktop: desktopBridge });
+const browserDeviceLinkRunner = createBrowserDeviceLinkRunner({
+  uplinks: browserUplinks,
+  logger: console,
+});
 
 const app = new ChatApp({
   mountEl,
   theme: {},
   sdkFactory: desktopBridge ? desktopSdkFactory : sdkFactory,
-  deviceLinkRunner: desktopBridge ? null : ({ linkCode }) => runBrowserDeviceLinkRequester({
-    linkCode,
-    uplinks: browserUplinks,
-    logger: console,
-  }),
+  deviceLinkRunner: desktopBridge ? null : browserDeviceLinkRunner,
   logger: console,
 });
 await app.start();

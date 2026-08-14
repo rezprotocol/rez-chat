@@ -15,7 +15,10 @@ import {
 import { SessionStore, SESSION_STATUS } from "../src/ui/stores/SessionStore.js";
 import { AccountRegistry } from "../src/ui/services/AccountRegistry.js";
 import { createAuthHarness } from "./_helpers/createAuthHarness.js";
-import { runBrowserDeviceLinkRequester } from "../src/client/runtime/BrowserDeviceLinkRunner.js";
+import {
+  createBrowserDeviceLinkRunner,
+  runBrowserDeviceLinkRequester,
+} from "../src/client/runtime/BrowserDeviceLinkRunner.js";
 
 function createMemoryStorage() {
   const mem = new Map();
@@ -291,6 +294,32 @@ test("browser device-link runner uses an account-blind temporary session and alw
   assert.equal(calls[0].identity.publicKeyB64.length > 0, true);
   assert.equal(calls[0].identity.privateKeyB64.length > 0, true);
   assert.deepEqual(calls[0].uplinks, ["wss://chat.example/ws"]);
+});
+
+test("hosted browser device-link binding preserves the persistence safety callback", async () => {
+  const persistDelegation = async () => ({ storeKey: "default" });
+  const onStatus = () => {};
+  let received = null;
+  const runner = createBrowserDeviceLinkRunner({
+    uplinks: ["wss://chat.example/ws"],
+    logger: console,
+    runner: async (params) => {
+      received = params;
+      return { ok: true };
+    },
+  });
+
+  const result = await runner({
+    linkCode: "rez:link:v1:test",
+    persistDelegation,
+    onStatus,
+  });
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(received.linkCode, "rez:link:v1:test");
+  assert.deepEqual(received.uplinks, ["wss://chat.example/ws"]);
+  assert.equal(received.persistDelegation, persistDelegation);
+  assert.equal(received.onStatus, onStatus);
 });
 
 test("browser device-link runner closes its temporary client when the ceremony fails", async () => {

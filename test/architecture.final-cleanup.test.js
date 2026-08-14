@@ -86,3 +86,10 @@ test("ChatApp forwards the hosted device-link runner into browser auth", () => {
   assert.match(content, /_createServices\(sdkFactory, deviceLinkRunner\)/);
   assert.match(content, /new AccountAuthService\([\s\S]*?deviceLinkRunner,/);
 });
+
+test("browser entry binds the complete device-link requester contract", () => {
+  const content = readFile("main.js");
+  assert.match(content, /createBrowserDeviceLinkRunner\(\{/);
+  assert.match(content, /deviceLinkRunner: desktopBridge \? null : browserDeviceLinkRunner/);
+  assert.doesNotMatch(content, /deviceLinkRunner:[^\n]*\(\{\s*linkCode\s*\}\)/);
+});

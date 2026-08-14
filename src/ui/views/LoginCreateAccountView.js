@@ -11,6 +11,10 @@ const REZ_FULL_LOGO_URL = new URL(
 
 export class LoginCreateAccountView extends BusComponent {
   #mode = "create"; // "create" | "link"
+  #linkCode = "";
+  #linkName = "";
+  #linkPassword = "";
+  #linkConfirmPassword = "";
 
   mount(parentEl) {
     super.mount(parentEl);
@@ -18,6 +22,11 @@ export class LoginCreateAccountView extends BusComponent {
     this._sessionStore = this.bus.stores.session;
     this._subscribe(this._sessionStore, () => this.render());
     this.render();
+  }
+
+  unmount() {
+    this.#clearLinkDraft();
+    super.unmount();
   }
 
   render() {
@@ -166,6 +175,7 @@ export class LoginCreateAccountView extends BusComponent {
   }
 
   #renderLinkMode() {
+    this.#captureLinkDraft();
     const error = this._sessionStore.error() || "";
     const unlocking = typeof this._sessionStore.isUnlocking === "function" && this._sessionStore.isUnlocking();
 
@@ -201,6 +211,10 @@ export class LoginCreateAccountView extends BusComponent {
       autocomplete: "new-password",
       "data-role": "link-confirm",
     });
+    codeInput.value = this.#linkCode;
+    nameInput.value = this.#linkName;
+    passwordInput.value = this.#linkPassword;
+    confirmInput.value = this.#linkConfirmPassword;
 
     const submitButton = h("button", {
       type: "submit",
@@ -249,11 +263,12 @@ export class LoginCreateAccountView extends BusComponent {
     if (linkForm) {
       linkForm.addEventListener("submit", (event) => {
         event.preventDefault();
+        this.#captureLinkDraft();
         this.bus.call("session", "linkDevice", {
-          linkCode: codeInput.value,
-          name: nameInput.value,
-          password: passwordInput.value,
-          confirmPassword: confirmInput.value,
+          linkCode: this.#linkCode,
+          name: this.#linkName,
+          password: this.#linkPassword,
+          confirmPassword: this.#linkConfirmPassword,
         }).catch((err) => {
           console.error("[LoginCreateAccountView] link device failed", err);
           this.bus.emit("app.error", { source: "LoginCreateAccountView", message: "link device failed", severity: "warn", err });
@@ -263,6 +278,7 @@ export class LoginCreateAccountView extends BusComponent {
     const backBtn = main.querySelector("[data-action='session.linkBack']");
     if (backBtn) {
       backBtn.addEventListener("click", () => {
+        this.#clearLinkDraft();
         this.#mode = "create";
         this._sessionStore.setError("");
         this.render();
@@ -285,6 +301,27 @@ export class LoginCreateAccountView extends BusComponent {
         h("div", { className: "absolute right-3 top-1/2 -translate-y-1/2 flex items-center justify-center pointer-events-none" }, [icon]),
       ]),
     ]);
+  }
+
+  #captureLinkDraft() {
+    if (!this._rootEl) return;
+    const form = this._rootEl.querySelector("[data-role='link-device-form']");
+    if (!form) return;
+    const codeInput = form.querySelector("[data-role='link-code']");
+    const nameInput = form.querySelector("[data-role='link-name']");
+    const passwordInput = form.querySelector("[data-role='link-password']");
+    const confirmInput = form.querySelector("[data-role='link-confirm']");
+    this.#linkCode = codeInput ? String(codeInput.value || "") : this.#linkCode;
+    this.#linkName = nameInput ? String(nameInput.value || "") : this.#linkName;
+    this.#linkPassword = passwordInput ? String(passwordInput.value || "") : this.#linkPassword;
+    this.#linkConfirmPassword = confirmInput ? String(confirmInput.value || "") : this.#linkConfirmPassword;
+  }
+
+  #clearLinkDraft() {
+    this.#linkCode = "";
+    this.#linkName = "";
+    this.#linkPassword = "";
+    this.#linkConfirmPassword = "";
   }
 
   #wireFormHandlers(rootEl, { nameInput, createPasswordInput, confirmInput }) {
@@ -336,6 +373,7 @@ export class LoginCreateAccountView extends BusComponent {
     const linkThisDeviceButton = rootEl.querySelector("[data-action='session.linkThisDevice']");
     if (linkThisDeviceButton) {
       linkThisDeviceButton.addEventListener("click", () => {
+        this.#clearLinkDraft();
         this.#mode = "link";
         this._sessionStore.setError("");
         this.render();
