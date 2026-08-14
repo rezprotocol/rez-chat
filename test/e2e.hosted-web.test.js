@@ -116,12 +116,14 @@ test("hosted web app: PWA + two-browser invite + offline durable catch-up", { ti
   await alice.getByTestId("thread.row").click();
   await alice.getByTestId("composer.input").fill(offlineText);
   await alice.getByTestId("composer.send").click();
-  await alice.getByText(offlineText, { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+  await alice.getByTestId("message.text").filter({ hasText: offlineText })
+    .waitFor({ state: "visible", timeout: 30_000 });
 
   bob = await bobContext.newPage();
   await observePage(bob, "bob-reopened");
   await unlockAccount(bob, bobPassword);
   await bob.getByTestId("thread.row").waitFor({ state: "visible", timeout: 45_000 });
   await bob.getByTestId("thread.row").click();
-  await bob.getByText(offlineText, { exact: true }).waitFor({ state: "visible", timeout: 60_000 });
+  await bob.getByTestId("message.text").filter({ hasText: offlineText })
+    .waitFor({ state: "visible", timeout: 60_000 });
 });
