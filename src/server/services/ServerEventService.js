@@ -464,34 +464,65 @@ export class ServerEventService extends BaseServerService {
 
     if (!messagePersisted) return;
 
-    // Delivery ack: only for 1:1 chat messages (groups have ambiguous
-    // "delivered" semantics — fan-out to N peers would yield N acks per
-    // message). Carries the sender's local messageId (payload.messageId,
-    // not the relay's eventId) so the sender can find the row in its
-    // ChatThreadStore and transition sent → delivered.
-    if (decodedPayload
-        && decodedPayload.kind === CHAT_MESSAGE_KIND
-        && thread
-        && thread.threadType !== "group"
-        && messageId
-        && thread.peerAccountId
-        && thread.peerInboxId) {
-      const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
-      if (sdk && typeof sdk.sealForPeer === "function" && sdk.mesh) {
-        const ackRecord = new E2eeDeliveryAckV1({
-          senderAccountId: this.ownerAccountId,
-          messageIds: [messageId],
+    // Delivery ack (DT-004 group-ack split-brain repair). 1:1 threads ack via
+    // the thread's own peer identity, unchanged. Group messages are now acked
+    // too: the sender registers EVERY group fan-out copy as expecting an E2E
+    // delivery-ack (ServerPeerLinkProtocolService.recordOutboundGroupMessage —
+    // its only desync evidence, since the opaque recipient side cannot
+    // attribute a group decrypt-miss), so suppressing group acks made that
+    // evidence structurally false and re-invited healthy-but-quiet links.
+    // A group thread carries no peer identity, so resolve the authenticated
+    // sender's inbox from its peer link — the message just decrypted over
+    // that link, so it exists. Sender-side STATUS stays 1:1-only: group
+    // messageIds are not ack-pending-registered (ServerMessagesService), so
+    // a group ack clears recovery evidence without flipping the row to
+    // "delivered" on the first of N member acks. Carries the sender's local
+    // messageId (payload.messageId, not the relay's eventId).
+    if (decodedPayload && decodedPayload.kind === CHAT_MESSAGE_KIND && thread && messageId) {
+      let ackPeerAccountId = null;
+      let ackPeerInboxId = null;
+      if (thread.threadType !== "group" && thread.peerAccountId && thread.peerInboxId) {
+        ackPeerAccountId = thread.peerAccountId;
+        ackPeerInboxId = thread.peerInboxId;
+      } else if (thread.threadType === "group" && senderAccountId) {
+        const peerLinksResult = await this._call("peer-links", "list", {}).catch(() => null);
+        const peerLinks = peerLinksResult && Array.isArray(peerLinksResult.items) ? peerLinksResult.items : [];
+        const senderLink = peerLinks.find((item) => {
+          if (!item || typeof item !== "object") return false;
+          const remote = typeof item.peerAccountId === "string" ? item.peerAccountId.trim() : "";
+          return remote === senderAccountId;
         });
-        sdk.sealForPeer({
-          peerAccountId: thread.peerAccountId,
-          plaintextBodyBytes: ackRecord.toBytes(),
-          deliverInboxId: thread.peerInboxId,
-        }).then((sealed) => sdk.mesh.dispatch(
-          sealed.object,
-          sealed.address,
-        )).catch((ackErr) => {
-          this.logger.error("[ServerEventService] delivery ack send failed", ackErr && ackErr.message ? ackErr.message : ackErr);
-        });
+        const senderInboxId = peerLinkPeerInboxId(senderLink);
+        if (senderInboxId) {
+          ackPeerAccountId = senderAccountId;
+          ackPeerInboxId = senderInboxId;
+        } else {
+          // No resolvable return inbox: the ack cannot be sent, and the
+          // sender's recovery evidence for this copy stays outstanding. Not
+          // silent — this is the same condition that would make the sender
+          // re-invite us, which is the correct recovery for a link this
+          // broken.
+          this.logger.warn("[ServerEventService] group delivery ack skipped: no peer-link inbox for " + senderAccountId);
+        }
+      }
+      if (ackPeerAccountId && ackPeerInboxId) {
+        const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
+        if (sdk && typeof sdk.sealForPeer === "function" && sdk.mesh) {
+          const ackRecord = new E2eeDeliveryAckV1({
+            senderAccountId: this.ownerAccountId,
+            messageIds: [messageId],
+          });
+          sdk.sealForPeer({
+            peerAccountId: ackPeerAccountId,
+            plaintextBodyBytes: ackRecord.toBytes(),
+            deliverInboxId: ackPeerInboxId,
+          }).then((sealed) => sdk.mesh.dispatch(
+            sealed.object,
+            sealed.address,
+          )).catch((ackErr) => {
+            this.logger.error("[ServerEventService] delivery ack send failed", ackErr && ackErr.message ? ackErr.message : ackErr);
+          });
+        }
       }
     }
 

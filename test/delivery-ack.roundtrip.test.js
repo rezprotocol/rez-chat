@@ -244,7 +244,16 @@ test("delivery ack: 1:1 chat message transitions alice's row from sent → deliv
   assert.equal(deliveredOk, true, "alice's row should transition to delivered after ack");
 });
 
-test("delivery ack: group fan-out does NOT trigger acks from group members", async () => {
+// DT-004 group-ack split-brain repair. Before: the sender registered every
+// group fan-out copy as expecting an E2E delivery-ack (recordOutboundGroupMessage,
+// the only sender-side desync evidence) while receivers SUPPRESSED group acks —
+// so the evidence was structurally false and healthy-but-quiet links got
+// re-invited. The repaired contract: group members DO ack (resolved via the
+// sender's peer link, since a group thread has no peer identity), and the
+// sender's STATUS semantics stay 1:1-only (a group row never flips to
+// "delivered" on the first of N member acks — group messageIds are not
+// ack-pending-registered).
+test("DT-004: group fan-out triggers member acks (recovery evidence) without flipping the sender's group row to delivered", async () => {
   const aliceStorage = new TestStorageProvider();
   const bobStorage = new TestStorageProvider();
   const aliceSent = [];
@@ -260,48 +269,88 @@ test("delivery ack: group fan-out does NOT trigger acks from group members", asy
   });
   await seedGroupThread({ storage: aliceStorage, ownerAccountId: ALICE });
   await seedGroupThread({ storage: bobStorage, ownerAccountId: BOB });
-  // Both sides need group membership for fan-out + ingestion to allow the
-  // message through.
-  await aliceStorage.getKeyValueStore(ALICE).set("app:groups/" + ALICE + "/" + GROUP_ID, {
-    groupId: GROUP_ID, createdBy: ALICE, title: "Group case", createdAtMs: 1000,
-  });
-  await aliceStorage.getKeyValueStore(ALICE).set("app:groups/" + ALICE + "/" + GROUP_ID + "/members/" + ALICE, {
-    groupId: GROUP_ID, accountId: ALICE, role: "admin", joinedAtMs: 1000,
-  });
-  await aliceStorage.getKeyValueStore(ALICE).set("app:groups/" + ALICE + "/" + GROUP_ID + "/members/" + BOB, {
-    groupId: GROUP_ID, accountId: BOB, role: "member", joinedAtMs: 1000, inboxId: "inbox:" + BOB,
-  });
-  await bobStorage.getKeyValueStore(BOB).set("app:groups/" + BOB + "/" + GROUP_ID, {
-    groupId: GROUP_ID, createdBy: ALICE, title: "Group case", createdAtMs: 1000,
-  });
-  await bobStorage.getKeyValueStore(BOB).set("app:groups/" + BOB + "/" + GROUP_ID + "/members/" + ALICE, {
-    groupId: GROUP_ID, accountId: ALICE, role: "admin", joinedAtMs: 1000,
-  });
-  await bobStorage.getKeyValueStore(BOB).set("app:groups/" + BOB + "/" + GROUP_ID + "/members/" + BOB, {
-    groupId: GROUP_ID, accountId: BOB, role: "member", joinedAtMs: 1000,
-  });
 
   const alice = makeServer({ ownerAccountId: ALICE, storage: aliceStorage, sendCapture: aliceSent, clock });
   const bob = makeServer({ ownerAccountId: BOB, storage: bobStorage, sendCapture: bobSent, clock });
   await startBoth([alice, bob]);
+
+  // Both sides need ACTIVE group membership for fan-out + ingestion to allow
+  // the message through. Seed through the real GroupStore API — the previous
+  // raw "app:groups/.../members/..." key seeds never matched the membership
+  // table's hashed "app:groupMembership/" layout, so the old version of this
+  // test asserted "no acks" against a fan-out that had zero targets (vacuous).
+  for (const [server, owner] of [[alice, ALICE], [bob, BOB]]) {
+    await server.bus.stores.groupStore.ensureGroup({ ownerAccountId: owner, groupId: GROUP_ID, createdBy: ALICE, title: "Group case" });
+    await server.bus.stores.groupStore.ensureMembership({ ownerAccountId: owner, groupId: GROUP_ID, accountId: ALICE, role: "admin" });
+    await server.bus.stores.groupStore.ensureMembership({ ownerAccountId: owner, groupId: GROUP_ID, accountId: BOB, role: "member" });
+  }
+
+  // Bob's ack path resolves Alice's return inbox from her peer link (a group
+  // thread carries no peer identity). Back the peer-links list directive with
+  // the link the group message would have decrypted over.
+  bob.bus.runtime.peerLinks = {
+    ownerAccountId: BOB,
+    peerLinkStorage: {
+      peerLinks: {
+        listByOwner: async () => [{
+          peerLinkId: "pl_bob_alice",
+          localAccountId: BOB,
+          peerAccountId: ALICE,
+          peerInboxId: "inbox:" + ALICE,
+          state: "session_established",
+        }],
+      },
+    },
+  };
+
+  // Sender side: group fan-out must still register recovery evidence per
+  // recipient — that is the mechanism the receiver-side ack now feeds.
+  const recovered = [];
+  const peerLinkProtocol = alice.bus.services.peerLinkProtocol;
+  const origRecord = peerLinkProtocol.recordOutboundGroupMessage.bind(peerLinkProtocol);
+  peerLinkProtocol.recordOutboundGroupMessage = (args) => { recovered.push(args); return origRecord(args); };
+
+  const aliceStatuses = [];
+  alice.bus.on("message.status", (e) => aliceStatuses.push(e));
 
   await alice.bus.services.messages.sendMessage({
     threadId: GROUP_THREAD,
     messageId: "mid_group_msg",
     payload: { kind: "rez.chat.message.v1", text: "hi team" },
   });
+  assert.equal(recovered.length, 1, "sender registered the fan-out copy as expecting an ack");
+  assert.equal(recovered[0].peerAccountId, BOB);
 
   await deliverToReceiver({ senderServer: alice, receiverServer: bob, sentBuf: aliceSent, expectedPeerAccountId: BOB });
 
-  // Give the ingest a chance to run, then assert nothing on Bob's side
-  // attempted to send an ack. Group fan-out is not acked (ambiguous
-  // semantics + N-ack-amplification risk).
-  await new Promise((r) => setTimeout(r, 100));
+  // Bob acked the group message, sealed to Alice at her peer-link inbox.
+  const ackArrived = await waitForCondition(() => bobSent.some((opts) => {
+    try {
+      const parsed = JSON.parse(Buffer.from(opts.plaintextBodyBytes).toString("utf8"));
+      return parsed && parsed.kind === "rez.delivery.ack";
+    } catch { return false; }
+  }));
+  assert.equal(ackArrived, true, "group message triggers a delivery ack from the member");
   const ackSends = bobSent.filter((opts) => {
     try {
       const parsed = JSON.parse(Buffer.from(opts.plaintextBodyBytes).toString("utf8"));
       return parsed && parsed.kind === "rez.delivery.ack";
     } catch { return false; }
   });
-  assert.equal(ackSends.length, 0, "group messages must not trigger delivery acks");
+  assert.equal(ackSends.length, 1, "exactly one ack per member per message");
+  assert.equal(ackSends[0].peerAccountId, ALICE, "ack sealed to the authenticated sender");
+  assert.equal(ackSends[0].deliverInboxId, "inbox:" + ALICE, "ack routed to the sender's peer-link inbox");
+  const ackBody = JSON.parse(Buffer.from(ackSends[0].plaintextBodyBytes).toString("utf8"));
+  assert.deepEqual(ackBody.messageIds, ["mid_group_msg"], "ack carries the sender's local messageId");
+
+  // Route the ack back to Alice: her group row must NOT flip to "delivered"
+  // (group messageIds are not ack-pending-registered — the ack feeds recovery
+  // evidence only, never the N-ack-ambiguous group status).
+  await deliverToReceiver({ senderServer: bob, receiverServer: alice, sentBuf: bobSent, expectedPeerAccountId: ALICE });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(
+    aliceStatuses.some((e) => e.messageId === "mid_group_msg" && e.status === "delivered"),
+    false,
+    "a group row never transitions to delivered on a member ack",
+  );
 });

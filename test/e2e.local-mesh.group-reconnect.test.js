@@ -53,14 +53,15 @@ const knownRelay = (relayKeyId, port) => ({
   id: relayKeyId, relayKeyId, host: "127.0.0.1", port, transport: "tcp", insecure: true, tls: false,
 });
 
-function relayOnlyConfig({ dataDir, listenPort, relayKeyId, knownRelays }) {
+function relayOnlyConfig({ dataDir, listenPort, knownRelays }) {
   return {
     node: {
       mode: "relay-only",
       storage: { dataDir },
       network: { knownRelays },
       mesh: { mode: "seed-only", seeds: [] },
-      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1", relayKeyId },
+      // ADR-RELAY-IDENTITY: relayKeyId is DERIVED from the node key — never configured.
+      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1" },
     },
   };
 }
@@ -168,12 +169,13 @@ test("live local mesh group RECONNECT: after Alice restarts, Bob's group message
   let bob = null;
   try {
     relay = await startRezNode(relayOnlyConfig({
-      dataDir: path.join(tmp, "relay"), listenPort: rPort, relayKeyId: "relay-core-1", knownRelays: [],
+      dataDir: path.join(tmp, "relay"), listenPort: rPort, knownRelays: [],
     }));
     started.push(relay);
+    const relayKeyId = relay.runtime.getIdentity().relayKeyId;
 
-    alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
-    bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
+    alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
+    bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
 
     await sleep(4_000);
 

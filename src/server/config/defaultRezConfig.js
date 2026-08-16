@@ -22,16 +22,18 @@ export function createDefaultRezConfig({ dataDir = ".local/rez-node-data" } = {}
       },
       network: {
         participateInRouting: true,
-        // TRUST-7: pin each relay's node identity public key (the key it signs
-        // its peer-auth challenge with). The local node asserts the relay presents
-        // exactly this key before trusting the connection — closing the rogue/MITM
-        // relay-by-self-claim gap (a TLS endpoint can no longer impersonate a relay
-        // without its node private key). Keys read from the live r1/r2/r3 node
-        // identities (nodeIdentity:v1). nodeKeyId is hash(pubkey) for reference.
+        // TRUST-7 + ADR-RELAY-IDENTITY: relayKeyId is now SELF-CERTIFYING —
+        // rez:relay:sha256hex(node public key SPKI DER), derived here from the
+        // live r1/r2/r3 node identity keys (nodeIdentity:v1). The `id` field is
+        // a human label only (metadata, never identity). The pinned
+        // nodePublicKeyB64 must re-derive to relayKeyId or the connection is
+        // rejected. NOTE: the deployed relays must be redeployed WITHOUT a
+        // configured relay.relayKeyId (they derive it) before these entries
+        // authenticate — the pre-launch one-time identity reset.
         knownRelays: [
           {
             id: "ws:relay1",
-            relayKeyId: "ws:relay1",
+            relayKeyId: "rez:relay:d045f1d7c0c61f9f7a30ff6735e112b498ba62ae70d30eddd1773683cde0d1d8",
             host: "r1.rezprotocol.io",
             port: 8443,
             transport: "tcp",
@@ -42,7 +44,7 @@ export function createDefaultRezConfig({ dataDir = ".local/rez-node-data" } = {}
           },
           {
             id: "ws:relay2",
-            relayKeyId: "ws:relay2",
+            relayKeyId: "rez:relay:4596facfe502588659db067a23cb04ad73870414c7e5f32e8414106d833332af",
             host: "r2.rezprotocol.io",
             port: 8443,
             transport: "tcp",
@@ -53,7 +55,7 @@ export function createDefaultRezConfig({ dataDir = ".local/rez-node-data" } = {}
           },
           {
             id: "ws:relay3",
-            relayKeyId: "ws:relay3",
+            relayKeyId: "rez:relay:c679f0cff57ac8d52821702ccfbf1fd38a346f05598c10c0a782c003a2c28501",
             host: "r3.rezprotocol.io",
             port: 8443,
             transport: "tcp",

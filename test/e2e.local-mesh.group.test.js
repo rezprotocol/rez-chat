@@ -53,14 +53,15 @@ const knownRelay = (relayKeyId, port) => ({
   id: relayKeyId, relayKeyId, host: "127.0.0.1", port, transport: "tcp", insecure: true, tls: false,
 });
 
-function relayOnlyConfig({ dataDir, listenPort, relayKeyId, knownRelays }) {
+function relayOnlyConfig({ dataDir, listenPort, knownRelays }) {
   return {
     node: {
       mode: "relay-only",
       storage: { dataDir },
       network: { knownRelays },
       mesh: { mode: "seed-only", seeds: [] },
-      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1", relayKeyId },
+      // ADR-RELAY-IDENTITY: relayKeyId is DERIVED from the node key — never configured.
+      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1" },
     },
   };
 }
@@ -152,13 +153,15 @@ test("live local mesh group: create + invite + member.join roster sync + bidirec
   const rPort = await getFreePort();
   const started = [];
   try {
-    started.push(await startRezNode(relayOnlyConfig({
-      dataDir: path.join(tmp, "relay"), listenPort: rPort, relayKeyId: "relay-core-1", knownRelays: [],
-    })));
+    const relayApp = await startRezNode(relayOnlyConfig({
+      dataDir: path.join(tmp, "relay"), listenPort: rPort, knownRelays: [],
+    }));
+    started.push(relayApp);
+    const relayKeyId = relayApp.runtime.getIdentity().relayKeyId;
 
-    const alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
+    const alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     started.push(alice);
-    const bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
+    const bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     started.push(bob);
 
     await sleep(4_000);

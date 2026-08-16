@@ -233,7 +233,7 @@ test("cross-leaf invite (inviter ONLINE): acceptor on a different leaf resolves 
   // The inviter (on leafA) publishes. The record lands on leafA's entry relay
   // (relay0) — NOT on relay1, and NOT on leafB.
   const put = await leafA.node.putRecord(created.durableRecord);
-  assert.equal(put.stored, true, "node accepts the chat-server-signed record: " + put.reason);
+  assert.equal(put.storedLocally, true, "node accepts the chat-server-signed record: " + put.reason);
   await flush();
 
   // Mechanism check: the put only reaches leafA's entry relay (leafA knows
@@ -285,7 +285,7 @@ test("cross-leaf invite (inviter OFFLINE): the record outlives the inviter leaf 
     peerInboxId: inviter.inbox,
   });
   const put = await leafA.node.putRecord(created.durableRecord);
-  assert.equal(put.stored, true, "node accepts the record: " + put.reason);
+  assert.equal(put.storedLocally, true, "node accepts the record: " + put.reason);
   await flush();
 
   // The sole core-resident copy is on relay0 (leafA's entry relay).

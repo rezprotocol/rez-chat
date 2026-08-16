@@ -47,14 +47,15 @@ const knownRelay = (relayKeyId, port) => ({
   id: relayKeyId, relayKeyId, host: "127.0.0.1", port, transport: "tcp", insecure: true, tls: false,
 });
 
-function relayOnlyConfig({ dataDir, listenPort, relayKeyId, knownRelays }) {
+function relayOnlyConfig({ dataDir, listenPort, knownRelays }) {
   return {
     node: {
       mode: "relay-only",
       storage: { dataDir },
       network: { knownRelays },
       mesh: { mode: "seed-only", seeds: [] },
-      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1", relayKeyId },
+      // ADR-RELAY-IDENTITY: relayKeyId is DERIVED from the node key — never configured.
+      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1" },
     },
   };
 }
@@ -153,11 +154,12 @@ test("live local mesh group OFFLINE-ACCEPT: Bob accepts while Alice is offline; 
   let bob = null;
   try {
     relay = await startRezNode(relayOnlyConfig({
-      dataDir: path.join(tmp, "relay"), listenPort: rPort, relayKeyId: "relay-core-1", knownRelays: [],
+      dataDir: path.join(tmp, "relay"), listenPort: rPort, knownRelays: [],
     }));
+    const relayKeyId = relay.runtime.getIdentity().relayKeyId;
 
-    alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
-    bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
+    alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
+    bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     await sleep(4_000);
 
     // --- Alice (online) creates a group + a GROUP invite ---
@@ -193,7 +195,7 @@ test("live local mesh group OFFLINE-ACCEPT: Bob accepts while Alice is offline; 
     await sleep(2_000);
 
     // --- Alice comes back ONLINE; her catch-up must drain Bob's buffered handshake ---
-    alice = await restartLeaf(tmp, { label: "alice", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
+    alice = await restartLeaf(tmp, { label: "alice", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     await sleep(4_000);
 
     // THE REGRESSION ASSERTIONS: the offline handshake must establish Alice's side.

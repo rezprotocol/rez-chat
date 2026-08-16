@@ -62,14 +62,15 @@ const knownRelay = (relayKeyId, port) => ({
   id: relayKeyId, relayKeyId, host: "127.0.0.1", port, transport: "tcp", insecure: true, tls: false,
 });
 
-function relayOnlyConfig({ dataDir, listenPort, relayKeyId, knownRelays }) {
+function relayOnlyConfig({ dataDir, listenPort, knownRelays }) {
   return {
     node: {
       mode: "relay-only",
       storage: { dataDir },
       network: { knownRelays },
       mesh: { mode: "seed-only", seeds: [] },
-      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1", relayKeyId },
+      // ADR-RELAY-IDENTITY: relayKeyId is DERIVED from the node key — never configured.
+      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1" },
     },
   };
 }
@@ -186,13 +187,15 @@ test("live local mesh: the full PSK device-link ceremony provisions a delegated 
   const started = [];
   let vault = null;
   try {
-    started.push(await startRezNode(relayOnlyConfig({
-      dataDir: path.join(tmp, "relay"), listenPort: rPort, relayKeyId: "relay-core-1", knownRelays: [],
-    })));
+    const relayApp = await startRezNode(relayOnlyConfig({
+      dataDir: path.join(tmp, "relay"), listenPort: rPort, knownRelays: [],
+    }));
+    started.push(relayApp);
+    const relayKeyId = relayApp.runtime.getIdentity().relayKeyId;
 
     // PRIMARY leaf (seedful account with B).
     const primaryId = await makePrimaryIdentity();
-    const primaryNode = await startNode({ tmp, label: "primary", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
+    const primaryNode = await startNode({ tmp, label: "primary", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     const primary = await bootChatLeaf({
       dataDir: primaryNode.dataDir, wsUrl: primaryNode.wsUrl,
       expectedChatServerIdentity: primaryId.chatServerIdentity, deviceKey: primaryId.deviceKey,
@@ -202,7 +205,7 @@ test("live local mesh: the full PSK device-link ceremony provisions a delegated 
 
     // CAROL leaf (plain primary — the third peer the provisioned device talks to).
     const carolId = await makePrimaryIdentity();
-    const carolNode = await startNode({ tmp, label: "carol", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
+    const carolNode = await startNode({ tmp, label: "carol", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     const carol = await bootChatLeaf({
       dataDir: carolNode.dataDir, wsUrl: carolNode.wsUrl,
       expectedChatServerIdentity: carolId.chatServerIdentity, deviceKey: carolId.deviceKey,
@@ -211,7 +214,7 @@ test("live local mesh: the full PSK device-link ceremony provisions a delegated 
     started.push(carolLeaf);
 
     // NEW-DEVICE node (no chat server yet — the ceremony provisions it).
-    const newdevNode = await startNode({ tmp, label: "newdev", entryRelayKeyId: "relay-core-1", entryRelayPort: rPort });
+    const newdevNode = await startNode({ tmp, label: "newdev", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     started.push({ nodeApp: newdevNode.nodeApp });
 
     await sleep(4_000); // mesh form

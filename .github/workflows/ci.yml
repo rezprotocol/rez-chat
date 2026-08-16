@@ -47,3 +47,60 @@ jobs:
         working-directory: rez-chat
       - run: npm test
         working-directory: rez-chat
+
+  # Live loopback mesh e2e (re-audit R8): real chat-servers over real WS
+  # uplinks to real rez-nodes peered through a real TCP relay. These files were
+  # previously reachable from NO test entry point — the exact enumeration trap
+  # this repo has been bitten by before; the script globs so new files are
+  # auto-included. KNOWN RED (pre-existing product blockers, not this suite):
+  #   - delegated-invite: fs-node delegated WS auth fails closed
+  #     (GatewaySession revocation cache is pg-only)
+  #   - device-link: ceremony cannot complete against an fs home
+  #   - group-coremember-separation: contact-materialization race
+  # This job is intentionally separate so the main suite stays green while
+  # these failures stay VISIBLE until the blockers are fixed.
+  e2e-local-mesh:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      REZ_PG_TEST_URL: postgres://postgres:postgres@127.0.0.1:5433/postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rez-chat
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-core
+          path: rez-core
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-sdk
+          path: rez-sdk
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-node
+          path: rez-node
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-ui
+          path: rez-ui
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+      - run: npm install --install-links --no-audit --no-fund
+        working-directory: rez-chat
+      - run: npm run test:e2e:local-mesh
+        working-directory: rez-chat

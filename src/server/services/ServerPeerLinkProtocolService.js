@@ -424,6 +424,19 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         return { consumed: false, decryptOk: false, reason: "decrypt-empty" };
       }
 
+      // DT-007: a degraded commit (ratchet durable, but the peer-link
+      // transition or lifecycle event could not land) must be operationally
+      // visible — the SDK's typed marker is useless if nothing reads it.
+      if (decResult.commitError) {
+        this.logger.warn("[ServerPeerLinkProtocolService] decrypt commit degraded ("
+          + decResult.commitError.stage + "): " + decResult.commitError.message);
+        this._emit("app.error", {
+          source: "ServerPeerLinkProtocolService",
+          message: "peer-link commit degraded after decrypt (" + decResult.commitError.stage + ")",
+          severity: "warn",
+        });
+      }
+
       // Emit the snapshot-updated event only when an actual peer-link state
       // transition occurred (decResult.event is non-null). Snapshot is now
       // populated on every decrypt for downstream sender resolution, so we

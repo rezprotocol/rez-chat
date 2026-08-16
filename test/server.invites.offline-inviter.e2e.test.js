@@ -171,7 +171,7 @@ async function runOfflineInviteFlow({ kind, groupId, title }) {
   // chat-server-signed record. This is the cross-provider crypto bridge.
   const holder = makeHolderNode();
   const putResult = await holder.putRecord(created.durableRecord);
-  assert.equal(putResult.stored, true,
+  assert.equal(putResult.storedLocally, true,
     "node accepts the chat-server-signed record (crypto bridge holds): " + putResult.reason);
 
   // 3. Inviter goes OFFLINE: from here we never touch inviterPeerLinks until

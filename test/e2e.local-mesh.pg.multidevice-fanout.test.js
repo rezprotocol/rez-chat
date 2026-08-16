@@ -92,14 +92,15 @@ const knownRelay = (relayKeyId, port) => ({
   id: relayKeyId, relayKeyId, host: "127.0.0.1", port, transport: "tcp", insecure: true, tls: false,
 });
 
-function relayOnlyConfig({ dataDir, listenPort, relayKeyId, knownRelays }) {
+function relayOnlyConfig({ dataDir, listenPort, knownRelays }) {
   return {
     node: {
       mode: "relay-only",
       storage: { dataDir },
       network: { knownRelays },
       mesh: { mode: "seed-only", seeds: [] },
-      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1", relayKeyId },
+      // ADR-RELAY-IDENTITY: relayKeyId is DERIVED from the node key — never configured.
+      relay: { listenHost: "127.0.0.1", listenPort, advertisedHost: "127.0.0.1" },
     },
   };
 }
@@ -251,9 +252,11 @@ test(
 
     try {
       // One real relay over TCP (mesh formation only — all inboxes are home-local).
-      started.push(await startRezNode(relayOnlyConfig({
-        dataDir: path.join(tmp, "relay"), listenPort: rPort, relayKeyId: "relay-core-1", knownRelays: [],
-      })));
+      const relayApp = await startRezNode(relayOnlyConfig({
+        dataDir: path.join(tmp, "relay"), listenPort: rPort, knownRelays: [],
+      }));
+      started.push(relayApp);
+      const relayKeyId = relayApp.runtime.getIdentity().relayKeyId;
 
       // The pg-backed account HOME with the E6 fan-out gate OPEN (operator opt-in).
       const aliceHome = await startRezNode({
@@ -265,7 +268,7 @@ test(
             encryptionKeyB64: bytesToBase64(CRYPTO.randomBytes(32)),
             pg: { connectionString: schemaScopedUrl(PG_URL, SCHEMA), migrateOnBoot: true },
           },
-          network: { participateInRouting: true, knownRelays: [knownRelay("relay-core-1", rPort)] },
+          network: { participateInRouting: true, knownRelays: [knownRelay(relayKeyId, rPort)] },
           mesh: { enabled: true, mode: "seed-only", seeds: [], minPeers: 1, maxPeers: 5 },
           relay: { listenHost: "127.0.0.1", listenPort: 0 },
           device: { multiDeviceFanout: true },

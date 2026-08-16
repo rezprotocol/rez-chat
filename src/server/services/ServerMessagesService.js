@@ -253,6 +253,7 @@ export class ServerMessagesService extends BaseServerService {
     let eventId = "";
     let messageQueued = false;
     let queuedInboxIds = [];
+    let sentToGroup = false;
     // Every chat thread id is minted with a `th_` prefix (ServerThreadsService /
     // defaultRezConfig), so delivery always routes through #deliverToThread,
     // which seals per-recipient before handing opaque bytes to the mesh. There
@@ -263,6 +264,7 @@ export class ServerMessagesService extends BaseServerService {
       eventId = routed.eventId;
       messageQueued = routed.queued;
       queuedInboxIds = Array.isArray(routed.queuedInboxIds) ? routed.queuedInboxIds : [];
+      sentToGroup = routed.isGroup === true;
     }
 
     if (threadId) {
@@ -270,8 +272,14 @@ export class ServerMessagesService extends BaseServerService {
       if (eventId) {
         nextStatus = "sent";
         // Track in-flight so handleDeliveryAck can resolve the threadId
-        // from the bare messageId on the ack wire.
-        this.#ackPending.set(messageId, threadId);
+        // from the bare messageId on the ack wire. DT-004: group messageIds
+        // are deliberately NOT registered — group members now ack (so the
+        // sender-side recovery evidence in ServerPeerLinkProtocolService is
+        // truthful), but a group row's status must not flip to "delivered"
+        // on the first of N member acks; group acks feed recovery only.
+        if (!sentToGroup) {
+          this.#ackPending.set(messageId, threadId);
+        }
       } else if (messageQueued) {
         nextStatus = "queued";
         this.#queuedMessages.push({ threadId, messageId, queuedAtMs: now });
@@ -569,9 +577,9 @@ export class ServerMessagesService extends BaseServerService {
           localInboxId,
           messageId: eventTag,
         });
-        if (fanOut.sentCount > 0) return { eventId: "gw:" + now + ":" + eventTag, queued: false, queuedInboxIds: [] };
-        if (fanOut.queuedCount > 0) return { eventId: "", queued: true, queuedInboxIds: fanOut.queuedInboxIds };
-        return { eventId: "", queued: false, queuedInboxIds: [] };
+        if (fanOut.sentCount > 0) return { eventId: "gw:" + now + ":" + eventTag, queued: false, queuedInboxIds: [], isGroup: true };
+        if (fanOut.queuedCount > 0) return { eventId: "", queued: true, queuedInboxIds: fanOut.queuedInboxIds, isGroup: true };
+        return { eventId: "", queued: false, queuedInboxIds: [], isGroup: true };
       } catch (err) {
         if (err && err.queued === true) return { eventId: "", queued: true, queuedInboxIds: [] };
         throw err;
