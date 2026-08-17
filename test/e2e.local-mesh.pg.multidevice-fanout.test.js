@@ -5,7 +5,6 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import pg from "pg";
 import { startRezNode, NodeCryptoProvider } from "@rezprotocol/node";
 import {
   bytesToBase64,
@@ -112,8 +111,17 @@ function schemaScopedUrl(url, schema) {
   return url + sep + "options=" + encodeURIComponent("-c search_path=" + schema);
 }
 
+// `pg` is imported DYNAMICALLY, not at module scope. It is not a rez-chat
+// dependency — it resolves locally only because the workspace hoists rez-node's
+// copy to the repo root. A static import makes this whole file fail to load on a
+// standalone checkout (CI), which turns a SKIPPED test into a hard failure and
+// takes the e2e-local-mesh job red for a reason that has nothing to do with the
+// code under test. Everything below runs only when REZ_PG_TEST_URL is set, so the
+// import can't be reached on a run that skips.
 async function withAdminPg(url, fn) {
-  const pool = new pg.Pool({ connectionString: url });
+  const pg = await import("pg");
+  const Pool = pg.default ? pg.default.Pool : pg.Pool;
+  const pool = new Pool({ connectionString: url });
   try { return await fn(pool); } finally { await pool.end(); }
 }
 
