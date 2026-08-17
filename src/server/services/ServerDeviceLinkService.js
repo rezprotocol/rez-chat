@@ -1,5 +1,6 @@
 import { DeviceLinkApprover } from "@rezprotocol/sdk/device-link";
 import { BaseServerService } from "../base/BaseServerService.js";
+import { nodeSupportsDeviceLinking } from "../inbox/durableMode.js";
 import { DeviceLinkStartParams } from "../../records/params/DeviceLinkStartParams.js";
 import { DeviceLinkStatusParams } from "../../records/params/DeviceLinkStatusParams.js";
 import { DeviceLinkApproveParams } from "../../records/params/DeviceLinkApproveParams.js";
@@ -220,6 +221,25 @@ export class ServerDeviceLinkService extends BaseServerService {
     const sdk = this.#sdk();
     if (!sdk || !sdk.durableRecords) {
       throw new Error("deviceLink.start requires bus.runtime.sdk (connected chat server)");
+    }
+    // Refuse BEFORE starting anything the home cannot finish (rez-chat#3).
+    // Device linking needs the node's account-mutation serializer to commit
+    // device.add and its authority resolver to later admit the delegated
+    // session; both exist only on a pg home. An fs/desktop home used to accept
+    // the ceremony, fail device.add with SERVICE_UNAVAILABLE, and leave the new
+    // device waiting until a 68-second timeout reported a bare
+    // DEVICE_LINK_TIMEOUT — indistinguishable from the peer being offline.
+    //
+    // Checked here rather than deeper in #drive so nothing is written: a
+    // ceremony journalled against a home that can never commit it is state
+    // whose only future is expiry.
+    if (!nodeSupportsDeviceLinking(sdk)) {
+      const err = new Error(
+        "deviceLink.start: this account's home node does not support linking additional devices."
+          + " Multi-device requires a hosted (postgres-backed) home; a local desktop node is single-device.",
+      );
+      err.code = "DEVICE_LINKING_UNSUPPORTED";
+      throw err;
     }
     const peerLinks = this.bus.runtime ? this.bus.runtime.peerLinks : null;
     if (peerLinks && peerLinks.hasAdminRoot === false) {

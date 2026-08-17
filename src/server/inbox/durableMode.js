@@ -69,3 +69,36 @@ export function nodeEnablesMultiDeviceFanout(sdk) {
 export function nodeRequiresProvenDevice(sdk) {
   return nodeEnablesMultiDeviceFanout(sdk);
 }
+
+/**
+ * SSOT for "can this home carry a second device at all?" — the negotiated
+ * `delegatedDevices` capability.
+ *
+ * DISTINCT from nodeEnablesMultiDeviceFanout, which negotiates cursor semantics
+ * for a home that already has several devices. This one answers whether the
+ * device-link ceremony can complete at all: it needs the node's account-mutation
+ * serializer (to commit device.add) AND its authority revocation resolver
+ * (delegated session admission fails closed without one). Both exist only on a
+ * pg home, so an fs/desktop node advertises false.
+ *
+ * Read by the UI to decide whether to OFFER device linking. rez-chat#3: the
+ * "Link a new device" button was unconditional, so on the default fs home a user
+ * could start a ceremony that could never finish — it hung for 68 seconds and
+ * then reported a bare timeout, which reads as a network fault rather than an
+ * unsupported operation.
+ *
+ * Defaults false, so an older node that advertises no capability is treated as
+ * unable to link. Wrongly hiding the button is recoverable; wrongly offering it
+ * is the bug.
+ *
+ * @param {object} sdk
+ * @returns {boolean}
+ */
+export function nodeSupportsDeviceLinking(sdk) {
+  if (!sdk || typeof sdk.getSessionInfo !== "function") return false;
+  const info = sdk.getSessionInfo();
+  if (!info || typeof info !== "object") return false;
+  const caps = info.capabilities;
+  if (!caps || typeof caps !== "object") return false;
+  return caps.delegatedDevices === true;
+}

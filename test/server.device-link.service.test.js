@@ -95,14 +95,30 @@ function makeStorageProvider() {
   return { provider: { getKeyValueStore: () => kv }, data };
 }
 
-function makeBus({ overlay, hasAdminRoot = true, accountAuthority = null, accountIdentityDhKeyPair = null, onSubmit = null }) {
+function makeBus({
+  overlay,
+  hasAdminRoot = true,
+  accountAuthority = null,
+  accountIdentityDhKeyPair = null,
+  onSubmit = null,
+  // These tests exercise a home that CAN link, i.e. a pg home advertising the
+  // negotiated `delegatedDevices` capability. Defaulting true keeps them
+  // testing the ceremony; the fs/desktop home (false) is covered explicitly
+  // below, since there the ceremony must be refused before it starts.
+  delegatedDevices = true,
+}) {
   const events = [];
   const calls = [];
   return {
     events,
     calls,
     runtime: {
-      sdk: overlay ? { durableRecords: overlay } : null,
+      sdk: overlay
+        ? {
+            durableRecords: overlay,
+            getSessionInfo: () => ({ capabilities: { delegatedDevices } }),
+          }
+        : null,
       peerLinks: { hasAdminRoot, cryptoProvider: CRYPTO },
       accountAuthority,
       accountIdentityDhKeyPair,
@@ -140,13 +156,14 @@ function makePrimaryKeys() {
   };
 }
 
-function makeService({ overlay, keys, hasAdminRoot = true, dh = true, onSubmit = undefined, storageProvider = undefined, mutations = [] }) {
+function makeService({ overlay, keys, hasAdminRoot = true, dh = true, onSubmit = undefined, storageProvider = undefined, mutations = [], delegatedDevices = true }) {
   const bus = makeBus({
     overlay,
     hasAdminRoot,
     accountAuthority: keys.authority,
     accountIdentityDhKeyPair: dh ? keys.accountIdentityDhKeyPair : null,
     onSubmit: onSubmit === undefined ? makeMutationHome({ mutations }) : onSubmit,
+    delegatedDevices,
   });
   const storage = storageProvider === undefined ? makeStorageProvider().provider : storageProvider;
   const svc = new ServerDeviceLinkService({
@@ -421,4 +438,69 @@ test("L4: a ceremony cannot start without the durable journal", async () => {
   const keys = makePrimaryKeys();
   const { svc } = makeService({ overlay, keys, storageProvider: null });
   await assert.rejects(() => svc.startCeremony({}), /requires a storageProvider for the pending-ceremony journal/);
+});
+
+// rez-chat#3 / rez-node#2. Multi-device requires a pg home: an fs/desktop node
+// has no account-mutation serializer to commit device.add and no authority
+// resolver, so GatewaySession fails delegated admission CLOSED by design.
+// Before this refusal existed the ceremony started anyway, device.add failed
+// with SERVICE_UNAVAILABLE, and the new device sat until a 68-second
+// DEVICE_LINK_TIMEOUT that was indistinguishable from the peer being offline.
+test("an fs/desktop home refuses the ceremony immediately with a typed code", async () => {
+  const overlay = makeOverlay();
+  const keys = await makePrimaryKeys();
+  const { svc } = makeService({ overlay, keys, delegatedDevices: false });
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => svc.startCeremony({}),
+    (err) => {
+      assert.equal(err.code, "DEVICE_LINKING_UNSUPPORTED");
+      // The message has to tell the user WHY, not just that it failed — the
+      // whole defect was a failure that read as a network fault.
+      assert.match(err.message, /does not support linking additional devices/);
+      assert.match(err.message, /hosted/);
+      return true;
+    },
+  );
+  // Fast is the point, not incidental: the old path took ~68s.
+  assert.ok(Date.now() - startedAt < 2_000, "refusal must be immediate, not a timeout");
+});
+
+test("the refused ceremony leaves NO durable state behind", async () => {
+  // A journalled ceremony against a home that can never commit it is state
+  // whose only future is expiry. Refusing must happen before anything is
+  // written, and must not consume the single-ceremony slot.
+  const overlay = makeOverlay();
+  const keys = await makePrimaryKeys();
+  const { svc, bus } = makeService({ overlay, keys, delegatedDevices: false });
+
+  await assert.rejects(() => svc.startCeremony({}), (err) => err.code === "DEVICE_LINKING_UNSUPPORTED");
+
+  const status = await svc.statusCeremony({});
+  assert.equal(status.state, "idle", "a refused start must not leave a pending ceremony");
+  assert.equal(
+    bus.events.filter((e) => e.name === "deviceLink.updated").length,
+    0,
+    "a refused start must not announce ceremony progress",
+  );
+  assert.equal(
+    bus.calls.filter((c) => c.namespace === "account-mutation").length,
+    0,
+    "a refused start must not submit a device mutation",
+  );
+});
+
+test("a node advertising no capability at all is treated as unable to link", async () => {
+  // Fail closed on an older/unknown node: wrongly hiding the affordance is
+  // recoverable, wrongly offering it is the bug being fixed.
+  const overlay = makeOverlay();
+  const keys = await makePrimaryKeys();
+  const { svc, bus } = makeService({ overlay, keys });
+  bus.runtime.sdk.getSessionInfo = () => ({ capabilities: {} });
+
+  await assert.rejects(() => svc.startCeremony({}), (err) => err.code === "DEVICE_LINKING_UNSUPPORTED");
+
+  bus.runtime.sdk.getSessionInfo = () => null;
+  await assert.rejects(() => svc.startCeremony({}), (err) => err.code === "DEVICE_LINKING_UNSUPPORTED");
 });
