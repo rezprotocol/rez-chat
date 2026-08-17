@@ -651,17 +651,46 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     // so createInvite anchors it automatically — recovery does NOT hand-pass it.
     // createInvite fails loud if no binding is configured, so a bindingless invite
     // can no longer be silently produced.
+    const expiresAtMs = this.#clock() + RECOVERY_INVITE_TTL_MS;
     const created = await peerLinks.createInvite({
       ownerAccountId: this.ownerAccountId,
       kind: "direct",
       maxUses: 1,
-      expiresAtMs: this.#clock() + RECOVERY_INVITE_TTL_MS,
+      expiresAtMs,
     });
     const inviteId = created && typeof created.inviteId === "string" ? created.inviteId : "";
     if (!inviteId) {
       this.logger.warn("[ServerPeerLinkProtocolService] recovery invite produced no inviteId for peer " + remote);
       return;
     }
+    // rez-chat#10: durably mark this invite as OURS-BY-MACHINERY before it can
+    // possibly be accepted. The wire only admits kind ∈ {direct, group}, so a
+    // recovery invite is indistinguishable on the wire from a person asking to
+    // connect; without this marker, accepting one promotes an invisible
+    // co-member transport link into a 1:1 contact + DM thread.
+    //
+    // Ordering is load-bearing: this MUST be durable before dispatch, or the
+    // peer's accept races the write. It is also FAIL-CLOSED — if we cannot
+    // record provenance we do not send the invite at all. A link that stays
+    // desynced is recoverable (recovery retries on the next trigger); a
+    // co-member wrongly materialized as a contact is a privacy leak the user
+    // has to notice and undo.
+    const autoMinted = this.bus.stores && this.bus.stores.autoMintedInviteStore
+      ? this.bus.stores.autoMintedInviteStore
+      : null;
+    if (!autoMinted || typeof autoMinted.markAutoMinted !== "function") {
+      this.logger.error(
+        "[ServerPeerLinkProtocolService] recovery invite ABORTED — autoMintedInviteStore unavailable;"
+          + " cannot prove provenance, refusing to mint a link that could surface as a contact",
+      );
+      return;
+    }
+    await autoMinted.markAutoMinted({
+      ownerAccountId: this.ownerAccountId,
+      inviteId,
+      reason: "peerlink-recovery",
+      expiresAtMs,
+    });
     const envelopeData = await peerLinks.getStoredInviteEnvelope(this.ownerAccountId, inviteId);
     if (!envelopeData || !envelopeData.envelope || typeof envelopeData.signatureB64 !== "string") {
       this.logger.warn("[ServerPeerLinkProtocolService] recovery invite envelope missing for peer " + remote);

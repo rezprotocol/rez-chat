@@ -47,6 +47,49 @@ export class ServerInvitesService extends BaseServerService {
     if (!id) return false;
     if (this.#directContactInviteIds.has(id)) return true;
 
+    // rez-chat#10. The envelope fallback below cannot tell a person's invite
+    // from one this node minted as machinery: peer-link recovery re-uses the
+    // invite/accept path and the wire only admits kind ∈ {direct, group}, so a
+    // recovery invite for an INVISIBLE co-member link reads as kind:"direct"
+    // and would answer yes here — surfacing two people who merely share a group
+    // as a 1:1 contact + DM thread.
+    //
+    // The allow-list above already encodes the right rule (auto-minted invites
+    // never enter it), but it cannot survive a restart, which is precisely when
+    // the fallback takes over. So consult durable provenance first. A row means
+    // WE minted it; a person never did; the answer is no regardless of kind.
+    // Deliberately checked BEFORE the envelope read so a storage fault fails
+    // closed rather than falling through to the permissive path.
+    const autoMinted = this.bus.stores && this.bus.stores.autoMintedInviteStore
+      ? this.bus.stores.autoMintedInviteStore
+      : null;
+    if (autoMinted && typeof autoMinted.isAutoMinted === "function") {
+      let wasAutoMinted = true;
+      try {
+        wasAutoMinted = await autoMinted.isAutoMinted({
+          ownerAccountId: this._peerLinks().ownerAccountId,
+          inviteId: id,
+        });
+      } catch (err) {
+        // Fail closed: we could not prove a person asked for this invite, so we
+        // must not let it surface a contact. Reported, never swallowed — this
+        // caller runs under a non-awaited bus handler, so rethrowing would
+        // become an unhandled rejection instead of a decision.
+        this.logger.error(
+          "[ServerInvitesService] auto-minted lookup failed, treating invite as auto-minted",
+          err && err.message ? err.message : err,
+        );
+        this._emit("app.error", {
+          source: "ServerInvitesService",
+          message: "auto-minted invite lookup failed; direct-link materialization suppressed",
+          severity: "warn",
+          err,
+        });
+        wasAutoMinted = true;
+      }
+      if (wasAutoMinted) return false;
+    }
+
     const peerLinks = this._peerLinks();
     if (typeof peerLinks.getStoredInviteEnvelope !== "function") return false;
     const stored = await peerLinks.getStoredInviteEnvelope(peerLinks.ownerAccountId, id);

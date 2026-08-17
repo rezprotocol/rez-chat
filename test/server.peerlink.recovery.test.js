@@ -36,6 +36,7 @@ import { PeerLinkService } from "@rezprotocol/sdk/peer-link";
 import { NodeCryptoProvider } from "@rezprotocol/node";
 
 import { ServerPeerLinkProtocolService } from "../src/server/services/ServerPeerLinkProtocolService.js";
+import { AutoMintedInviteStore } from "../src/server/storage/AutoMintedInviteStore.js";
 
 const CRYPTO = new NodeCryptoProvider();
 const SILENT = { log() {}, info() {}, warn() {}, error() {} };
@@ -130,10 +131,18 @@ function makePeerLinkService({ accountId, inboxId, getInviteAuthority, clock = (
 }
 
 function makeFakeBus({ runtime, groupStore = null } = {}) {
+  // A REAL AutoMintedInviteStore, not a stub. Recovery now records invite
+  // provenance before dispatch and refuses to mint if it cannot (rez-chat#10),
+  // so a bus without this store has no working recovery path — stubbing it
+  // would hide that coupling from exactly the tests that cover recovery.
+  const stores = groupStore ? { groupStore } : {};
+  stores.autoMintedInviteStore = new AutoMintedInviteStore({
+    storageProvider: createDefaultStorageProvider(),
+  });
   return {
     runtime,
     services: {},
-    stores: groupStore ? { groupStore } : {},
+    stores,
     on() { return () => {}; },
     emit() {},
     registerFunction() {},

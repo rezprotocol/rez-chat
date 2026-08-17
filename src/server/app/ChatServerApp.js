@@ -2,6 +2,7 @@ import { ThreadStoreService } from "../storage/ChatThreadStore.js";
 import { ThreadIndexService } from "../storage/ChatThreadIndex.js";
 import { ContactStore } from "../storage/ChatContactStore.js";
 import { ConnectRequestStore } from "../storage/ConnectRequestStore.js";
+import { AutoMintedInviteStore } from "../storage/AutoMintedInviteStore.js";
 import { GroupStore } from "../storage/ChatGroupStore.js";
 import { ChannelStore } from "../storage/ChatChannelStore.js";
 import { DeviceFanoutCacheStore } from "../storage/DeviceFanoutCacheStore.js";
@@ -198,6 +199,13 @@ export class ChatServerApp {
       clock: this.#clock,
     });
     this.bus.stores.connectRequestStore = new ConnectRequestStore({
+      storageProvider,
+      clock: this.#clock,
+    });
+    // Durable provenance for invites this node mints as machinery (peer-link
+    // recovery / co-member bootstrap) so an accept can never mistake one for a
+    // person asking to connect. See AutoMintedInvite (rez-chat#10).
+    this.bus.stores.autoMintedInviteStore = new AutoMintedInviteStore({
       storageProvider,
       clock: this.#clock,
     });
