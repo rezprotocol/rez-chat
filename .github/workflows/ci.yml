@@ -52,13 +52,15 @@ jobs:
   # uplinks to real rez-nodes peered through a real TCP relay. These files were
   # previously reachable from NO test entry point — the exact enumeration trap
   # this repo has been bitten by before; the script globs so new files are
-  # auto-included. KNOWN RED (pre-existing product blockers, not this suite):
-  #   - delegated-invite: fs-node delegated WS auth fails closed
-  #     (GatewaySession revocation cache is pg-only)
-  #   - device-link: ceremony cannot complete against an fs home
-  #   - group-coremember-separation: contact-materialization race
-  # This job is intentionally separate so the main suite stays green while
-  # these failures stay VISIBLE until the blockers are fixed.
+  # auto-included.
+  #
+  # This job earns its keep. It was red for weeks on a failure that could not
+  # reproduce locally, and the cause was a real product bug, not test flake: a
+  # DHT route announced before the k-buckets filled was STOREd on zero peers
+  # and silently never retried, leaving the inbox undiscoverable until the
+  # 1h republish (rez-node, DhtRouteAnnouncer). The runner is simply slow
+  # enough to lose that race every run. Keep this job on real transports —
+  # a mocked one would have stayed green throughout.
   e2e-local-mesh:
     runs-on: ubuntu-latest
     services:
@@ -73,13 +75,6 @@ jobs:
           --health-timeout 5s --health-retries 10
     env:
       REZ_PG_TEST_URL: postgres://postgres:postgres@127.0.0.1:5433/postgres
-      # DIAGNOSTIC (rez-chat#6): cross-node route resolution fails on this
-      # runner and never recovers — a re-registration 30s later still cannot
-      # resolve, so it is NOT slow propagation. This prints which branch of
-      # GatewayLoop's route lookup misses. Remove once the cause is found.
-      REZ_ROUTE_DEBUG: "1"
-      REZ_GW_DEBUG: "1"
-      REZ_INBOX_DEBUG: "1"
     steps:
       - uses: actions/checkout@v4
         with:
