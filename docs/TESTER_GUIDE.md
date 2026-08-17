@@ -144,6 +144,25 @@ sudo dpkg -i Rez.Chat_<version>_amd64.deb
   reconnect.
 - Very large groups are untested. If you are pushing past a handful of members,
   we want to hear what happens.
+- **A message can be lost if your disk rejects a write at exactly the wrong
+  moment.** Rare, and worth knowing the shape of:
+
+  Opening an encrypted message destroys the key that opened it — that is what
+  stops an attacker who steals your device later from reading today's messages.
+  So every decrypt also has to *record* that it happened. If that record fails to
+  save, nothing is lost: the message stays unopened and arrives on the next try.
+  If it saves and is *then* rejected, that one message is gone.
+
+  What it is not: nothing is corrupted, the conversation keeps working, and later
+  messages are unaffected. It is one message, not a cascade.
+
+  What you would see: a message that never arrives, and a warning captured at the
+  same moment in **Settings → Report a problem**. If a message goes missing,
+  grab that bundle — it distinguishes "a message vanished" from "a message
+  vanished for this specific reason", and we cannot tell those apart without it.
+
+  This is a known gap with a fix planned, not a mystery. Technical detail:
+  `rez-sdk/docs/KNOWN_LIMITATIONS.md`.
 
 ---
 
