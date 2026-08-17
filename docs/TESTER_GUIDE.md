@@ -8,26 +8,26 @@ should not use it for anything you would be upset to lose or to have go wrong.
 
 ---
 
-## Read this first: the relay reset
+## Read this first: the relay reset has happened
 
-There is a **one-time, breaking cutover** coming.
+This was a **one-time, breaking cutover**, and it is now done (2026-08-17).
 
-Rez relays are moving to self-certifying identities — a relay's ID becomes a
-hash of its own key, rather than something configured by whoever runs it. This
-removes an operator's ability to claim an identity they don't hold the key for.
+Rez relays moved to self-certifying identities — a relay's ID is now a hash of
+its own key, rather than something configured by whoever runs it. This removes
+an operator's ability to claim an identity they don't hold the key for.
 
-The consequence for you: **clients from before the cutover stop working at the
-moment it happens.** Not "degrade", not "reconnect slowly" — they will fail to
-authenticate against every relay and stay offline.
+**What this means for you: any build older than `v0.6.0-rc.5` can no longer
+connect.** Not "degrades", not "reconnects slowly" — it fails to authenticate
+against every relay and stays offline. That includes `v0.5.2`, which is still
+the release marked *Latest* on the Releases page.
 
 So:
 
-- **Do not settle on a build and stay there.** "It still works, I'll upgrade
-  later" is not available for this one.
-- If the app suddenly cannot connect and reinstalling the same version doesn't
-  help, the cutover probably happened. Get the current release.
-- Auto-update covers this for anyone already on a Tauri release build. It does
-  **not** help anyone still on `v0.5.2` or earlier.
+- **You need `v0.6.0-rc.5` or newer.** Nothing earlier can reach the network.
+- If the app cannot connect and reinstalling the same version doesn't help,
+  you are on a pre-cutover build. Get the current release.
+- Auto-update carries anyone already on a `v0.6.0-rc.*` Tauri build. It does
+  **not** rescue `v0.5.2` or earlier — those need a manual reinstall.
 
 ---
 
@@ -36,10 +36,10 @@ So:
 Grab the newest release from the
 [Releases page](https://github.com/rezprotocol/rez-chat/releases).
 
-> **Check the version.** At time of writing the release marked **Latest** is
-> `v0.5.2` from June, which predates the relay work and will not survive the
-> cutover. Until an alpha build is promoted, take the newest **pre-release**
-> instead of the one labelled Latest.
+> **Check the version — this one matters.** The release marked **Latest** is
+> still `v0.5.2` from June, which cannot connect at all since the relay reset.
+> Take the newest **pre-release** (`v0.6.0-rc.5` or later), *not* the one
+> labelled Latest.
 
 | Platform | Download | Notes |
 |---|---|---|
