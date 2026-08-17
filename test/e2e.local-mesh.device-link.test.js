@@ -20,22 +20,37 @@ import { runDeviceLinkRequester } from "../src/desktop/runtime/DesktopDeviceLink
 /**
  * LIVE local-mesh DEVICE-LINK CEREMONY e2e — the S2.5 S10 gate, fully un-mocked.
  *
- *   primary  → primaryNode ─┐
- *   newdev   → newdevNode  ─┼─ relayR
- *   carol    → carolNode   ─┘
+ *   primary ─┐
+ *   newdev  ─┼─ accountHome (rez-node, backend=pg) ── relayR
+ *   carol   ─┘
  *
  * The whole PSK ceremony runs over real sockets: the PRIMARY (a seedful
  * account with the account root B) issues a link code via deviceLink.start;
- * the NEW DEVICE runs the real requester against ITS OWN node; the primary's
+ * the NEW DEVICE runs the real requester against the SAME home; the primary's
  * deviceLink.updated event surfaces the new device's fingerprint; the primary
  * approves; the requester's delegation provisions a REAL DesktopVaultService
  * v3 row; that vault boots a DELEGATED chat leaf — which then proves it WORKS
  * by inviting carol (a plain primary) and exchanging messages both ways.
  *
- * Gated behind RUN_LOCAL_MESH_E2E=1 (binds real loopback ports).
+ * WHY ONE SHARED PG HOME (rez-chat#3). This test used to give every
+ * participant its own fs-backed node. That topology CANNOT link devices, and
+ * not by accident: an fs/desktop node wires no accountMutationSerializer (so
+ * device.add has nothing to commit it) and no authority resolver (so delegated
+ * session admission fails closed). GatewaySession states the rule directly —
+ * "present => pg home (both dimensions); absent => FAIL CLOSED (fs/desktop wire
+ * no resolver and are single-device)". Multi-device REQUIRES a hosted home, so
+ * the fixture now matches the only topology in which the feature exists. The
+ * node advertises this as SessionCapabilities.delegatedDevices, which is what
+ * the chat server checks before starting a ceremony at all.
+ *
+ * Gated behind RUN_LOCAL_MESH_E2E=1 AND REZ_PG_TEST_URL (binds real loopback
+ * ports + a real Postgres home).
  */
 
 const RUN = process.env.RUN_LOCAL_MESH_E2E === "1";
+const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const SKIP = !(RUN && PG_URL);
+const SCHEMA = "test_s10_device_link";
 const CHAT_TIMEOUT_MS = 30_000;
 const CRYPTO = new NodeCryptoProvider();
 
@@ -101,21 +116,53 @@ async function makePrimaryIdentity() {
   };
 }
 
-async function startNode({ tmp, label, entryRelayKeyId, entryRelayPort }) {
-  const dataDir = path.join(tmp, label);
+// The pg home connection string, pinned to an isolated schema via libpq options
+// so this test's DDL/DML never collides with other pg test files.
+function schemaScopedUrl(url, schema) {
+  const sep = url.includes("?") ? "&" : "?";
+  return url + sep + "options=" + encodeURIComponent("-c search_path=" + schema);
+}
+
+// `pg` is imported dynamically so this file still LOADS (and skips) on a run
+// with no REZ_PG_TEST_URL; everything below is unreachable when SKIP is true.
+async function withAdminPg(url, fn) {
+  const pg = await import("pg");
+  const Pool = pg.default ? pg.default.Pool : pg.Pool;
+  const pool = new Pool({ connectionString: url });
+  try { return await fn(pool); } finally { await pool.end(); }
+}
+
+// The ONE pg-backed account home every leaf in this test connects to. A pg
+// backend is what wires the account-mutation serializer and authority resolver,
+// which is what makes delegated devices possible at all — see the header.
+async function startPgHome({ tmp, entryRelayKeyId, entryRelayPort }) {
+  const dataDir = path.join(tmp, "home-node");
   await fs.mkdir(dataDir, { recursive: true });
   const wsPort = await getFreePort();
   const wsPath = "/ws";
   const nodeApp = await startRezNode({
     node: {
       ws: { host: "127.0.0.1", port: wsPort, path: wsPath },
-      storage: { dataDir },
+      storage: {
+        dataDir,
+        backend: "pg",
+        encryptionKeyB64: bytesToBase64(CRYPTO.randomBytes(32)),
+        pg: { connectionString: schemaScopedUrl(PG_URL, SCHEMA), migrateOnBoot: true },
+      },
       network: { participateInRouting: true, knownRelays: [knownRelay(entryRelayKeyId, entryRelayPort)] },
       mesh: { enabled: true, mode: "seed-only", seeds: [], minPeers: 1, maxPeers: 5 },
       relay: { listenHost: "127.0.0.1", listenPort: 0 },
     },
   });
   return { nodeApp, dataDir, wsUrl: "ws://127.0.0.1:" + wsPort + wsPath };
+}
+
+// Per-leaf node-local state directory. Leaves SHARE the home (one wsUrl) but
+// each keeps its own local dir — the hosted-cluster shape.
+async function leafDir(tmp, label) {
+  const dir = path.join(tmp, label);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
 }
 
 async function bootChatLeaf({ dataDir, wsUrl, expectedChatServerIdentity, deviceKey }) {
@@ -181,11 +228,17 @@ function makeSafeStorage() {
   };
 }
 
-test("live local mesh: the full PSK device-link ceremony provisions a delegated device that then messages a third peer", { skip: !RUN, timeout: 180_000 }, async () => {
+test("live local mesh: the full PSK device-link ceremony provisions a delegated device that then messages a third peer", { skip: SKIP ? "set RUN_LOCAL_MESH_E2E=1 and REZ_PG_TEST_URL to run" : false, timeout: 180_000 }, async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rez-local-mesh-devlink-"));
   const rPort = await getFreePort();
   const started = [];
   let vault = null;
+
+  await withAdminPg(PG_URL, async (pool) => {
+    await pool.query("DROP SCHEMA IF EXISTS " + SCHEMA + " CASCADE");
+    await pool.query("CREATE SCHEMA " + SCHEMA);
+  });
+
   try {
     const relayApp = await startRezNode(relayOnlyConfig({
       dataDir: path.join(tmp, "relay"), listenPort: rPort, knownRelays: [],
@@ -193,29 +246,33 @@ test("live local mesh: the full PSK device-link ceremony provisions a delegated 
     started.push(relayApp);
     const relayKeyId = relayApp.runtime.getIdentity().relayKeyId;
 
+    // The ONE pg home. Every leaf below connects to it; carol keeps her own
+    // account on the same node (the hosted base case: many accounts, one home).
+    const home = await startPgHome({ tmp, entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
+    started.push({ nodeApp: home.nodeApp });
+
     // PRIMARY leaf (seedful account with B).
     const primaryId = await makePrimaryIdentity();
-    const primaryNode = await startNode({ tmp, label: "primary", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     const primary = await bootChatLeaf({
-      dataDir: primaryNode.dataDir, wsUrl: primaryNode.wsUrl,
+      dataDir: await leafDir(tmp, "primary"), wsUrl: home.wsUrl,
       expectedChatServerIdentity: primaryId.chatServerIdentity, deviceKey: primaryId.deviceKey,
     });
-    const primaryLeaf = { chat: primary.chatServer, nodeApp: primaryNode.nodeApp, accountId: primary.ownerAccountId };
+    const primaryLeaf = { chat: primary.chatServer, accountId: primary.ownerAccountId };
     started.push(primaryLeaf);
 
     // CAROL leaf (plain primary — the third peer the provisioned device talks to).
     const carolId = await makePrimaryIdentity();
-    const carolNode = await startNode({ tmp, label: "carol", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     const carol = await bootChatLeaf({
-      dataDir: carolNode.dataDir, wsUrl: carolNode.wsUrl,
+      dataDir: await leafDir(tmp, "carol"), wsUrl: home.wsUrl,
       expectedChatServerIdentity: carolId.chatServerIdentity, deviceKey: carolId.deviceKey,
     });
-    const carolLeaf = { chat: carol.chatServer, nodeApp: carolNode.nodeApp, accountId: carol.ownerAccountId };
+    const carolLeaf = { chat: carol.chatServer, accountId: carol.ownerAccountId };
     started.push(carolLeaf);
 
-    // NEW-DEVICE node (no chat server yet — the ceremony provisions it).
-    const newdevNode = await startNode({ tmp, label: "newdev", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
-    started.push({ nodeApp: newdevNode.nodeApp });
+    // NEW-DEVICE local dir (no chat server yet — the ceremony provisions it).
+    // It joins the SAME home: a second device of one account is precisely what a
+    // hosted home exists to carry.
+    const newdevDir = await leafDir(tmp, "newdev");
 
     await sleep(4_000); // mesh form
 
@@ -231,7 +288,7 @@ test("live local mesh: the full PSK device-link ceremony provisions a delegated 
     // The NEW device runs the real requester against its OWN node.
     const requesterPromise = runDeviceLinkRequester({
       linkCode: started2.linkCode,
-      wsUrl: newdevNode.wsUrl,
+      wsUrl: home.wsUrl,
       timeoutMs: 60_000,
       logger: silentLogger,
       persistDelegation: async () => null,
@@ -269,7 +326,7 @@ test("live local mesh: the full PSK device-link ceremony provisions a delegated 
 
     // --- Boot the DELEGATED leaf from the vault + prove it WORKS ---
     const delegated = await bootChatLeaf({
-      dataDir: newdevNode.dataDir, wsUrl: newdevNode.wsUrl,
+      dataDir: newdevDir, wsUrl: home.wsUrl,
       expectedChatServerIdentity: delegatedIdentity, deviceKey: delegatedDeviceKey,
     });
     const delegatedLeaf = { chat: delegated.chatServer, accountId: delegated.ownerAccountId, bootstrapped: delegated };
@@ -309,6 +366,13 @@ test("live local mesh: the full PSK device-link ceremony provisions a delegated 
       else if (app && typeof app.stop === "function") await app.stop().catch(() => {});
       else if (app && app.nodeApp) await stopLeaf(app);
     }
-    await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
+    await withAdminPg(PG_URL, async (pool) => {
+      await pool.query("DROP SCHEMA IF EXISTS " + SCHEMA + " CASCADE");
+    }).catch((err) => {
+      console.error("[device-link e2e] schema teardown failed", err && err.message ? err.message : err);
+    });
+    await fs.rm(tmp, { recursive: true, force: true }).catch((err) => {
+      console.error("[device-link e2e] tmp cleanup failed", err && err.message ? err.message : err);
+    });
   }
 });

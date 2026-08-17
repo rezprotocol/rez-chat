@@ -18,9 +18,9 @@ import { bootstrapChatServer } from "../src/server/index.js";
 /**
  * LIVE local-mesh DELEGATED-DEVICE e2e — the S2.5 S9 gate, fully un-mocked.
  *
- *   aliceChat (PRIMARY)   → aliceNode ─┐
- *                                      ├─ relayR
- *   bobChat   (DELEGATED) → bobNode  ──┘
+ *   aliceChat (PRIMARY)   ─┐
+ *                          ├─ accountHome (rez-node, backend=pg) ── relayR
+ *   bobChat   (DELEGATED) ─┘
  *
  * Bob's stack is a SEEDLESS delegated device: his identity is the account
  * PUBLIC key + a B→C capability chain + the account X25519 DH key — the
@@ -34,10 +34,23 @@ import { bootstrapChatServer } from "../src/server/index.js";
  *     overlay — Alice (a plain primary) accepts it by code
  *   - X3DH completes both ways; messages flow Bob→Alice and Alice→Bob
  *
- * Gated behind RUN_LOCAL_MESH_E2E=1 (binds real loopback ports).
+ * WHY ONE SHARED PG HOME (rez-chat#3). Bob is a DELEGATED device, and a
+ * delegated session is admitted only by a home that wires an authority
+ * resolver — which an fs/desktop node does not. GatewaySession fails such a
+ * session closed on purpose ("absent => FAIL CLOSED (fs/desktop wire no
+ * resolver and are single-device)"), so the old per-leaf fs topology could
+ * never have authenticated Bob at all; the test died at chat-server start,
+ * before reaching anything it meant to prove. Both leaves now share one
+ * pg-backed home, the only topology where delegated devices exist.
+ *
+ * Gated behind RUN_LOCAL_MESH_E2E=1 AND REZ_PG_TEST_URL (binds real loopback
+ * ports + a real Postgres home).
  */
 
 const RUN = process.env.RUN_LOCAL_MESH_E2E === "1";
+const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const SKIP = !(RUN && PG_URL);
+const SCHEMA = "test_s9_delegated_invite";
 const CHAT_TIMEOUT_MS = 30_000;
 const CRYPTO = new NodeCryptoProvider();
 
@@ -131,21 +144,51 @@ function makeDelegatedIdentity() {
   };
 }
 
-async function startChatLeaf({ tmp, label, entryRelayKeyId, entryRelayPort, expectedChatServerIdentity = null, deviceKey = null }) {
-  const dataDir = path.join(tmp, label);
+// The pg home connection string, pinned to an isolated schema via libpq options
+// so this test's DDL/DML never collides with other pg test files.
+function schemaScopedUrl(url, schema) {
+  const sep = url.includes("?") ? "&" : "?";
+  return url + sep + "options=" + encodeURIComponent("-c search_path=" + schema);
+}
+
+// `pg` is imported dynamically so this file still LOADS (and skips) on a run
+// with no REZ_PG_TEST_URL; everything below is unreachable when SKIP is true.
+async function withAdminPg(url, fn) {
+  const pg = await import("pg");
+  const Pool = pg.default ? pg.default.Pool : pg.Pool;
+  const pool = new Pool({ connectionString: url });
+  try { return await fn(pool); } finally { await pool.end(); }
+}
+
+// The ONE pg-backed home both leaves connect to. Its authority resolver is what
+// admits Bob's DELEGATED session; see the header.
+async function startPgHome({ tmp, entryRelayKeyId, entryRelayPort }) {
+  const dataDir = path.join(tmp, "home-node");
   await fs.mkdir(dataDir, { recursive: true });
   const wsPort = await getFreePort();
   const wsPath = "/ws";
   const nodeApp = await startRezNode({
     node: {
       ws: { host: "127.0.0.1", port: wsPort, path: wsPath },
-      storage: { dataDir },
+      storage: {
+        dataDir,
+        backend: "pg",
+        encryptionKeyB64: bytesToBase64(CRYPTO.randomBytes(32)),
+        pg: { connectionString: schemaScopedUrl(PG_URL, SCHEMA), migrateOnBoot: true },
+      },
       network: { participateInRouting: true, knownRelays: [knownRelay(entryRelayKeyId, entryRelayPort)] },
       mesh: { enabled: true, mode: "seed-only", seeds: [], minPeers: 1, maxPeers: 5 },
       relay: { listenHost: "127.0.0.1", listenPort: 0 },
     },
   });
-  const wsUrl = "ws://127.0.0.1:" + wsPort + wsPath;
+  return { nodeApp, wsUrl: "ws://127.0.0.1:" + wsPort + wsPath };
+}
+
+// A chat leaf on the SHARED home. Each leaf keeps its own node-local dir; only
+// the home is shared (the hosted-cluster shape).
+async function startChatLeaf({ tmp, label, wsUrl, expectedChatServerIdentity = null, deviceKey = null }) {
+  const dataDir = path.join(tmp, label);
+  await fs.mkdir(dataDir, { recursive: true });
   const bootstrapped = await bootstrapChatServer({
     nodeDataDir: dataDir,
     wsUrl,
@@ -154,7 +197,7 @@ async function startChatLeaf({ tmp, label, entryRelayKeyId, entryRelayPort, expe
     deviceKey,
   });
   await bootstrapped.chatServer.start();
-  return { label, nodeApp, chat: bootstrapped.chatServer, accountId: bootstrapped.ownerAccountId, bootstrapped };
+  return { label, chat: bootstrapped.chatServer, accountId: bootstrapped.ownerAccountId, bootstrapped };
 }
 
 async function stopLeaf(app) {
@@ -221,10 +264,16 @@ async function waitForMessageText(chat, threadId, text, label) {
   return msg;
 }
 
-test("live local mesh: a DELEGATED device invites a primary peer — V2 record resolves, X3DH completes, messages flow", { skip: !RUN, timeout: 120_000 }, async () => {
+test("live local mesh: a DELEGATED device invites a primary peer — V2 record resolves, X3DH completes, messages flow", { skip: SKIP ? "set RUN_LOCAL_MESH_E2E=1 and REZ_PG_TEST_URL to run" : false, timeout: 120_000 }, async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rez-local-mesh-delegated-"));
   const rPort = await getFreePort();
   const started = [];
+
+  await withAdminPg(PG_URL, async (pool) => {
+    await pool.query("DROP SCHEMA IF EXISTS " + SCHEMA + " CASCADE");
+    await pool.query("CREATE SCHEMA " + SCHEMA);
+  });
+
   try {
     const relayApp = await startRezNode(relayOnlyConfig({
       dataDir: path.join(tmp, "relay"), listenPort: rPort,
@@ -233,16 +282,20 @@ test("live local mesh: a DELEGATED device invites a primary peer — V2 record r
     started.push(relayApp);
     const relayKeyId = relayApp.runtime.getIdentity().relayKeyId;
 
+    // The ONE pg home. Alice keeps her own account on it alongside Bob's — the
+    // hosted base case (many accounts, one home).
+    const home = await startPgHome({ tmp, entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
+    started.push({ nodeApp: home.nodeApp });
+
     // Alice: an unchanged PRIMARY leaf. Bob: the DELEGATED leaf — his account
     // private key was zeroed inside makeDelegatedIdentity BEFORE this boot.
-    const alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
+    const alice = await startChatLeaf({ tmp, label: "alice", wsUrl: home.wsUrl });
     started.push(alice);
     const bobDelegation = makeDelegatedIdentity();
     const bob = await startChatLeaf({
       tmp,
       label: "bob",
-      entryRelayKeyId: relayKeyId,
-      entryRelayPort: rPort,
+      wsUrl: home.wsUrl,
       expectedChatServerIdentity: bobDelegation.chatServerIdentity,
       deviceKey: bobDelegation.deviceKey,
     });
@@ -317,7 +370,15 @@ test("live local mesh: a DELEGATED device invites a primary peer — V2 record r
     for (const app of started.reverse()) {
       if (app && app.chat) await stopLeaf(app);
       else if (app && typeof app.stop === "function") await app.stop().catch(() => {});
+      else if (app && app.nodeApp) await stopLeaf(app);
     }
-    await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
+    await withAdminPg(PG_URL, async (pool) => {
+      await pool.query("DROP SCHEMA IF EXISTS " + SCHEMA + " CASCADE");
+    }).catch((err) => {
+      console.error("[delegated-invite e2e] schema teardown failed", err && err.message ? err.message : err);
+    });
+    await fs.rm(tmp, { recursive: true, force: true }).catch((err) => {
+      console.error("[delegated-invite e2e] tmp cleanup failed", err && err.message ? err.message : err);
+    });
   }
 });
