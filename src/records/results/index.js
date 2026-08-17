@@ -18,6 +18,7 @@ export { ContactsBlockResult } from "./ContactsBlockResult.js";
 export { ContactsUnblockResult } from "./ContactsUnblockResult.js";
 export { ContactsDeleteResult } from "./ContactsDeleteResult.js";
 export { InviteCreateResult } from "./InviteCreateResult.js";
+export { DiagnosticsSnapshotResult } from "./DiagnosticsSnapshotResult.js";
 export { InviteAcceptResult } from "./InviteAcceptResult.js";
 export { PeerLinksListResult } from "./PeerLinksListResult.js";
 export { PeerLinkGetResult } from "./PeerLinkGetResult.js";

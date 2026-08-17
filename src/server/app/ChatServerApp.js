@@ -19,6 +19,7 @@ import { ServerContactsService } from "../services/ServerContactsService.js";
 import { ServerGroupsService } from "../services/ServerGroupsService.js";
 import { ServerChannelsService } from "../services/ServerChannelsService.js";
 import { ServerInvitesService } from "../services/ServerInvitesService.js";
+import { ServerDiagnosticsService } from "../services/ServerDiagnosticsService.js";
 import { ServerConnectionService } from "../services/ServerConnectionService.js";
 import { ServerEventService } from "../services/ServerEventService.js";
 import { ServerPeerLinkProtocolService } from "../services/ServerPeerLinkProtocolService.js";
@@ -39,6 +40,7 @@ export class ChatServerApp {
   #ownerAccountId;
   #storageProvider;
   #bridge;
+  #appVersion;
 
   constructor({
     identity,
@@ -55,6 +57,7 @@ export class ChatServerApp {
     wsFactory = null,
     linksServiceFactory = null,
     deviceLinkServiceFactory = null,
+    appVersion = "",
     logger = console,
   } = {}) {
     if (!Array.isArray(uplinks) || uplinks.length === 0) {
@@ -70,6 +73,7 @@ export class ChatServerApp {
     this.#clock = clock;
     this.#ownerAccountId = ownerAccountId.trim();
     this.#storageProvider = storageProvider;
+    this.#appVersion = typeof appVersion === "string" ? appVersion : "";
     this.bus = new ChatServerBus({
       config: { identity, uplinks, ownerAccountId: this.#ownerAccountId },
       logger,
@@ -308,6 +312,15 @@ export class ChatServerApp {
       }),
       invites: new ServerInvitesService({
         bus: this.bus,
+        logger,
+      }),
+      // Redacted, local-only diagnostic snapshots for bug reports (rez-chat#7).
+      // Builds an object; never transmits. See docs/DIAGNOSTICS.md.
+      diagnostics: new ServerDiagnosticsService({
+        bus: this.bus,
+        ownerAccountId: this.#ownerAccountId,
+        appVersion: this.#appVersion,
+        clock,
         logger,
       }),
       connection: new ServerConnectionService({

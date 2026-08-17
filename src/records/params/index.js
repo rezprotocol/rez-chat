@@ -23,6 +23,7 @@ export { PeerLinksListParams } from "./PeerLinksListParams.js";
 export { PeerLinkGetParams } from "./PeerLinkGetParams.js";
 export { NodeStatusParams } from "./NodeStatusParams.js";
 export { MeshStatusParams } from "./MeshStatusParams.js";
+export { DiagnosticsSnapshotParams } from "./DiagnosticsSnapshotParams.js";
 export { KeystorePutParams } from "./KeystorePutParams.js";
 export { KeystoreFetchParams } from "./KeystoreFetchParams.js";
 export { GroupCreateParams } from "./GroupCreateParams.js";

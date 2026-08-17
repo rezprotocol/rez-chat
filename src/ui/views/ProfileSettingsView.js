@@ -168,6 +168,55 @@ export class ProfileSettingsView extends BusComponent {
       }).open();
     });
 
+    // ---- Report a problem (rez-chat#7) ----
+    // LOCAL ONLY. This copies a redacted bundle to the clipboard and opens the
+    // issue tracker; nothing is transmitted by the app itself, and the user can
+    // read what they are about to paste. See docs/DIAGNOSTICS.md.
+    const reportStatus = h("p", { className: "text-label-micro font-label-technical text-on-surface-variant/60" }, "");
+    const reportBtn = h("button", { type: "button", className: securityBtnClass, "data-testid": "profile.reportProblem" }, "Report a problem");
+    reportBtn.addEventListener("click", async () => {
+      reportStatus.textContent = "Collecting diagnostics…";
+      let snapshot = null;
+      try {
+        snapshot = await this.bus.call("diagnostics", "snapshot", {});
+      } catch (err) {
+        console.error("[ProfileSettingsView] diagnostics snapshot failed", err);
+        this.bus.emit("app.error", { source: "ProfileSettingsView", message: "diagnostics snapshot failed", severity: "warn", err });
+        reportStatus.textContent = "Could not collect diagnostics. You can still open an issue without them.";
+        return;
+      }
+      const text = JSON.stringify(
+        snapshot && typeof snapshot.toJSON === "function" ? snapshot.toJSON() : snapshot,
+        null,
+        2,
+      );
+      let copied = false;
+      if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        try {
+          await navigator.clipboard.writeText(text);
+          copied = true;
+        } catch (err) {
+          // Not fatal: the user can still file the report, just without the
+          // paste. Report it rather than pretending the copy worked.
+          console.error("[ProfileSettingsView] clipboard write failed", err);
+          this.bus.emit("app.error", { source: "ProfileSettingsView", message: "clipboard write failed", severity: "warn", err });
+        }
+      }
+      reportStatus.textContent = copied
+        ? "Redacted diagnostics copied. Paste them into the issue — read them first if you like; they contain no messages, keys or full account ids."
+        : "Could not copy to the clipboard. Describe the problem in the issue and we will follow up.";
+      const url = "https://github.com/rezprotocol/rez-chat/issues/new";
+      if (typeof window !== "undefined" && typeof window.open === "function") {
+        window.open(url, "_blank", "noopener,noreferrer");
+      }
+    });
+
+    const reportSection = h("section", { className: "flex flex-col gap-space-sm mt-space-md pt-space-md border-t border-outline-variant/30" }, [
+      h("label", { className: "text-label-micro font-label-technical text-outline uppercase tracking-wider" }, "Feedback"),
+      reportBtn,
+      reportStatus,
+    ]);
+
     const securitySection = h("section", { className: "flex flex-col gap-space-sm mt-space-md pt-space-md border-t border-outline-variant/30" }, [
       h("label", { className: "text-label-micro font-label-technical text-outline uppercase tracking-wider" }, "Security"),
       changePasswordBtn,
@@ -196,6 +245,7 @@ export class ProfileSettingsView extends BusComponent {
       statusEl,
       h("div", { className: "flex gap-space-md mt-space-sm" }, [saveBtn, backBtn]),
       securitySection,
+      reportSection,
     ]);
 
     this._rootEl.replaceChildren(content);
