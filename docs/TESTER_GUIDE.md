@@ -36,10 +36,13 @@ So:
 Grab the newest release from the
 [Releases page](https://github.com/rezprotocol/rez-chat/releases).
 
-> **Check the version — this one matters.** The release marked **Latest** is
-> still `v0.5.2` from June, which cannot connect at all since the relay reset.
-> Take the newest **pre-release** (`v0.6.0-rc.6` or later), *not* the one
-> labelled Latest.
+The release marked **Latest** is `v0.6.0-rc.6` or newer, and that is the one you
+want — no hunting through pre-releases.
+
+> **If you already have Rez Chat installed, check its version.** Anything older
+> than `v0.6.0-rc.6` cannot connect since the relay reset. `v0.5.2` in
+> particular is far enough back that auto-update cannot carry it — reinstall
+> from the link above instead.
 
 | Platform | Download | Notes |
 |---|---|---|
