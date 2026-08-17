@@ -16,14 +16,14 @@ Rez relays moved to self-certifying identities — a relay's ID is now a hash of
 its own key, rather than something configured by whoever runs it. This removes
 an operator's ability to claim an identity they don't hold the key for.
 
-**What this means for you: any build older than `v0.6.0-rc.5` can no longer
+**What this means for you: any build older than `v0.6.0-rc.6` can no longer
 connect.** Not "degrades", not "reconnects slowly" — it fails to authenticate
 against every relay and stays offline. That includes `v0.5.2`, which is still
 the release marked *Latest* on the Releases page.
 
 So:
 
-- **You need `v0.6.0-rc.5` or newer.** Nothing earlier can reach the network.
+- **You need `v0.6.0-rc.6` or newer.** Nothing earlier can reach the network.
 - If the app cannot connect and reinstalling the same version doesn't help,
   you are on a pre-cutover build. Get the current release.
 - Auto-update carries anyone already on a `v0.6.0-rc.*` Tauri build. It does
@@ -38,7 +38,7 @@ Grab the newest release from the
 
 > **Check the version — this one matters.** The release marked **Latest** is
 > still `v0.5.2` from June, which cannot connect at all since the relay reset.
-> Take the newest **pre-release** (`v0.6.0-rc.5` or later), *not* the one
+> Take the newest **pre-release** (`v0.6.0-rc.6` or later), *not* the one
 > labelled Latest.
 
 | Platform | Download | Notes |
