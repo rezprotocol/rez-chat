@@ -18,8 +18,9 @@ an operator's ability to claim an identity they don't hold the key for.
 
 **What this means for you: any build older than `v0.6.0-rc.6` can no longer
 connect.** Not "degrades", not "reconnects slowly" — it fails to authenticate
-against every relay and stays offline. That includes `v0.5.2`, which is still
-the release marked *Latest* on the Releases page.
+against every relay and stays offline. That includes `v0.5.2`, which was the
+release marked *Latest* for most of the summer, so it is what you have if you
+installed once and never touched it since.
 
 So:
 
@@ -31,18 +32,48 @@ So:
 
 ---
 
+## Also worth reading: `v0.6.0-rc.7` is a security update
+
+**This one is not a forced upgrade.** Unlike the relay reset above, `rc.6` still
+connects and still works. Take the update anyway — auto-update will offer it, and
+there is nothing to do by hand.
+
+Two of the fixes are in the app on your machine rather than on our servers, which
+is why a new build exists at all:
+
+- **A contact could plant values your client would later read back.** Profile
+  updates deliberately preserve unknown fields, so the app keeps working when a
+  peer runs a newer build. A specially-crafted profile could abuse that: parts
+  of the app reading a profile field would get whatever the sender chose, rather
+  than nothing. It had to come from someone you were already connected with, not
+  a stranger. Found by an internal audit, not by catching it happening — we did
+  not go looking through logs for attempts. Rejected outright now.
+- **Messages arriving from the network are checked before they are unpacked.**
+  Same class of problem, at the point where bytes off the wire become data. Both
+  ends of that connection were fixed: your app, and the relays.
+
+The relays and the hosted node were updated on 2026-08-17 and need nothing from
+you. Full technical detail, including what was *not* affected, is in
+`rez-core/docs/SECURITY_FINDINGS_CONSOLIDATED.md`.
+
+If you find something in this class, please report it privately — see
+[Reporting problems](#reporting-problems) below.
+
+---
+
 ## Install
 
 Grab the newest release from the
 [Releases page](https://github.com/rezprotocol/rez-chat/releases).
 
-The release marked **Latest** is `v0.6.0-rc.6` or newer, and that is the one you
-want — no hunting through pre-releases.
+The release marked **Latest** is `v0.6.0-rc.7`, and that is the one you want — no
+hunting through pre-releases.
 
 > **If you already have Rez Chat installed, check its version.** Anything older
 > than `v0.6.0-rc.6` cannot connect since the relay reset. `v0.5.2` in
 > particular is far enough back that auto-update cannot carry it — reinstall
-> from the link above instead.
+> from the link above instead. If you are on any `v0.6.0-rc.*`, auto-update will
+> bring you to `rc.7` on its own.
 
 | Platform | Download | Notes |
 |---|---|---|
