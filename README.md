@@ -32,6 +32,8 @@ Published installers are available on the [Releases page](https://github.com/rez
 
 The desktop app is wired for in-place auto-update (silent download, restart-to-install banner) — once you've installed a release build, you won't need to manually upgrade for subsequent versions.
 
+**Testing the alpha?** Read the [Tester Guide](./docs/TESTER_GUIDE.md) first — per-platform install notes (the Windows installer is not code-signed yet), what works and what doesn't, how to report problems, and the one-time relay identity cutover that will break pre-cutover clients.
+
 ---
 
 ## Building from source
