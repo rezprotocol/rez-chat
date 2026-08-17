@@ -14,6 +14,7 @@ import {
   ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
 } from "@rezprotocol/core";
 import { bootstrapChatServer } from "../src/server/index.js";
+import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**
  * LIVE local-mesh DELEGATED-DEVICE e2e — the S2.5 S9 gate, fully un-mocked.
@@ -314,7 +315,7 @@ test("live local mesh: a DELEGATED device invites a primary peer — V2 record r
       "the device key C claims Bob's inbox",
     );
 
-    await sleep(4_000);
+    await sleep(MESH_FORM_WAIT_MS);
 
     // --- BOB (delegated) creates the invite ---
     const invite = await bob.chat.bus.call("invite", "create", {

@@ -14,6 +14,7 @@ import {
 import { SeedKeys } from "@rezprotocol/sdk/crypto/seedDerivation";
 import { Bip39 } from "@rezprotocol/sdk/crypto/bip39";
 import { bootstrapChatServer } from "../src/server/index.js";
+import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**
  * LIVE local-mesh + REAL Postgres MULTI-DEVICE FAN-OUT e2e — the S2.5 S13 headline
@@ -292,7 +293,7 @@ test(
       const carolId = await makeAccountIdentity();
       const carolDevKey = makeDeviceKey();
 
-      await sleep(4_000); // mesh form (relay uplink + WS auth)
+      await sleep(MESH_FORM_WAIT_MS); // mesh form (relay uplink + WS auth)
 
       // --- Bring alice-dev1 online: claims inbox, binds, publishes its bundle. ---
       const dev1 = await bootChatLeaf({

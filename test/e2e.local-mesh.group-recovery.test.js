@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { startRezNode } from "@rezprotocol/node";
 import { bootstrapChatServer } from "../src/server/index.js";
+import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**
  * LIVE local-mesh GROUP RECOVERY e2e — fully un-mocked, loopback only.
@@ -190,7 +191,7 @@ test("live local mesh: a desynced GROUP link self-heals via sender-side recovery
     const carol = await startChatLeaf({ tmp, label: "carol", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     started.push(carol);
 
-    await sleep(4_000);
+    await sleep(MESH_FORM_WAIT_MS);
 
     const nonce = String(Date.now());
     const groupTitle = "Recover3 " + nonce;

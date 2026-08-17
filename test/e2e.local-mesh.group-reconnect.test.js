@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { startRezNode } from "@rezprotocol/node";
 import { bootstrapChatServer } from "../src/server/index.js";
+import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**
  * LIVE local-mesh GROUP RECONNECT e2e — fully un-mocked, loopback only.
@@ -177,7 +178,7 @@ test("live local mesh group RECONNECT: after Alice restarts, Bob's group message
     alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
 
-    await sleep(4_000);
+    await sleep(MESH_FORM_WAIT_MS);
 
     // --- Alice creates a group + a GROUP invite; Bob accepts (both online) ---
     const nonce = String(Date.now());
@@ -207,7 +208,7 @@ test("live local mesh group RECONNECT: after Alice restarts, Bob's group message
     // reload / WS blip). Her node — the host of her own inbox — stays up. ---
     // Her group thread id is persisted, so it survives the reconnect unchanged.
     alice = await restartChatOnly(alice);
-    await sleep(4_000);
+    await sleep(MESH_FORM_WAIT_MS);
 
     // Peer-link should still be established after the chat-server reconnect.
     await waitForPeerLinkReady(alice.chat, bob.accountId, "Alice peer-link to Bob ready (post-reconnect)");

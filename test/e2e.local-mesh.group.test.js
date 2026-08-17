@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { startRezNode } from "@rezprotocol/node";
 import { bootstrapChatServer } from "../src/server/index.js";
+import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**
  * LIVE local-mesh GROUP e2e — fully un-mocked, loopback only.
@@ -164,7 +165,7 @@ test("live local mesh group: create + invite + member.join roster sync + bidirec
     const bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
     started.push(bob);
 
-    await sleep(4_000);
+    await sleep(MESH_FORM_WAIT_MS);
 
     // --- Alice creates a group + a GROUP invite; Bob accepts ---
     const nonce = String(Date.now());

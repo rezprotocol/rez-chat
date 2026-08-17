@@ -16,6 +16,7 @@ import { Bip39 } from "@rezprotocol/sdk/crypto/bip39";
 import { bootstrapChatServer } from "../src/server/index.js";
 import { DesktopVaultService } from "../electron/runtime/DesktopVaultService.mjs";
 import { runDeviceLinkRequester } from "../src/desktop/runtime/DesktopDeviceLinkRunner.js";
+import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**
  * LIVE local-mesh DEVICE-LINK CEREMONY e2e — the S2.5 S10 gate, fully un-mocked.
@@ -274,7 +275,7 @@ test("live local mesh: the full PSK device-link ceremony provisions a delegated 
     // hosted home exists to carry.
     const newdevDir = await leafDir(tmp, "newdev");
 
-    await sleep(4_000); // mesh form
+    await sleep(MESH_FORM_WAIT_MS); // mesh form
 
     // --- The ceremony ---
     const pendingEvents = [];
