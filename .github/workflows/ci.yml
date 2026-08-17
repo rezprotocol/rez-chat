@@ -79,6 +79,7 @@ jobs:
       # GatewayLoop's route lookup misses. Remove once the cause is found.
       REZ_ROUTE_DEBUG: "1"
       REZ_GW_DEBUG: "1"
+      REZ_INBOX_DEBUG: "1"
     steps:
       - uses: actions/checkout@v4
         with:
