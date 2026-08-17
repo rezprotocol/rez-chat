@@ -112,6 +112,24 @@ sudo dpkg -i Rez.Chat_<version>_amd64.deb
   "Link a new device" button is hidden unless your account lives on a hosted
   (Postgres-backed) home, because there it genuinely cannot work. This is a
   deliberate design boundary, not a missing feature we forgot.
+
+  **The alpha ships single-device.** Not by a switch we left off — by what a
+  desktop install *is*. Your account lives on your machine; there is no second
+  place for a second device to attach to. Message fan-out to multiple devices is
+  built and tested, but it needs a Postgres-backed home, so no tester will
+  exercise it on a normal install.
+
+  Two consequences worth planning around:
+
+  - **One account, one machine.** Installing on a laptop and a desktop gives you
+    two unrelated accounts, not one account in two places. They will not share
+    history, contacts, or groups.
+  - **No "sign in on my other computer".** With no account recovery either (see
+    below), the machine holding your account is the account.
+
+  If you try to link a device against a home that cannot support it, the app now
+  says so plainly. It used to fail with a connection error, which sent people off
+  to debug their network for a problem that was never theirs.
 - **No account recovery.** Lose the device or the vault password and the account
   is gone. There is no reset, and no one can restore it for you. Do not put
   anything irreplaceable in here.
