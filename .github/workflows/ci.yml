@@ -73,12 +73,11 @@ jobs:
           --health-timeout 5s --health-retries 10
     env:
       REZ_PG_TEST_URL: postgres://postgres:postgres@127.0.0.1:5433/postgres
-      # A hosted 4-core runner forms the mesh far slower than a dev box. The
-      # tests' 4s default expires before route propagation finishes, the first
-      # cross-node deposit fails with "no route to target", and nothing retries
-      # it — so the test then times out waiting for a message never re-sent.
-      # See test/support/meshFormWait.js.
-      REZ_MESH_FORM_WAIT_MS: "20000"
+      # DIAGNOSTIC (rez-chat#6): cross-node route resolution fails on this
+      # runner and never recovers — a re-registration 30s later still cannot
+      # resolve, so it is NOT slow propagation. This prints which branch of
+      # GatewayLoop's route lookup misses. Remove once the cause is found.
+      REZ_ROUTE_DEBUG: "1"
     steps:
       - uses: actions/checkout@v4
         with:
