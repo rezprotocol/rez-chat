@@ -16,6 +16,7 @@ export class ProfileSettingsView extends BusComponent {
   #statusEl;
   #avatarDataB64;
   #avatarChanged;
+  #linkDeviceBtnEl;
 
   constructor({ bus } = {}) {
     super({ bus });
@@ -26,6 +27,7 @@ export class ProfileSettingsView extends BusComponent {
     this.#statusEl = null;
     this.#avatarDataB64 = null;
     this.#avatarChanged = false;
+    this.#linkDeviceBtnEl = null;
   }
 
   mount(parentEl) {
@@ -140,6 +142,8 @@ export class ProfileSettingsView extends BusComponent {
     linkDeviceBtn.addEventListener("click", () => {
       new DeviceLinkModal({ bus: this.bus }).open();
     });
+    this.#linkDeviceBtnEl = linkDeviceBtn;
+    this.#applyDeviceLinkingAvailability();
 
     const deleteAccountBtn = h("button", { type: "button", className: dangerBtnClass }, "Delete account");
     deleteAccountBtn.addEventListener("click", () => {
@@ -223,7 +227,27 @@ export class ProfileSettingsView extends BusComponent {
     return this.bus.stores.session.selectedOrVaultAccountId() || "";
   }
 
+  // Only OFFER device linking where the home can actually perform it
+  // (rez-chat#3). Multi-device needs a pg home; on the default desktop node the
+  // ceremony can never complete, and it used to fail by hanging for 68 seconds.
+  // Hidden rather than disabled: on a desktop install this is permanent, not a
+  // transient state, and a control that can never become usable is clutter.
+  // The typed DEVICE_LINKING_UNSUPPORTED refusal in ServerDeviceLinkService
+  // remains the backstop for any path that reaches start() anyway.
+  #applyDeviceLinkingAvailability() {
+    if (!this.#linkDeviceBtnEl) return;
+    const sessionStore = this.bus && this.bus.stores ? this.bus.stores.session : null;
+    const available = sessionStore && typeof sessionStore.deviceLinkingAvailable === "function"
+      ? sessionStore.deviceLinkingAvailable()
+      : false;
+    this.#linkDeviceBtnEl.hidden = !available;
+  }
+
   #updateFromSession() {
+    // Toggle in place rather than re-rendering: this store also fires on
+    // connection churn, and a full re-render there is what caused the v0.4.1
+    // CPU spin.
+    this.#applyDeviceLinkingAvailability();
     if (!this.#nameInputEl) return;
     const label = this.#resolveSelfLabel();
     const initialsEl = this.#avatarPreviewEl && this.#avatarPreviewEl.querySelector("[data-role='avatar-initials']");

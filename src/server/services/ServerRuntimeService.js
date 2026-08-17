@@ -1,8 +1,8 @@
 import { createRezClient, REZ_CONTRACT_TYPES } from "@rezprotocol/sdk/client";
-import { ConnectionStateEvent } from "../../records/index.js";
+import { ConnectionStateEvent, NodeCapabilitiesEvent } from "../../records/index.js";
 import { BaseServerService } from "../base/BaseServerService.js";
 import { MailboxPushBridge } from "../runtime/MailboxPushBridge.js";
-import { nodeAdvertisesDurableInbox, nodeRequiresProvenDevice, nodeEnablesMultiDeviceFanout } from "../inbox/durableMode.js";
+import { nodeAdvertisesDurableInbox, nodeRequiresProvenDevice, nodeEnablesMultiDeviceFanout, nodeSupportsDeviceLinking } from "../inbox/durableMode.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -180,6 +180,21 @@ export class ServerRuntimeService extends BaseServerService {
         await this.#publishMultiDeviceSet();
       }
     }
+    // Publish what the HOME can do, so the UI can decline to OFFER operations it
+    // cannot perform (rez-chat#3). Read from the same bound session as the
+    // fan-out gate above, so the two can never disagree about which node
+    // answered.
+    //
+    // LAST, deliberately: everything above can throw (a replacement transport
+    // whose inbox claim cannot be rebound rejects here and the connection goes
+    // offline). Announcing earlier would advertise a capability for a session
+    // that never became usable, and the UI would keep offering device linking
+    // against a home it is not actually attached to. On that failure path
+    // nothing is emitted and SessionService clears the capability on
+    // runtime.disconnected.
+    this._emit("node.capabilities", new NodeCapabilitiesEvent({
+      deviceLinking: nodeSupportsDeviceLinking(this.#sdk),
+    }));
   }
 
   async #restoreAfterReconnect() {

@@ -190,3 +190,53 @@ test("SessionStore.labelForAccountId() looks up any row label", () => {
   assert.equal(s.labelForAccountId("hint_b"), "Beta");
   assert.equal(s.labelForAccountId("nope"), null);
 });
+
+// rez-chat#3: the home node's capability, distinct from the machine
+// capabilities the store already holds. The UI gates "Link a new device" on
+// this so it never offers an operation the home cannot perform — on the default
+// desktop (fs) home the ceremony can never complete, and it used to fail by
+// hanging for 68 seconds.
+
+test("deviceLinkingAvailable() starts false before any home has answered", () => {
+  const s = makeStore();
+  assert.equal(s.deviceLinkingAvailable(), false);
+});
+
+test("deviceLinkingAvailable() reflects a home that supports linking", () => {
+  const s = makeStore();
+  s.setNodeCapabilities({ deviceLinking: true });
+  assert.equal(s.deviceLinkingAvailable(), true);
+});
+
+test("only a STRICT true enables linking", () => {
+  // Truthy is not the contract. An older server sending a string, a 1, or
+  // omitting the field entirely must read as unsupported — wrongly offering the
+  // affordance is the bug being fixed, and wrongly hiding it is recoverable.
+  for (const value of ["true", 1, {}, [], "yes"]) {
+    const s = makeStore();
+    s.setNodeCapabilities({ deviceLinking: value });
+    assert.equal(s.deviceLinkingAvailable(), false, "truthy value " + JSON.stringify(value) + " must not enable linking");
+  }
+  const missing = makeStore();
+  missing.setNodeCapabilities({});
+  assert.equal(missing.deviceLinkingAvailable(), false);
+});
+
+test("losing the home clears the capability", () => {
+  // The window between disconnect and the next bind must not keep offering an
+  // operation that nothing is currently able to perform. A reconnect to a
+  // DIFFERENT home also has to re-answer the question rather than inherit.
+  const s = makeStore();
+  s.setNodeCapabilities({ deviceLinking: true });
+  assert.equal(s.deviceLinkingAvailable(), true);
+  s.setNodeCapabilities(null);
+  assert.equal(s.deviceLinkingAvailable(), false);
+});
+
+test("setNodeCapabilities notifies subscribers", () => {
+  const s = makeStore();
+  let fired = 0;
+  s.onChange(() => { fired += 1; });
+  s.setNodeCapabilities({ deviceLinking: true });
+  assert.ok(fired > 0, "the view re-reads the gate from a store notification");
+});

@@ -38,6 +38,18 @@ export class SessionService extends BaseBusService {
     this._register("session", "importBackup", (payload) => this.importBackup(payload));
     this._register("session", "restoreWithMnemonic", (payload) => this.restoreWithMnemonic(payload));
     this._register("session", "purgeAccount", (payload) => this.purgeAccount(payload));
+    // What the home node can do for this session. The server states it on every
+    // session bind, so a reconnect to a DIFFERENT home re-answers the question
+    // rather than leaving a stale capability from the previous one.
+    this._listen("runtime.event.node.capabilities", (record) => {
+      this._sessionStore.setNodeCapabilities(record);
+    });
+    // A dropped runtime means no home has answered yet. Clear back to
+    // unsupported so the window between disconnect and the next bind cannot
+    // keep offering an operation nothing is currently able to perform.
+    this._listen("runtime.disconnected", () => {
+      this._sessionStore.setNodeCapabilities(null);
+    });
   }
 
   async exportBackup({ password = "" } = {}) {

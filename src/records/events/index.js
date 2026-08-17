@@ -19,3 +19,4 @@ export { ChannelUpsertedEvent } from "./ChannelUpsertedEvent.js";
 export { ChannelRemovedEvent } from "./ChannelRemovedEvent.js";
 export { ConnectRequestUpdatedEvent } from "./ConnectRequestUpdatedEvent.js";
 export { DeviceLinkUpdatedEvent } from "./DeviceLinkUpdatedEvent.js";
+export { NodeCapabilitiesEvent } from "./NodeCapabilitiesEvent.js";

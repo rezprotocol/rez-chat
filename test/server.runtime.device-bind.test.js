@@ -150,7 +150,10 @@ test("replacement transport replays session-scoped claim and device binding befo
 
   assert.equal(fixture.calls.sendRequest.length, 2, "inbox claim replayed onto the replacement session");
   assert.equal(fixture.calls.bind.length, 2, "device binding replayed onto the replacement session");
-  assert.deepEqual(bus.events.map((entry) => entry.name), ["runtime.connected", "connection.state"]);
+  // node.capabilities is emitted LAST inside the rebind, so its presence here
+  // is itself the proof that the replacement session finished binding before
+  // anything was announced about what its home can do.
+  assert.deepEqual(bus.events.map((entry) => entry.name), ["node.capabilities", "runtime.connected", "connection.state"]);
   assert.equal(bus.events[1].payload.status, "connected");
 });
 

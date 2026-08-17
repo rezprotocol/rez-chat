@@ -29,6 +29,10 @@ export class SessionStore {
       // for the session — they don't change on lock/unlock transitions.
       deviceUnlockAvailable: false,
       environmentCapabilities: null,
+      // Home-node capability, set from the server's node.capabilities event.
+      // Starts false so the UI never offers device linking before the home has
+      // actually said it can do it.
+      deviceLinkingAvailable: false,
     };
     this._handlers = new Set();
   }
@@ -315,5 +319,24 @@ export class SessionStore {
     this._state.environmentCapabilities = caps;
     this._state.deviceUnlockAvailable = !!(caps && caps.keychainAvailable === true);
     this._emit("session.environmentChanged");
+  }
+
+  // What the HOME NODE can do for this session — distinct from the machine
+  // capabilities above. The same account can get different answers on two
+  // machines, because it depends on which home it connected to. Set from the
+  // server's node.capabilities event; see NodeCapabilitiesEvent.
+  setNodeCapabilities(capabilities) {
+    const caps = capabilities && typeof capabilities === "object" ? capabilities : null;
+    // Strictly true, never truthy: an absent field must read as unsupported so
+    // an older server that omits it cannot enable an affordance by accident.
+    this._state.deviceLinkingAvailable = !!(caps && caps.deviceLinking === true);
+    this._emit("session.nodeCapabilitiesChanged");
+  }
+
+  // Can this account link another device on its current home? False until the
+  // server says otherwise (rez-chat#3 — the affordance must be opt-in on proof,
+  // not opt-out on failure).
+  deviceLinkingAvailable() {
+    return this._state.deviceLinkingAvailable === true;
   }
 }

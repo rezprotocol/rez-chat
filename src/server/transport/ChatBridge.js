@@ -125,6 +125,7 @@ import {
   DeviceLinkApproveResult,
   DeviceLinkCancelResult,
   DeviceLinkUpdatedEvent,
+  NodeCapabilitiesEvent,
 } from "../../records/index.js";
 
 export const CHAT_BRIDGE_SPEC = {
@@ -207,6 +208,7 @@ export const CHAT_BRIDGE_SPEC = {
     "channel.removed": ChannelRemovedEvent,
     "connectRequest.updated": ConnectRequestUpdatedEvent,
     "deviceLink.updated": DeviceLinkUpdatedEvent,
+    "node.capabilities": NodeCapabilitiesEvent,
   },
 };
 
