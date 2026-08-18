@@ -61,6 +61,29 @@ If you find something in this class, please report it privately — see
 
 ---
 
+## One-time check if you used groups before `rc.6`
+
+Worth two minutes, and then you never have to think about it again.
+
+There was a bug where **being in a group with someone silently added them to your
+direct contacts** — no request, no approval, no notification. Any build from
+`v0.6.0-rc.6` on is clear of it, so no new ones appear. But the fix only stops new
+ones: it does not go back and remove the old ones, and the app deliberately never
+downgrades a contact on its own.
+
+So if you were in a group on `v0.5.2` or earlier — that was the version marked
+Latest from June until 17 August, so it is probably what you were running — **open
+your contact list and look for people you never actually connected with.** Delete
+any you did not intend to have. That is the whole fix; there is nothing else to do
+and nothing to reinstall.
+
+To be clear about what this was and was not: it exposed a *relationship* — that
+account showing up as a contact, and being able to DM you directly. It did not
+expose messages, keys, or anything a fellow group member could not already see.
+Everyone involved was someone you already shared a group with.
+
+---
+
 ## Install
 
 Grab the newest release from the
