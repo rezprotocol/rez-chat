@@ -6,12 +6,14 @@ import { AutoMintedInviteStore } from "../storage/AutoMintedInviteStore.js";
 import { GroupStore } from "../storage/ChatGroupStore.js";
 import { ChannelStore } from "../storage/ChatChannelStore.js";
 import { DeviceFanoutCacheStore } from "../storage/DeviceFanoutCacheStore.js";
+import { AccountDeviceRosterStore } from "../storage/AccountDeviceRosterStore.js";
 import { ChatServerBus } from "./ChatServerBus.js";
 import { ChatBridge } from "../transport/ChatBridge.js";
 import { InboundDepositPipeline } from "../runtime/InboundDepositPipeline.js";
 import { ProcessedDepositLog } from "../inbox/ProcessedDepositLog.js";
 import { InboundApplyOutbox } from "../inbox/InboundApplyOutbox.js";
 import { ServerRuntimeService } from "../services/ServerRuntimeService.js";
+import { AccountControlChannel } from "../runtime/AccountControlChannel.js";
 import { ServerSessionService } from "../services/ServerSessionService.js";
 import { ServerThreadsService } from "../services/ServerThreadsService.js";
 import { ServerMessagesService } from "../services/ServerMessagesService.js";
@@ -27,6 +29,8 @@ import { ServerDeviceSetService } from "../services/ServerDeviceSetService.js";
 import { ServerAccountMutationService } from "../services/ServerAccountMutationService.js";
 import { ServerAuthorityPublicationService } from "../services/ServerAuthorityPublicationService.js";
 import { ServerAccountStateSyncService } from "../services/ServerAccountStateSyncService.js";
+import { ServerSiblingSyncService } from "../services/ServerSiblingSyncService.js";
+import { ServerDeviceActivationService } from "../services/ServerDeviceActivationService.js";
 import { ServerFileTransferService } from "../services/ServerFileTransferService.js";
 import { ServerProfileService } from "../services/ServerProfileService.js";
 import { InboxCatchupService } from "../services/InboxCatchupService.js";
@@ -57,6 +61,12 @@ export class ChatServerApp {
     wsFactory = null,
     linksServiceFactory = null,
     deviceLinkServiceFactory = null,
+    sessionMode = "account-legacy",
+    retentionClass = "transient",
+    // P1.3b: split-transport activation — when configured, the device-set
+    // publication path resolves the bundle's inboxId through this establisher
+    // (the portable per-device inbox), never the session's claimed inbox.
+    portableInboxEstablisher = null,
     appVersion = "",
     logger = console,
   } = {}) {
@@ -83,6 +93,19 @@ export class ChatServerApp {
     // runtime — chat-server uses this inboxId for invites/deposits instead
     // of the SDK session's ephemeral assignment.
     this.bus.runtime.inboxClaimant = inboxClaimant;
+    // F8: in claimant mode, account-control work runs through the on-demand
+    // AccountControlChannel — the data-plane client cannot express account
+    // authority by surface. In legacy mode this stays null: the account-
+    // authenticated sdk IS the (explicitly labeled) legacy pipe.
+    this.bus.runtime.accountControl = sessionMode === "claimant"
+      ? new AccountControlChannel({
+        identity,
+        uplinks,
+        wsFactory,
+        expectedNodePublicKeyB64,
+        logger,
+      })
+      : null;
     // Account-key signer/verifier (REZ-2): the same authority that signs invite
     // envelopes, used here to sign + verify membership-consent proofs on group
     // ops. bootstrapChatServer passes the real authority; tests that drive the
@@ -104,6 +127,9 @@ export class ChatServerApp {
       wsFactory,
       linksServiceFactory,
       deviceLinkServiceFactory,
+      sessionMode,
+      retentionClass,
+      portableInboxEstablisher,
       logger,
     });
     this.#bridge = new ChatBridge({
@@ -162,7 +188,21 @@ export class ChatServerApp {
     if (this.#started) return;
     this.#started = true;
     this.bus.emit("server.starting", {});
-    await this.bus.services.runtime.connect();
+    // M1 (plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md, offline-tolerant boot): an
+    // UNREACHABLE home must not abort boot. Every service still starts, the
+    // connection state reports offline, and the runtime completes its bind on
+    // the pool's first successful background reconnect
+    // (ServerRuntimeService#restoreAfterReconnect) — no process restart.
+    // Anything WITHOUT the retryable flag (a terminal home rejection, the F9
+    // claimant/durable-home config error, a failed bind on a reachable home)
+    // still fails start loudly: a refused home is not an unreachable home.
+    try {
+      await this.bus.services.runtime.connect();
+    } catch (err) {
+      if (!(err && err.retryable === true)) throw err;
+      this.bus.logger.warn("[ChatServerApp] home unreachable at start; booting offline, will bind on reconnect: "
+        + (err && err.message ? err.message : err));
+    }
     for (const service of this.#services) {
       if (service === this.bus.services.runtime) continue;
       if (service && typeof service.start === "function") {
@@ -232,6 +272,14 @@ export class ChatServerApp {
     this.bus.stores.globalGroupLookup = new GlobalGroupLookup({
       groupStore: this.bus.stores.groupStore,
     });
+    // M4: durable last-known ACTIVE device roster (snapshotted from the
+    // authenticated aggregate at account-plane touches; composed with
+    // verified authority state by the sibling machinery on the data plane).
+    this.bus.stores.deviceRosterStore = new AccountDeviceRosterStore({
+      storageProvider,
+      ownerAccountId: this.#ownerAccountId,
+      clock: this.#clock,
+    });
   }
 
   #createServices({
@@ -245,6 +293,9 @@ export class ChatServerApp {
     wsFactory,
     linksServiceFactory,
     deviceLinkServiceFactory,
+    sessionMode = "account-legacy",
+    retentionClass = "transient",
+    portableInboxEstablisher = null,
     logger,
   }) {
     const services = {
@@ -257,6 +308,9 @@ export class ChatServerApp {
         inboxClaimant,
         expectedNodePublicKeyB64,
         wsFactory,
+        sessionMode,
+        retentionClass,
+        clock,
         logger,
       }),
       session: new ServerSessionService({
@@ -362,6 +416,7 @@ export class ChatServerApp {
       deviceSet: new ServerDeviceSetService({
         bus: this.bus,
         ownerAccountId: this.#ownerAccountId,
+        portableInboxEstablisher,
         clock,
         logger,
       }),
@@ -388,9 +443,24 @@ export class ChatServerApp {
       // (contacts, direct threads) to sibling device inboxes so a sibling that
       // never took part in an invite surfaces (and can reply to) a peer's
       // fanned-out message. No-op unless this account runs per-device sessions.
+      deviceActivation: new ServerDeviceActivationService({
+        bus: this.bus,
+        ownerAccountId: this.#ownerAccountId,
+        storageProvider: this.#storageProvider,
+        clock,
+        logger,
+      }),
       accountStateSync: new ServerAccountStateSyncService({
         bus: this.bus,
         storageProvider: this.#storageProvider,
+        ownerAccountId: this.#ownerAccountId,
+        clock,
+        logger,
+      }),
+      // AE-2: sibling anti-entropy over the immutable OriginalMessage fact
+      // log (same enablement gate as accountStateSync; no-op elsewhere).
+      siblingSync: new ServerSiblingSyncService({
+        bus: this.bus,
         ownerAccountId: this.#ownerAccountId,
         clock,
         logger,

@@ -101,6 +101,20 @@ export async function bootstrapChatRuntime({
   wsFactory = null,
   linksServiceFactory = null,
   deviceLinkServiceFactory = null,
+  sessionMode = "account-legacy",
+  retentionClass = "transient",
+  // P1.3b: which inbox-resolution phase this runtime boots in. "legacy" is
+  // the shipped behavior (desktop/browser: the delegated ceremony inbox IS
+  // the runtime primary; primaries fresh-mint). "enrollment" is the bounded
+  // activation session (claims exactly the bootstrap inbox, records no
+  // primary). "portable" is the split-transport steady state (the claim
+  // store's portable primary ONLY — no bootstrap fallback, by ruling).
+  inboxRole = "legacy",
+  // P1.3b: when configured, the device-set publication path resolves the
+  // bundle's inboxId through this establisher (portable per-device inbox),
+  // never the session's claimed inbox. Enrollment-session wiring only.
+  portableInboxEstablisher = null,
+  clock = () => Date.now(),
   allowLegacyAccountIdentityDhAdoption = false,
   onLegacyAccountIdentityDhAdopted = null,
   logger = console,
@@ -141,6 +155,12 @@ export async function bootstrapChatRuntime({
           privateKeyB64: deviceKey.deviceKeyPair.privateKeyB64,
         },
     delegatedInboxId: !hasAdminRoot && typeof identity.inboxId === "string" ? identity.inboxId : null,
+    role: inboxRole,
+    // ONE InboxClaimStore per storage domain: when the portable establisher
+    // is wired (the enrollment session), the runtime's claimant MUST share
+    // its store instance — two cached instances over one KV key are
+    // last-writer-wins and drop each other's lease recordings.
+    claimStore: portableInboxEstablisher ? portableInboxEstablisher.claimStore : null,
   });
 
   const inviteAuthority = buildChatServerInviteAuthority({
@@ -212,6 +232,10 @@ export async function bootstrapChatRuntime({
     wsFactory,
     linksServiceFactory,
     deviceLinkServiceFactory,
+    sessionMode,
+    retentionClass,
+    portableInboxEstablisher,
+    clock,
     logger,
   });
 

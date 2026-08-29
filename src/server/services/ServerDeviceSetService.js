@@ -37,9 +37,24 @@ const DEVICE_SET_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 export class ServerDeviceSetService extends BaseServerService {
   #clock;
   #resolved;
+  // P1.3b (split-transport activation, frozen rulings 2026-08-26): when
+  // configured, publishOwnDeviceBundle resolves the bundle's inboxId through
+  // the portable establisher — the PORTABLE per-device inbox, never the
+  // session's claimed (bootstrap) inbox. Establishment runs INSIDE the
+  // publish, before the wire op, so the frozen commit ordering (portable
+  // claim durably persisted BEFORE publication) and the no-fallback rule
+  // ("activation cannot commit until the portable inbox is durably
+  // established; there is no bootstrap-inbox fallback") are intrinsic to the
+  // one publication seam rather than a caller convention.
+  #portableEstablisher;
 
-  constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
+  constructor({ bus, ownerAccountId, portableInboxEstablisher = null, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
+    if (portableInboxEstablisher !== null
+      && (typeof portableInboxEstablisher !== "object" || typeof portableInboxEstablisher.ensureEstablished !== "function")) {
+      throw new Error("ServerDeviceSetService portableInboxEstablisher must expose ensureEstablished()");
+    }
+    this.#portableEstablisher = portableInboxEstablisher;
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
     // peerAccountId -> { deviceSetRecord, established, fetchedAtMs, revision }
     this.#resolved = new Map();
@@ -57,6 +72,11 @@ export class ServerDeviceSetService extends BaseServerService {
     // once the E6 gate is known open, and by the account-mutation service).
     this._register("device-set", "publishOwnBundle", (payload) => this.publishOwnDeviceBundle(payload || {}));
     this._register("device-set", "republishToAllPeers", (payload) => this.republishToAllPeers(payload || {}));
+    // M4: persist the durable device roster from the authenticated ACTIVE
+    // aggregate — invoked ONLY from account-plane contexts (legacy bind's
+    // publication path, enrollment/foreground control work). The roster is
+    // what a claimant wake later composes with verified authority state.
+    this._register("device-set", "snapshotRoster", (payload) => this.snapshotRoster(payload || {}));
   }
 
   #peerLinks() {
@@ -116,7 +136,18 @@ export class ServerDeviceSetService extends BaseServerService {
         || typeof peerLinks.buildAndRetainAccountDeviceBundle !== "function") {
       return null;
     }
-    const bundle = await peerLinks.buildAndRetainAccountDeviceBundle({ nowMs: nowMs || this.#clock() });
+    // P1.3b: the split-transport bundle carries the PORTABLE inbox. A failed
+    // establishment throws HERE — before any bytes leave — so publication
+    // (the one externally visible commit) simply does not happen, the device
+    // stays unpublished and recoverable, and no path can ever substitute the
+    // bootstrap inbox. Without an establisher this is the shipped behavior,
+    // byte-identical (the invite binding's mailbox).
+    let inboxId = null;
+    if (this.#portableEstablisher) {
+      const established = await this.#portableEstablisher.ensureEstablished();
+      inboxId = established.inboxId;
+    }
+    const bundle = await peerLinks.buildAndRetainAccountDeviceBundle({ nowMs: nowMs || this.#clock(), inboxId });
     return sdk.devices.publishDeviceBundle({ bundle });
   }
 
@@ -140,6 +171,44 @@ export class ServerDeviceSetService extends BaseServerService {
       published += 1;
     }
     return { published };
+  }
+
+  /**
+   * M4: snapshot the durable device roster from the home's authenticated
+   * ACTIVE aggregate (`listActiveBundles` behind ACCOUNT_DEVICE_SET_GET — the
+   * registry-JOINed read that already excludes revoked devices) at the
+   * account's CURRENT authority epoch. Account-plane callers only. No-op
+   * result (snapshotted:false) when the home serves no aggregate (fs/desktop
+   * single-device shape) or no roster store is wired.
+   * @returns {Promise<{snapshotted: boolean, devices?: number, epoch?: number, reason?: string}>}
+   */
+  async snapshotRoster() {
+    if (!this.isEnabled()) return { snapshotted: false, reason: "disabled" };
+    const rosterStore = this.bus.stores && this.bus.stores.deviceRosterStore ? this.bus.stores.deviceRosterStore : null;
+    if (!rosterStore) return { snapshotted: false, reason: "no-roster-store" };
+    const devices = await this.#accountDeviceSetFromHome();
+    if (!devices) return { snapshotted: false, reason: "no-home-aggregate" };
+    // The revision seam already floors the epoch at 1; the roster wants the
+    // RAW epoch (0 when the home serves none) so the data-plane epoch gate
+    // compares like with like against AccountAuthorityStateV1.epoch.
+    let epoch = 0;
+    const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
+    if (sdk && sdk.devices && typeof sdk.devices.getAuthorityState === "function") {
+      try {
+        const s = await sdk.devices.getAuthorityState();
+        epoch = s && Number.isInteger(s.epoch) ? s.epoch : 0;
+      } catch (err) {
+        // The roster snapshot must not record an epoch it could not read:
+        // failing the snapshot keeps the PREVIOUS roster+epoch intact, which
+        // fails toward defer (safe) — never toward a roster stamped fresher
+        // than it is.
+        const reason = err && err.message ? err.message : String(err);
+        this.logger.error("[ServerDeviceSetService] roster snapshot aborted: authority epoch unavailable: " + reason);
+        return { snapshotted: false, reason: "epoch-unavailable: " + reason };
+      }
+    }
+    const snapshot = await rosterStore.replaceFromAggregate({ devices, epoch, snapshotAtMs: this.#clock() });
+    return { snapshotted: true, devices: snapshot.devices.length, epoch: snapshot.epoch };
   }
 
   // The account's home-aggregated active device set (all self-published bundles),

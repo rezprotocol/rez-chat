@@ -176,7 +176,10 @@ export class AccountAuthService {
           deviceKeyPair: delegation.deviceKeyPair,
           certChain: delegation.certChain,
           cachedDeviceSet: delegation.cachedDeviceSet === undefined ? null : delegation.cachedDeviceSet,
-          inboxId: result.inboxId === undefined ? null : result.inboxId,
+          // R3: the ceremony inbox is the BOOTSTRAP inbox — the envelope
+          // field carries the honest name (the requester result's wire field
+          // is still `inboxId`).
+          bootstrapInboxId: result.inboxId === undefined ? null : result.inboxId,
         },
       });
       await this._authBootstrapService.addAccount(storeKey, profileName);

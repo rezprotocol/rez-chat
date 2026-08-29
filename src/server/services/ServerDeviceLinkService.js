@@ -124,6 +124,14 @@ export class ServerDeviceLinkService extends BaseServerService {
   }
 
   #buildRecoveryWorker() {
+    // F8: device linking is ACCOUNT-control work and lives on the legacy
+    // identity-bearing path (F9 ruling). A claimant-mode runtime can never
+    // START a ceremony (the node.capabilities event advertises
+    // deviceLinking: false), so it has no registrations to recover — and its
+    // data-plane client has NO `devices` surface by construction (the getter
+    // throws). Same semantic as the missing-surface guards below: cannot
+    // link ⇒ nothing to recover.
+    if (this.bus && this.bus.runtime && this.bus.runtime.sessionMode === "claimant") return null;
     const sdk = this.#sdk();
     if (!this.#pendingCeremonies) return null;
     if (!sdk || !sdk.durableRecords || typeof sdk.durableRecords.put !== "function") return null;
@@ -356,6 +364,26 @@ export class ServerDeviceLinkService extends BaseServerService {
       const done = await ceremony.approver.approve();
       ceremony.state = "confirmed";
       this.#emitUpdated({ state: "confirmed", newDeviceId: done.newDeviceId });
+      // Device activation (plans/DEVICE_ACTIVATION_PLAN.md): the approver is
+      // online by definition — it just ran the ceremony — so it sends the new
+      // sibling its relationship BASELINE now, terminated by a marker bound
+      // to THIS activation (activationId = the leaf certId approve()
+      // returned). FROZEN (P1.3-pre R1): the baseline goes DIRECTLY to the
+      // ceremony inbox the home committed at device.add — the knowledge this
+      // ceremony just produced — never to a DeviceSet-derived sibling list,
+      // which cannot contain a device whose bundle publication IS the
+      // activation commit it is still waiting for. Fire-and-forget: a failed
+      // send must not fail the ceremony; the device's stall-recovery
+      // re-request covers it, and a resend is idempotent (lamport-ordered
+      // full-row state).
+      if (done && typeof done.certId === "string" && done.certId.length > 0) {
+        this._call("account-state", "sendActivationBaseline", {
+          activationId: done.certId,
+          target: { deviceId: done.newDeviceId, inboxId: done.inboxId },
+        })
+          .catch((err) => this.logger.warn("[ServerDeviceLinkService] activation baseline send failed (device will re-request): "
+            + (err && err.message ? err.message : err)));
+      }
     } catch (err) {
       ceremony.state = "failed";
       this.#emitUpdated({

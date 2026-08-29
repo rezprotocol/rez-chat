@@ -33,6 +33,8 @@ import { ChatSystemEventPayloadV1, SYSTEM_EVENT_KIND } from "./ChatSystemEventPa
 import { ConnectRequestPayloadV1, CONNECT_REQUEST_KIND } from "./ConnectRequestPayloadV1.js";
 import { ChatConnectAcceptedPayloadV1, CONNECT_ACCEPTED_KIND } from "./ChatConnectAcceptedPayloadV1.js";
 import { AccountStateEventPayloadV1, ACCOUNT_STATE_EVENT_KIND } from "./AccountStateEventPayloadV1.js";
+import { SiblingSyncPayloadV1, SIBLING_SYNC_KIND } from "./SiblingSyncPayloadV1.js";
+import { MessageCommitAckV1, MESSAGE_COMMIT_ACK_KIND } from "./MessageCommitAckV1.js";
 import { FileManifestV1, FileChunkV1 } from "@rezprotocol/sdk/filetransfer";
 import { ProfilePayloadV1 } from "@rezprotocol/sdk/profile";
 
@@ -53,6 +55,10 @@ export {
   ChatConnectAcceptedPayloadV1,
   AccountStateEventPayloadV1,
   ACCOUNT_STATE_EVENT_KIND,
+  SiblingSyncPayloadV1,
+  SIBLING_SYNC_KIND,
+  MessageCommitAckV1,
+  MESSAGE_COMMIT_ACK_KIND,
   FileManifestV1,
   FileChunkV1,
   ProfilePayloadV1,
@@ -165,6 +171,43 @@ const ENTRIES = [
       const sync = services && services.accountStateSync;
       if (sync && typeof sync.applyInbound === "function") {
         await sync.applyInbound(record);
+      }
+      return true;
+    },
+  },
+  {
+    kind: SIBLING_SYNC_KIND,
+    recordClass: SiblingSyncPayloadV1,
+    // AE-2: a sibling anti-entropy exchange sealed with the account-state
+    // AEAD (only our own account's devices can produce it). Like the S14
+    // event, it carries no peer sender and is ALWAYS consumed — never the
+    // message-persist path (transferred facts persist via admission inside
+    // the sync service).
+    async dispatch(record, _ctx, services) {
+      const sync = services && services.siblingSync;
+      if (sync && typeof sync.handleInbound === "function") {
+        await sync.handleInbound(record);
+      }
+      return true;
+    },
+  },
+  {
+    kind: MESSAGE_COMMIT_ACK_KIND,
+    recordClass: MessageCommitAckV1,
+    // MessageCommitAck (plans/MESSAGE_COMMIT_ACK_PLAN.md): the recipient's
+    // signed commit proof for one OriginalMessage fingerprint, arriving over
+    // the sealed peer channel. ALWAYS consumed — it is evidence for the
+    // sender's pending-commit state, never chat content, and must never fall
+    // through to the message-persist path. Verification (fail-closed) lives
+    // in ServerMessagesService.handleCommitAck; ctx.peerAccountId is the
+    // envelope-authenticated sender (never the payload's self-claim).
+    async dispatch(record, ctx, services) {
+      const messagesService = services && services.messages;
+      if (messagesService && typeof messagesService.handleCommitAck === "function") {
+        await messagesService.handleCommitAck(record, {
+          senderAccountId: extractPayloadSender(record, ctx),
+          threadId: ctx && typeof ctx.threadId === "string" ? ctx.threadId : "",
+        });
       }
       return true;
     },

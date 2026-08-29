@@ -309,10 +309,19 @@ test("live local mesh: a DELEGATED device invites a primary peer — V2 record r
     assert.equal(bob.bootstrapped.peerLinkService.hasAdminRoot, false);
     assert.equal(bob.bootstrapped.identity.hasAdminRoot, false);
     assert.equal(bob.bootstrapped.identity.privateKeyB64, "");
-    assert.equal(
+    // F8 (plans/F8_REZCHAT_ROLE_SPLIT_PLAN.md): a FRESH claim mints a FRESH
+    // RANDOM claimant keypair — the claimant key is deliberately NEVER the
+    // device key C or the account identity again (the pre-F8 assertion here
+    // pinned exactly the role conflation F8 removed).
+    assert.notEqual(
       bob.bootstrapped.inboxClaimant.claimantPublicKeyB64,
       bobDelegation.deviceKey.deviceKeyPair.publicKeyB64,
-      "the device key C claims Bob's inbox",
+      "the claimant key is NOT the device key C (F8 role split)",
+    );
+    assert.notEqual(
+      bob.bootstrapped.inboxClaimant.claimantPublicKeyB64,
+      bobDelegation.chatServerIdentity.publicKeyB64,
+      "the claimant key is NOT the account identity key (F8 role split)",
     );
 
     await sleep(MESH_FORM_WAIT_MS);

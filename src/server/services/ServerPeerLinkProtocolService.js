@@ -730,6 +730,18 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     this._sweepStaleDeliveries();
   }
 
+  // MessageCommitAck (plan §7 decision 1 rider): the signed-era commit ack
+  // replaces the legacy delivery ack on the wire but carries the SAME
+  // transport-level evidence — it decrypted off this peer's sealed channel,
+  // so the us->peer direction lives. The commit ack routes through the chat
+  // layer (registry dispatch → ServerMessagesService.handleCommitAck), which
+  // reports the evidence here with the ENVELOPE-authenticated sender. Public
+  // seam by design: recovery evidence must count ANY authenticated ack kind,
+  // or the cutover would structurally falsify REZ-4/REZ-5 for signed traffic.
+  noteAckEvidence({ peerAccountId } = {}) {
+    this._noteDeliveryAckReceived(peerAccountId);
+  }
+
   // Clear a peer's unacked tally — a delivery-ack from them proves the us->peer
   // direction is healthy. Also sweeps the rest: acks flowing from healthy members
   // give the sweep cadence even when WE have stopped sending into a dead group.

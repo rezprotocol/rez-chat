@@ -114,6 +114,11 @@ export class ServerDiagnosticsService extends BaseServerService {
         durableInbox: caps.durableInbox === true,
         multiDeviceFanout: caps.multiDeviceFanout === true,
         delegatedDevices: caps.delegatedDevices === true,
+        // M4: the durable-state-derived account multiplicity flag, alongside
+        // the per-session home capability it was decoupled from — the two can
+        // legitimately disagree (claimant session, multi-device account), and
+        // that disagreement is exactly what triage needs to see.
+        accountMultiDevice: Boolean(this.bus.runtime && this.bus.runtime.accountMultiDevice === true),
       };
     } catch (err) {
       // A bundle is best-effort by nature; a missing section must not cost the

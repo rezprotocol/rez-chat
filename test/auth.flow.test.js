@@ -189,7 +189,7 @@ test("browser device linking persists a seedless delegated keystore and unlocks 
   assert.equal(account.hasAdminRoot, false);
   assert.equal(account.identityKeyPair, null);
   assert.equal(account.deviceId, linked.deviceId);
-  assert.equal(account.inboxId, linked.inboxId);
+  assert.equal(account.bootstrapInboxId, linked.inboxId, "the envelope surfaces the ceremony inbox under the honest R3 name");
   assert.deepEqual(account.accountIdentityDhKeyPair, linked.delegation.accountDhKeyPair);
   assert.equal((await service.listAccounts())[0].label, "Phone");
   assert.equal(await service.authBootstrapService.getRecoveryStore("default").hasKeystore(), false);
@@ -198,7 +198,7 @@ test("browser device linking persists a seedless delegated keystore and unlocks 
   await service.init();
   await service.unlock({ password: "password-phone" });
   assert.equal(service.getAccount().hasAdminRoot, false, "delegated mode survives a cold unlock");
-  assert.equal(service.getAccount().inboxId, linked.inboxId, "the pre-registered inbox survives a cold unlock");
+  assert.equal(service.getAccount().bootstrapInboxId, linked.inboxId, "the pre-registered bootstrap inbox survives a cold unlock");
 });
 
 test("browser device linking cleans up the delegated keystore when registry admission fails", async () => {

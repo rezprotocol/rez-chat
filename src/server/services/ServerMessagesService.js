@@ -25,12 +25,31 @@ import {
   ChatMessageEditPayloadV1,
   ChatMessageTombstonePayloadV1,
   ChatReactionPayloadV1,
+  MESSAGE_KIND,
   MESSAGE_EDIT_KIND,
   MESSAGE_TOMBSTONE_KIND,
   REACTION_KIND,
 } from "../../records/payloads/index.js";
+import {
+  signableOriginalMessageBytes,
+  messageFingerprint,
+} from "../../records/payloads/originalMessageShapes.js";
+import {
+  MessageCommitAckV1,
+  verifyCommitAckForAcceptance,
+} from "../../records/payloads/MessageCommitAckV1.js";
 import { BaseServerService } from "../base/BaseServerService.js";
-import { runtimeUuid } from "@rezprotocol/sdk/client";
+import { runtimeUuid, bytesToBase64 } from "@rezprotocol/sdk/client";
+
+// MessageCommitAck retry policy (plans/MESSAGE_COMMIT_ACK_PLAN.md §7
+// decision 5): FIXED internal constants — aggressive bounded exponential
+// backoff for roughly the first hour, then a capped SLOW TAIL forever. A
+// pending commit is never declared failed purely on time; a verified ack is
+// the only terminal success, and event triggers (reconnect, boot) may sweep
+// earlier. Jitter keeps multiple clients from synchronizing retries.
+const COMMIT_RETRY_SCHEDULE_MS = [5_000, 15_000, 45_000, 120_000, 300_000, 900_000];
+const COMMIT_RETRY_SLOW_TAIL_MS = 20 * 60_000;
+const COMMIT_RETRY_JITTER_FRAC = 0.25;
 
 export class ServerMessagesService extends BaseServerService {
   static QUEUE_TTL_MS = 72 * 60 * 60 * 1000;
@@ -57,6 +76,12 @@ export class ServerMessagesService extends BaseServerService {
   #queuedByInbox = new Map();
   #queueTracking = new Map();
   #outboundStatusUnsubscribe = null;
+  // AE-1: this runtime's account-authority signer (resolved lazily, once —
+  // mode/keys/chain are fixed for a boot) and a short-TTL authority-epoch
+  // cache. Null signer = a runtime without the signing machinery (minimal
+  // embeddings) that emits legacy unsigned payloads.
+  #originalSignerPromise = null;
+  #epochCache = null;
   // DURABLE per-(messageId, peerDeviceId) sealed-ciphertext cache (injected
   // DeviceFanoutCacheStore) for gated per-device fan-out. Re-encrypting a device
   // on a send retry advances that device's ratchet AGAIN — duplicating to
@@ -66,6 +91,15 @@ export class ServerMessagesService extends BaseServerService {
   // means a retry AFTER A SENDER RESTART (recovery re-send) replays too, instead
   // of re-encrypting from a fresh ratchet position. Audit R2 #4 + R3 #4.
   #deviceFanoutStore;
+  // MessageCommitAck (decision 4): the ADVISORY sweep timer. It only triggers
+  // re-evaluation — retry eligibility always derives from the DURABLE
+  // pending-commit rows + the clock, so losing the timer (restart) loses
+  // nothing: start()/reconnect re-derive the schedule from the rows.
+  #commitSweepTimer = null;
+  #commitSweepRunning = false;
+  // Set by stop(): an in-flight #scheduleCommitSweep must not re-arm the
+  // timer after the service shut down (orphan-timer race).
+  #commitSweepStopped = false;
 
   constructor({
     bus,
@@ -97,9 +131,11 @@ export class ServerMessagesService extends BaseServerService {
     this._register("message", "deleteLocal", (payload) => this.deleteLocalMessage(payload));
     this._register("message.reaction", "add", (payload) => this.addReaction(payload));
     this._register("message.reaction", "remove", (payload) => this.removeReaction(payload));
+    this._register("message.commit", "sweep", (payload) => this.sweepPendingCommits(payload || {}));
   }
 
   async start() {
+    this.#commitSweepStopped = false;
     await this.#recoverQueuedMessages().catch((err) => {
       this.logger.error("[ServerMessagesService] queued message recovery failed", err && err.message ? err.message : err);
     });
@@ -121,9 +157,22 @@ export class ServerMessagesService extends BaseServerService {
         },
       );
     }
+    // Deterministic restart resume (decision 4): pending-commit rows are
+    // durable, so boot re-derives the retry schedule from them — anything
+    // already due sweeps now, the rest re-arms the advisory timer. Best-effort
+    // here (the runtime may not be connected yet); the reconnect trigger
+    // sweeps again once connectivity lands.
+    this.sweepPendingCommits({}).catch((err) => {
+      this.logger.error("[ServerMessagesService] boot pending-commit sweep failed", err && err.message ? err.message : err);
+    });
   }
 
   async stop() {
+    this.#commitSweepStopped = true;
+    if (this.#commitSweepTimer) {
+      clearTimeout(this.#commitSweepTimer);
+      this.#commitSweepTimer = null;
+    }
     if (typeof this.#outboundStatusUnsubscribe === "function") {
       this.#outboundStatusUnsubscribe();
       this.#outboundStatusUnsubscribe = null;
@@ -133,6 +182,142 @@ export class ServerMessagesService extends BaseServerService {
     this.#queueTracking.clear();
     this.#ackPending.clear();
     await super.stop();
+  }
+
+  // ── AE-1: OriginalMessage signing (plan §2/§7) ─────────────────────────────
+  // ONE helper covers all four wire-payload build sites. Dual-mode via the
+  // SDK's accountAuthoritySigner(): the account root B signs directly on a
+  // primary, the device key C signs under the capability chain on a
+  // delegated device.
+  //
+  // The cutover boundary (Noah's AE-1 close ruling) distinguishes:
+  //   SIGNING_UNAVAILABLE_BY_CONFIGURATION — this runtime has no signing
+  //     machinery at all (no bus.runtime.peerLinks / no signer seam:
+  //     minimal embeddings, legacy tests) → legacy unsigned emission.
+  //   SIGNING_EXPECTED_BUT_BROKEN — the machinery exists but the signer
+  //     fails to resolve (or, below, fails to sign) → the send/mutation
+  //     FAILS. A full runtime must never quietly leave authenticated
+  //     history through an error path.
+
+  async #originalSigner() {
+    const peerLinks = this.bus.runtime && this.bus.runtime.peerLinks ? this.bus.runtime.peerLinks : null;
+    if (!peerLinks || typeof peerLinks.accountAuthoritySigner !== "function") return null;
+    if (!this.#originalSignerPromise) {
+      const resolving = peerLinks.accountAuthoritySigner();
+      this.#originalSignerPromise = resolving;
+      // A failed resolution must not be cached forever: clear it so a
+      // transient boot-order failure can recover on the next attempt.
+      resolving.catch(() => {
+        if (this.#originalSignerPromise === resolving) this.#originalSignerPromise = null;
+      });
+    }
+    try {
+      return await this.#originalSignerPromise;
+    } catch (err) {
+      const reason = err && err.message ? err.message : String(err);
+      this.logger.error("[ServerMessagesService] account-authority signer failed to resolve; refusing to emit an unsigned fact", reason);
+      this._emit("app.error", {
+        source: "ServerMessagesService",
+        message: "account-authority signer failed to resolve; send refused",
+        severity: "error",
+        err,
+      });
+      const failure = new Error("account-authority signer failed to resolve; refusing to emit an unsigned fact: " + reason);
+      failure.code = "SIGNING_EXPECTED_BUT_BROKEN";
+      throw failure;
+    }
+  }
+
+  // The epoch stamp is signed ORDERING/AUDIT data — admission never trusts a
+  // record's claimed epoch (rev4 Q4: revocation is forward-looking at the
+  // receiver) — so an unreadable authority state degrades to 0, loudly.
+  async #authorityEpoch() {
+    const now = this.#clock();
+    if (this.#epochCache && (now - this.#epochCache.atMs) < 60000) return this.#epochCache.epoch;
+    let epoch = 0;
+    const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
+    if (sdk && sdk.devices && typeof sdk.devices.getAuthorityState === "function") {
+      try {
+        const state = await sdk.devices.getAuthorityState();
+        epoch = state && Number.isInteger(state.epoch) && state.epoch >= 0 ? state.epoch : 0;
+      } catch (err) {
+        this.logger.warn("[ServerMessagesService] authority epoch unavailable; stamping 0",
+          err && err.message ? err.message : err);
+      }
+    }
+    this.#epochCache = { epoch, atMs: now };
+    return epoch;
+  }
+
+  /**
+   * Build + sign one OriginalMessage wire payload. Two-phase: a draft record
+   * first COERCES the semantic fields (trim/int rules), the canonical bytes
+   * are built from the COERCED JSON, then the final record carries the
+   * envelope (chain/contentHash/sig) — so the bytes the receiver recomputes
+   * from the wire JSON are byte-identical to what was signed. Returns null
+   * when this runtime has no signer (legacy unsigned emission); THROWS when
+   * a resolved signer fails to sign — never a silent downgrade.
+   */
+  async #signOriginalPayload(RecordClass, semanticFields) {
+    const signer = await this.#originalSigner();
+    if (!signer) return null;
+    const draft = new RecordClass({
+      ...semanticFields,
+      signerPublicKeyB64: signer.signerPublicKeyB64,
+      senderDeviceId: typeof signer.senderDeviceId === "string" ? signer.senderDeviceId : "",
+      senderAuthorityEpoch: await this.#authorityEpoch(),
+    }).toJSON();
+    const signableBytes = signableOriginalMessageBytes(draft);
+    const contentHash = messageFingerprint(draft);
+    const sigB64 = bytesToBase64(await signer.sign(signableBytes));
+    return new RecordClass({
+      ...draft,
+      senderCertChain: Array.isArray(signer.certChain) ? signer.certChain : [],
+      contentHash,
+      sig: sigB64,
+    }).toJSON();
+  }
+
+  /**
+   * Record this device's OWN signed fact into the immutable per-thread log
+   * (local origin — no admission verify; we authored it). Same error posture
+   * as the outbound projection persist: log + app.error, never blocks the
+   * send.
+   */
+  async #recordLocalOriginalFact({ threadId, wirePayload, now }) {
+    const contentHash = wirePayload && typeof wirePayload.contentHash === "string" ? wirePayload.contentHash.trim() : "";
+    if (!threadId || !contentHash) return;
+    await this.#threadStore.appendOriginalFact({
+      threadId,
+      fact: { fingerprint: contentHash, payload: wirePayload, receivedAtMs: now, origin: "local" },
+    }).catch((err) => {
+      this.logger.error("[ServerMessagesService] local original-fact persist failed", err && err.message ? err.message : err);
+      this._emit("app.error", { source: "ServerMessagesService", message: "local original-fact persist failed", severity: "error", err });
+    });
+  }
+
+  /**
+   * Resolve the `targetFingerprint` a signed mutation binds to (the plan's
+   * BINDING requirement — messageId is not a unique fact identity).
+   *   - exactly one base fact for the (sender, messageId) identity → bind it
+   *   - none → an unsigned-era target: the mutation is emitted as a legacy
+   *     UNSIGNED payload (pre-cutover history stays in the legacy world)
+   *   - more than one → the target is integrity-conflicted; there is no
+   *     cryptographic basis for choosing WHICH fact to mutate — fail loud.
+   */
+  async #resolveTargetFingerprint({ threadId, targetMessageId, targetSenderAccountId = null } = {}) {
+    const facts = await this.#threadStore.findBaseFactsByMessageId({
+      threadId,
+      messageId: targetMessageId,
+      senderAccountId: targetSenderAccountId,
+    });
+    if (facts.length === 0) return "";
+    if (facts.length > 1) {
+      const err = new Error("target message '" + targetMessageId + "' is integrity-conflicted; a mutation cannot name which fact it mutates");
+      err.code = "MESSAGE_TARGET_CONFLICTED";
+      throw err;
+    }
+    return typeof facts[0].fingerprint === "string" ? facts[0].fingerprint : "";
   }
 
   async listMessages(payload = {}) {
@@ -179,9 +364,13 @@ export class ServerMessagesService extends BaseServerService {
     // The optional `channelId` is a logical-organization tag (see
     // ChatMessagePayloadV1). Empty/missing = the implicit #general bucket.
     let wirePayload;
-    if (params.payload && typeof params.payload === "object") {
+    const objectPayload = params.payload && typeof params.payload === "object" ? params.payload : null;
+    const objectKind = objectPayload && typeof objectPayload.kind === "string" ? objectPayload.kind : "";
+    if (objectPayload && objectKind && objectKind !== MESSAGE_KIND) {
+      // Non-primary kinds (images, etc.) pass through as before — they are
+      // not OriginalMessages in AE-1's scope.
       const base = {
-        ...params.payload,
+        ...objectPayload,
         threadId,
         senderAccountId: this.ownerAccountId,
         messageId,
@@ -191,14 +380,25 @@ export class ServerMessagesService extends BaseServerService {
       if (channelId) base.channelId = channelId;
       wirePayload = base;
     } else {
-      wirePayload = new ChatMessagePayloadV1({
+      // The primary chat message (the UI sends it as {kind, text, ...}).
+      // AE-1 hard cutover: a runtime with the account-authority signer emits
+      // the SIGNED OriginalMessage; only signerless embeddings stay legacy.
+      // Top-level inReplyToMessageId/channelId win over the payload's
+      // (unchanged precedence).
+      const semantic = {
         threadId,
         senderAccountId: this.ownerAccountId,
         messageId,
-        text: String(params.payload || ""),
-        inReplyToMessageId,
-        channelId,
-      }).toJSON();
+        text: objectPayload && typeof objectPayload.text === "string"
+          ? objectPayload.text
+          : String(params.payload || ""),
+        inReplyToMessageId: inReplyToMessageId
+          || (objectPayload && typeof objectPayload.inReplyToMessageId === "string" ? objectPayload.inReplyToMessageId.trim() : ""),
+        channelId: channelId
+          || (objectPayload && typeof objectPayload.channelId === "string" ? objectPayload.channelId.trim() : ""),
+      };
+      const signed = await this.#signOriginalPayload(ChatMessagePayloadV1, semantic);
+      wirePayload = signed || new ChatMessagePayloadV1(semantic).toJSON();
     }
     const previewText = this.bus.services.threads.extractPreviewText(wirePayload);
     const packetB64 = JSON.stringify(wirePayload);
@@ -217,6 +417,8 @@ export class ServerMessagesService extends BaseServerService {
         this.logger.error("[ServerMessagesService] outbound deposit persist failed", err && err.message ? err.message : err);
         this._emit("app.error", { source: "ServerMessagesService", message: "outbound deposit persist failed", severity: "error", err });
       });
+
+      await this.#recordLocalOriginalFact({ threadId, wirePayload, now });
 
       const indexRecord = await this.#threadIndex.upsertFromMessage({
         threadId,
@@ -299,6 +501,17 @@ export class ServerMessagesService extends BaseServerService {
         status: nextStatus,
         sentAtMs: eventId ? now : null,
       }));
+      // MessageCommitAck (plan §3): a SIGNED 1:1 send that reached the mesh
+      // (or the node's durable queue) opens a durable pending-commit row —
+      // "delivered" is now a proof, and this row is what the verified ack
+      // consumes. Group sends stay evidence-only (DT-004: a group row never
+      // flips on the first of N member acks). A failed send stays with the
+      // user-visible failed/tap-to-retry path, not the ack-repair loop.
+      const signedFingerprint = wirePayload && typeof wirePayload.contentHash === "string"
+        ? wirePayload.contentHash.trim() : "";
+      if (signedFingerprint && !sentToGroup && (nextStatus === "sent" || nextStatus === "queued")) {
+        await this.#openPendingCommit({ threadId, messageId, fingerprint: signedFingerprint, now });
+      }
     }
 
     return new MessageSendResult({
@@ -327,13 +540,27 @@ export class ServerMessagesService extends BaseServerService {
     if (applied && applied.message) {
       this.#emitMessageUpdated(threadId, applied.message);
     }
-    const wirePayload = new ChatMessageEditPayloadV1({
+    // AE-1: bind the signed mutation to the target FACT's fingerprint (only
+    // the author may edit, so the target identity is (owner, target)). An
+    // unsigned-era target ("" fingerprint) stays a legacy unsigned mutation.
+    const targetFingerprint = await this.#resolveTargetFingerprint({
+      threadId,
+      targetMessageId: target,
+      targetSenderAccountId: this.ownerAccountId,
+    });
+    const editSemantic = {
       threadId,
       targetMessageId: target,
       newText: params.newText,
       senderAccountId: this.ownerAccountId,
       editedAtMs,
-    }).toJSON();
+    };
+    let wirePayload = null;
+    if (targetFingerprint) {
+      wirePayload = await this.#signOriginalPayload(ChatMessageEditPayloadV1, { ...editSemantic, targetFingerprint });
+    }
+    if (!wirePayload) wirePayload = new ChatMessageEditPayloadV1(editSemantic).toJSON();
+    await this.#recordLocalOriginalFact({ threadId, wirePayload, now: editedAtMs });
     await this.#deliverMutationPayload({ threadId, wirePayload });
     return new MessageEditResult({ threadId, targetMessageId: target, editedAtMs });
   }
@@ -355,12 +582,24 @@ export class ServerMessagesService extends BaseServerService {
     if (applied && applied.message) {
       this.#emitMessageUpdated(threadId, applied.message);
     }
-    const wirePayload = new ChatMessageTombstonePayloadV1({
+    // AE-1: same fingerprint binding as editMessage (author-only mutation).
+    const targetFingerprint = await this.#resolveTargetFingerprint({
+      threadId,
+      targetMessageId: target,
+      targetSenderAccountId: this.ownerAccountId,
+    });
+    const tombstoneSemantic = {
       threadId,
       targetMessageId: target,
       senderAccountId: this.ownerAccountId,
       tombstonedAtMs,
-    }).toJSON();
+    };
+    let wirePayload = null;
+    if (targetFingerprint) {
+      wirePayload = await this.#signOriginalPayload(ChatMessageTombstonePayloadV1, { ...tombstoneSemantic, targetFingerprint });
+    }
+    if (!wirePayload) wirePayload = new ChatMessageTombstonePayloadV1(tombstoneSemantic).toJSON();
+    await this.#recordLocalOriginalFact({ threadId, wirePayload, now: tombstonedAtMs });
     await this.#deliverMutationPayload({ threadId, wirePayload });
     return new MessageTombstoneResult({ threadId, targetMessageId: target, tombstonedAtMs });
   }
@@ -406,14 +645,6 @@ export class ServerMessagesService extends BaseServerService {
 
   async #sendReaction({ threadId, targetMessageId, emoji, op } = {}) {
     const createdAtMs = this.#clock();
-    const wirePayload = new ChatReactionPayloadV1({
-      threadId,
-      targetMessageId,
-      emoji,
-      op,
-      senderAccountId: this.ownerAccountId,
-      createdAtMs,
-    }).toJSON();
     const applied = await this.#threadStore.applyReaction({
       threadId,
       targetMessageId,
@@ -426,6 +657,32 @@ export class ServerMessagesService extends BaseServerService {
     if (applied && applied.message) {
       this.#emitMessageUpdated(threadId, applied.message);
     }
+    // AE-1: a reaction may target ANOTHER account's message — disambiguate
+    // the fact identity by the target row's authenticated author when the
+    // local apply resolved it.
+    const targetSender = applied && applied.message && typeof applied.message.senderAccountId === "string"
+      && applied.message.senderAccountId.trim()
+      ? applied.message.senderAccountId.trim()
+      : null;
+    const targetFingerprint = await this.#resolveTargetFingerprint({
+      threadId,
+      targetMessageId,
+      targetSenderAccountId: targetSender,
+    });
+    const reactionSemantic = {
+      threadId,
+      targetMessageId,
+      emoji,
+      op,
+      senderAccountId: this.ownerAccountId,
+      createdAtMs,
+    };
+    let wirePayload = null;
+    if (targetFingerprint) {
+      wirePayload = await this.#signOriginalPayload(ChatReactionPayloadV1, { ...reactionSemantic, targetFingerprint });
+    }
+    if (!wirePayload) wirePayload = new ChatReactionPayloadV1(reactionSemantic).toJSON();
+    await this.#recordLocalOriginalFact({ threadId, wirePayload, now: createdAtMs });
     await this.#deliverMutationPayload({ threadId, wirePayload });
     if (op === "add") {
       return new MessageReactionAddResult({ threadId, targetMessageId, emoji, createdAtMs });
@@ -859,6 +1116,18 @@ export class ServerMessagesService extends BaseServerService {
         || (queuedEntry && typeof queuedEntry.threadId === "string" ? queuedEntry.threadId : "")
         || (typeof pendingThreadId === "string" ? pendingThreadId : "");
       if (!resolvedThreadId) continue;
+      // Hard cutover by message regime (plan §7 decision 1): a SIGNED send's
+      // "delivered" is a PROOF carried only by a verified MessageCommitAck.
+      // A legacy delivery ack for a message with an open pending-commit row
+      // (e.g. from a signerless recipient runtime) is transport evidence
+      // only — it was already counted for link recovery — and must not flip
+      // the status; the retry loop keeps running until real proof arrives.
+      const pendingCommit = await this.#threadStore.getPendingCommit({ messageId });
+      if (pendingCommit) {
+        this.logger.warn("[ServerMessagesService] legacy delivery ack for signed message "
+          + messageId + " ignored for status; awaiting MessageCommitAck proof");
+        continue;
+      }
       await this.#threadStore.setMessageStatus({
         threadId: resolvedThreadId,
         messageId,
@@ -877,6 +1146,343 @@ export class ServerMessagesService extends BaseServerService {
         status: "delivered",
         acceptedAtMs: now,
       }));
+    }
+  }
+
+  // ── MessageCommitAck (plans/MESSAGE_COMMIT_ACK_PLAN.md) ───────────────────
+
+  /**
+   * Build + sign the recipient-side commit proof for one admitted-and-
+   * committed OriginalMessage (called by ServerEventService at the T1 site,
+   * AFTER the projection commit). Returns the wire JSON, or null when this
+   * runtime has no signing machinery (SIGNING_UNAVAILABLE_BY_CONFIGURATION —
+   * the caller falls back to the legacy delivery ack). THROWS when the
+   * resolved signer breaks (SIGNING_EXPECTED_BUT_BROKEN): a false commit
+   * claim is never emitted.
+   */
+  async buildCommitAck({ messageId, messageFingerprint: fingerprint, threadId, committedAtMs } = {}) {
+    const signer = await this.#originalSigner();
+    if (!signer) return null;
+    const semantic = {
+      messageId,
+      messageFingerprint: fingerprint,
+      threadId,
+      recipientAccountId: this.ownerAccountId,
+      recipientDeviceId: typeof signer.senderDeviceId === "string" ? signer.senderDeviceId : "",
+      recipientAuthorityEpoch: await this.#authorityEpoch(),
+      signerPublicKeyB64: signer.signerPublicKeyB64,
+      committedAtMs,
+    };
+    const sigB64 = bytesToBase64(await signer.sign(MessageCommitAckV1.signableBytes(semantic)));
+    return new MessageCommitAckV1({
+      ...semantic,
+      recipientCertChain: Array.isArray(signer.certChain) ? signer.certChain : [],
+      sig: sigB64,
+    }).toJSON();
+  }
+
+  /**
+   * Inbound commit ack (registry dispatch — always consumed). EVIDENCE,
+   * admitted fail-closed per the frozen distinction (plan §8): malformed /
+   * wrong-signature / wrong-fingerprint / revoked-signer acks are rejected;
+   * an unavailable recipient authority source leaves the ack UNCONSUMED (the
+   * retry loop continues — never "unknown authority state means probably
+   * okay"); only a VERIFIED ack consumes the pending commit. Idempotent by
+   * fingerprint: any valid proof — including one from a recipient sibling
+   * outside the original fan-out (decision 2) — is the same terminal
+   * condition, and later duplicates are harmless.
+   */
+  async handleCommitAck(record, ctx = {}) {
+    if (!(record instanceof MessageCommitAckV1)) return false;
+    const authedSender = typeof ctx.senderAccountId === "string" ? ctx.senderAccountId.trim() : "";
+    // Any ack that decrypted off the sealed channel proves the us→peer
+    // direction lives — the same recovery evidence the legacy ack carries at
+    // the transport layer (decision 1 rider). Recorded before verification,
+    // keyed ONLY by the envelope-authenticated sender.
+    const peerLinkProtocol = this.bus.services && this.bus.services.peerLinkProtocol
+      ? this.bus.services.peerLinkProtocol : null;
+    if (authedSender && peerLinkProtocol && typeof peerLinkProtocol.noteAckEvidence === "function") {
+      peerLinkProtocol.noteAckEvidence({ peerAccountId: authedSender });
+    }
+    // REZ-7 analog: the commit claim must come from the account that makes
+    // it — a peer must not clear ANOTHER peer's pending commit by naming
+    // them in the payload.
+    if (!authedSender || record.recipientAccountId !== authedSender) {
+      this.logger.warn("[ServerMessagesService] commit-ack recipient mismatch (claimed "
+        + record.recipientAccountId + " != authenticated " + (authedSender || "<none>") + "); ignoring");
+      return true;
+    }
+
+    // Step 1 — the claim must name a fact WE authored. The pending row is
+    // the primary lookup; without one (duplicate proof after consume, group
+    // ack, or an ack racing the row write) the claim is re-derived from our
+    // own originals log — absent there, we never sent this.
+    const pending = await this.#threadStore.getPendingCommit({ messageId: record.messageId });
+    if (pending) {
+      if (record.messageFingerprint !== pending.fingerprint || record.threadId !== pending.threadId) {
+        // Exactly the divergence rev6 wanted visible: the recipient claims a
+        // commit of DIFFERENT content under our messageId.
+        this.logger.warn("[ServerMessagesService] commit-ack claim mismatch for " + record.messageId
+          + " (fingerprint/thread does not match the pending claim) — divergence evidence; ignoring");
+        return true;
+      }
+      if (pending.recipientAccountId !== authedSender) {
+        this.logger.warn("[ServerMessagesService] commit-ack for " + record.messageId
+          + " from " + authedSender + " but pending recipient is " + pending.recipientAccountId + "; ignoring");
+        return true;
+      }
+    } else {
+      const fact = await this.#threadStore.getOriginalFact({
+        threadId: record.threadId,
+        fingerprint: record.messageFingerprint,
+      });
+      const factSender = fact && typeof fact.senderAccountId === "string" ? fact.senderAccountId : "";
+      const factMessageId = fact && typeof fact.messageId === "string" ? fact.messageId : "";
+      if (!fact || factSender !== this.ownerAccountId || factMessageId !== record.messageId) {
+        this.logger.warn("[ServerMessagesService] commit-ack names no outbound fact of ours ("
+          + record.messageId + "); ignoring");
+        return true;
+      }
+    }
+
+    // Steps 2–5 — fail-closed acceptance (self-certifying recipient identity,
+    // deviceId self-cert, signature, verifyAccountAuthority with CURRENT
+    // revocation state). A direct-mode ack carries no revocable credential;
+    // a cert-mode ack requires an ESTABLISHED revocation source.
+    const runtimePeerLinks = this.bus.runtime && this.bus.runtime.peerLinks ? this.bus.runtime.peerLinks : null;
+    const cryptoProvider = runtimePeerLinks && runtimePeerLinks.cryptoProvider ? runtimePeerLinks.cryptoProvider : null;
+    if (!cryptoProvider) {
+      this.logger.warn("[ServerMessagesService] no cryptoProvider; commit ack for "
+        + record.messageId + " left unconsumed");
+      return true;
+    }
+    const chain = Array.isArray(record.recipientCertChain) && record.recipientCertChain.length > 0
+      ? record.recipientCertChain : null;
+    let revocationState = null;
+    if (chain) {
+      const source = await this.#peerRevocationStateFor(authedSender);
+      if (!source.ok) {
+        this.logger.warn("[ServerMessagesService] commit ack for " + record.messageId
+          + " left unconsumed: " + source.reason);
+        return true;
+      }
+      revocationState = source.revocationState;
+    }
+    const verdict = await verifyCommitAckForAcceptance({
+      ackJson: record.toJSON(),
+      cryptoProvider,
+      nowMs: this.#clock(),
+      revocationState,
+    });
+    if (!verdict.ok) {
+      this.logger.warn("[ServerMessagesService] rejected commit ack for " + record.messageId
+        + ": " + verdict.reason);
+      return true;
+    }
+
+    // Terminal success: consume the pending commit and make "delivered" the
+    // proof it now is (decision 3). Group rows never flip on a member ack
+    // (DT-004); the evidence above is their whole consumption.
+    const resolvedThreadId = pending ? pending.threadId : record.threadId;
+    if (pending) {
+      await this.#threadStore.deletePendingCommit({ messageId: record.messageId });
+      this.#scheduleCommitSweep();
+    }
+    const thread = await this.#threadStore.getThread(resolvedThreadId).catch(() => null);
+    if (thread && thread.threadType !== "group") {
+      const now = this.#clock();
+      await this.#threadStore.setMessageStatus({
+        threadId: resolvedThreadId,
+        messageId: record.messageId,
+        status: "delivered",
+        acceptedAtMs: now,
+      }).catch((err) => {
+        this.logger.error("[ServerMessagesService] commit-ack status persist failed", err && err.message ? err.message : err);
+        this._emit("app.error", { source: "ServerMessagesService", message: "commit-ack status persist failed", severity: "error", err });
+      });
+      this.#queuedMessages = this.#queuedMessages.filter((entry) => !(entry.threadId === resolvedThreadId && entry.messageId === record.messageId));
+      this.#ackPending.delete(record.messageId);
+      this.#discardQueueTracking(record.messageId);
+      this._emit("message.status", new MessageStatusEvent({
+        threadId: resolvedThreadId,
+        messageId: record.messageId,
+        status: "delivered",
+        acceptedAtMs: this.#clock(),
+      }));
+    }
+    return true;
+  }
+
+  /**
+   * Sweep the durable pending-commit rows: every row whose nextRetryAtMs has
+   * passed is retried (invalidate DeviceSet → re-resolve fresh → re-fan-out
+   * the EXACT same OriginalMessage — same messageId, same fingerprint, cached
+   * ciphertexts replayed so no device ratchet ever advances twice). Triggered
+   * by boot, reconnect, the advisory timer, and the on-demand directive;
+   * `force` retries every row regardless of schedule (tests/diagnostics).
+   */
+  async sweepPendingCommits({ force = false } = {}) {
+    if (this.#commitSweepRunning) return { swept: 0, pending: -1, busy: true };
+    this.#commitSweepRunning = true;
+    try {
+      const rows = await this.#threadStore.listPendingCommits();
+      const now = this.#clock();
+      let swept = 0;
+      for (const row of rows) {
+        // A non-finite schedule stamp means "due now" — `now >= NaN` is
+        // false, and treating it as not-due would stall the row forever
+        // (the frozen NaN fail-open lesson).
+        const dueAt = Number.isFinite(row.nextRetryAtMs) ? row.nextRetryAtMs : 0;
+        if (force !== true && now < dueAt) continue;
+        try {
+          await this.#retryPendingCommit(row);
+          swept += 1;
+        } catch (err) {
+          this.logger.error("[ServerMessagesService] pending-commit retry failed for " + row.messageId,
+            err && err.message ? err.message : err);
+        }
+      }
+      return { swept, pending: rows.length };
+    } finally {
+      this.#commitSweepRunning = false;
+      this.#scheduleCommitSweep();
+    }
+  }
+
+  async #openPendingCommit({ threadId, messageId, fingerprint, now } = {}) {
+    try {
+      const thread = await this.#threadStore.getThread(threadId);
+      const recipientAccountId = thread && thread.threadType !== "group"
+        && typeof thread.peerAccountId === "string" ? thread.peerAccountId.trim() : "";
+      if (!recipientAccountId) return;
+      await this.#threadStore.putPendingCommit({
+        messageId,
+        threadId,
+        fingerprint,
+        recipientAccountId,
+        firstSentAtMs: now,
+        attempts: 0,
+        nextRetryAtMs: now + this.#commitRetryDelayMs(0),
+      });
+      this.#scheduleCommitSweep();
+    } catch (err) {
+      // The send already happened; a tracking fault must be loud, never fatal.
+      this.logger.error("[ServerMessagesService] pending-commit open failed for " + messageId,
+        err && err.message ? err.message : err);
+      this._emit("app.error", { source: "ServerMessagesService", message: "pending-commit open failed", severity: "error", err });
+    }
+  }
+
+  async #retryPendingCommit(row) {
+    const fact = await this.#threadStore.getOriginalFact({ threadId: row.threadId, fingerprint: row.fingerprint });
+    if (!fact || !fact.payload || typeof fact.payload !== "object") {
+      // A claim whose immutable fact vanished is unrepairable — drop VISIBLY,
+      // never stall silently.
+      this.logger.error("[ServerMessagesService] pending commit " + row.messageId
+        + " has no originals-log fact; dropping the row");
+      await this.#threadStore.deletePendingCommit({ messageId: row.messageId });
+      return;
+    }
+    const now = this.#clock();
+    const attempts = (Number.isInteger(row.attempts) && row.attempts >= 0 ? row.attempts : 0) + 1;
+    // Persist the schedule step BEFORE dispatching so a crash mid-attempt
+    // backs off on resume instead of hot-looping the same row.
+    await this.#threadStore.putPendingCommit({
+      messageId: row.messageId,
+      threadId: row.threadId,
+      fingerprint: row.fingerprint,
+      recipientAccountId: row.recipientAccountId,
+      firstSentAtMs: row.firstSentAtMs,
+      attempts,
+      lastAttemptAtMs: now,
+      nextRetryAtMs: now + this.#commitRetryDelayMs(attempts),
+    });
+    // Stale-DeviceSet repair (plan §3): drop the cached recipient set so the
+    // deliver path re-resolves fresh; newly-enrolled devices get fresh seals,
+    // already-delivered devices replay from the durable fan-out cache.
+    if (this.bus.functions && this.bus.functions["device-set"]) {
+      try {
+        await this._call("device-set", "invalidate", { peerAccountId: row.recipientAccountId });
+      } catch (err) {
+        this.logger.warn("[ServerMessagesService] device-set invalidate failed for " + row.recipientAccountId,
+          err && err.message ? err.message : err);
+      }
+    }
+    const plaintextBodyBytes = new TextEncoder().encode(JSON.stringify(fact.payload));
+    try {
+      await this.#deliverToThread({
+        threadId: row.threadId,
+        plaintextBodyBytes,
+        sdk: this.bus.runtime ? this.bus.runtime.sdk : null,
+        eventTag: row.messageId,
+        now,
+      });
+    } catch (err) {
+      // The row already carries its next schedule step; a failed attempt just
+      // waits for it.
+      this.logger.warn("[ServerMessagesService] pending-commit re-fan-out failed for " + row.messageId,
+        err && err.message ? err.message : err);
+    }
+  }
+
+  #commitRetryDelayMs(attempts) {
+    const n = Number.isInteger(attempts) && attempts >= 0 ? attempts : 0;
+    const base = n < COMMIT_RETRY_SCHEDULE_MS.length ? COMMIT_RETRY_SCHEDULE_MS[n] : COMMIT_RETRY_SLOW_TAIL_MS;
+    return base + Math.floor(base * COMMIT_RETRY_JITTER_FRAC * Math.random());
+  }
+
+  // Re-arm the ADVISORY timer from the durable rows (never the other way
+  // around). Fire-and-forget by design; scheduling faults are logged.
+  #scheduleCommitSweep() {
+    const run = async () => {
+      if (this.#commitSweepStopped) return;
+      const rows = await this.#threadStore.listPendingCommits();
+      if (this.#commitSweepTimer) {
+        clearTimeout(this.#commitSweepTimer);
+        this.#commitSweepTimer = null;
+      }
+      if (this.#commitSweepStopped || rows.length === 0) return;
+      const now = this.#clock();
+      let earliest = Infinity;
+      for (const row of rows) {
+        const at = Number.isFinite(row.nextRetryAtMs) ? row.nextRetryAtMs : now;
+        if (at < earliest) earliest = at;
+      }
+      const delay = Math.max(earliest - now, 1000);
+      this.#commitSweepTimer = setTimeout(() => {
+        this.#commitSweepTimer = null;
+        this.sweepPendingCommits({}).catch((err) => {
+          this.logger.error("[ServerMessagesService] scheduled pending-commit sweep failed",
+            err && err.message ? err.message : err);
+        });
+      }, delay);
+    };
+    run().catch((err) => {
+      this.logger.error("[ServerMessagesService] pending-commit sweep scheduling failed",
+        err && err.message ? err.message : err);
+    });
+  }
+
+  // The canonical peer revocation source availability wrapper (the AE-2
+  // pattern): {ok:false} = COULD NOT ESTABLISH — the caller must defer, never
+  // assume-allowed; {ok:true, revocationState:null} = established, nothing
+  // revoked (a real answer). The source itself is ServerAccountMutationService
+  // (SSOT); a disabled service answers null indistinguishably from
+  // "no revocations", so availability is checked BEFORE asking.
+  async #peerRevocationStateFor(peerAccountId) {
+    const accountMutation = this.bus.services && this.bus.services.accountMutation
+      ? this.bus.services.accountMutation : null;
+    if (!accountMutation
+        || typeof accountMutation.isEnabled !== "function"
+        || typeof accountMutation.getPeerRevocationState !== "function"
+        || !accountMutation.isEnabled()) {
+      return { ok: false, reason: "peer revocation source unavailable" };
+    }
+    try {
+      const revocationState = await accountMutation.getPeerRevocationState({ peerAccountId });
+      return { ok: true, revocationState };
+    } catch (err) {
+      return { ok: false, reason: "peer revocation fetch failed: " + (err && err.message ? err.message : "unknown") };
     }
   }
 

@@ -201,6 +201,9 @@ export async function startRezChat(options = {}) {
         nodeDataDir: config.node.storage.dataDir,
         wsUrl,
         expectedNodePublicKeyB64,
+        // F8.1: this launcher KNOWS its topology — it booted its own local fs
+        // sidecar — so the primary path opts into the claimant session model.
+        sessionMode: resolveSessionMode({ delegatedShape }),
         expectedChatServerIdentity: chatServerIdentity,
         // S2.5: this device's key (C) for per-device E2EE. Optional — a vault
         // predating device-key persistence yields null and the chat server runs
@@ -260,6 +263,40 @@ export async function startRezChat(options = {}) {
 
 export async function start() {
   return startRezChat();
+}
+
+/**
+ * F8.1 (plans/F8_REZCHAT_ROLE_SPLIT_PLAN.md): which session model this
+ * launcher runs. The rule is TOPOLOGY KNOWLEDGE, not preference:
+ *
+ *   own local fs sidecar (the wsUrl this launcher built from the node it
+ *   itself booted)                          → "claimant"  (known-compatible)
+ *   CHAT_WS_URL / HOST_NODE_WS_PORT set
+ *   (an external node this launcher did
+ *   not boot — topology unknown)            → "account-legacy"
+ *   delegated identity (the hosted-coupled
+ *   device-link flow)                        → "account-legacy"
+ *   CHAT_SESSION_MODE env                    → explicit override, wins
+ *
+ * Misconfiguration fails CLOSED: a claimant session against a durable shared
+ * home is refused by the F9 guard with an explicit error — it never falls
+ * back to disclosing account identity.
+ */
+export function resolveSessionMode({ delegatedShape = false } = {}) {
+  const override = String(process.env.CHAT_SESSION_MODE || "").trim();
+  if (override) {
+    if (override !== "claimant" && override !== "account-legacy") {
+      throw new Error("CHAT_SESSION_MODE must be \"claimant\" or \"account-legacy\", got: " + override);
+    }
+    return override;
+  }
+  if (process.env.CHAT_WS_URL || process.env.HOST_NODE_WS_PORT) {
+    return "account-legacy";
+  }
+  if (delegatedShape === true) {
+    return "account-legacy";
+  }
+  return "claimant";
 }
 
 function buildWsUrl(config) {

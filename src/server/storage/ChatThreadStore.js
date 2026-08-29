@@ -4,6 +4,7 @@ import { coerceRow } from "../../records/domain/coerce.js";
 import { ChatMessage, MESSAGE_STATUSES, coerceReactions } from "../../records/domain/ChatMessage.js";
 import { ChatThread, THREAD_TYPES, coerceThreadType } from "../../records/domain/ChatThread.js";
 import { PENDING_MUTATION_KINDS, PendingMutation } from "../../records/domain/PendingMutation.js";
+import { MESSAGE_KIND } from "../../records/payloads/ChatMessagePayloadV1.js";
 
 // Re-export THREAD_TYPES for legacy importers (server services, tests).
 // New code should import directly from records/domain/ChatThread.js.
@@ -13,6 +14,16 @@ const THREAD_PREFIX = "app:threads/";
 const MESSAGE_PREFIX = "app:messages/";
 const IDEMPOTENCY_PREFIX = "app:idempotency/";
 const PENDING_MUTATIONS_PREFIX = "app:pending_mutations/";
+// AE-1 immutable OriginalMessage fact log (fingerprint-keyed, append-only)
+// plus its base-kind (senderAccountId, messageId) → fingerprints index.
+const ORIGINALS_PREFIX = "app:originals/";
+const ORIGINALS_INDEX_PREFIX = "app:originals_index/";
+// MessageCommitAck (plans/MESSAGE_COMMIT_ACK_PLAN.md §3, decision 4): the
+// DURABLE pending-commit rows for signed 1:1 sends — retry eligibility
+// derives from these rows + now, never from an in-memory timer, so a sender
+// restart resumes the loop deterministically. Cleared only by a VERIFIED
+// commit ack for the row's exact fingerprint.
+const COMMIT_PENDING_PREFIX = "app:commit_pending/";
 const MAX_MESSAGES_PER_THREAD = 500;
 const MAX_PENDING_MUTATIONS_PER_TARGET = 64;
 const PENDING_MUTATION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -166,6 +177,18 @@ export class ThreadStoreService {
 
   _kPendingMutations(targetMessageId) {
     return `${this._ownerPrefix(PENDING_MUTATIONS_PREFIX)}${targetMessageId}`;
+  }
+
+  _kOriginalFact(threadId, fingerprint) {
+    return `${this._ownerPrefix(ORIGINALS_PREFIX)}${threadId}/${fingerprint}`;
+  }
+
+  _kOriginalsIndex(threadId) {
+    return `${this._ownerPrefix(ORIGINALS_INDEX_PREFIX)}${threadId}`;
+  }
+
+  _kCommitPending(messageId) {
+    return `${this._ownerPrefix(COMMIT_PENDING_PREFIX)}${messageId}`;
   }
 
   _withThreadLock(threadId, operation) {
@@ -582,6 +605,30 @@ export class ThreadStoreService {
         // Genuine idempotent re-delivery: same authenticated sender (or we have no
         // sender identity to distinguish by) → collapse, as before.
         if (!incomingSender || !existingSender || existingSender === incomingSender) {
+          // AE-1 (frozen conflict semantic, plan §5): when BOTH rows are SIGNED
+          // facts from the same sender and their fingerprints differ, this is
+          // an integrity conflict — never a silent collapse. Both facts are
+          // retained in the originals log (the caller appends before this
+          // upsert); the projection row is flagged `conflicted`, and NO winner
+          // is chosen — the first-stored row stays displayed only as the
+          // carrier of the flag, not as the canonical content. Unsigned rows
+          // (either side) keep the pre-AE-1 collapse: no fingerprint exists to
+          // distinguish by.
+          const incomingHash = payload && typeof payload === "object" ? nonEmpty(payload.contentHash) : "";
+          const existingHash = existing.payload && typeof existing.payload === "object"
+            ? nonEmpty(existing.payload.contentHash)
+            : "";
+          if (incomingHash && existingHash && incomingHash !== existingHash
+              && incomingSender && existingSender === incomingSender) {
+            const flagged = coerceMessageRow({ ...existing, conflicted: true }, now);
+            const at = existingMessages.findIndex((row) => row.messageId === existing.messageId);
+            existingMessages[at] = flagged;
+            await this.kv.set(this._kMessages(id), existingMessages.slice(0, MAX_MESSAGES_PER_THREAD));
+            if (existing.senderKey && existing.messageId) {
+              await this.kv.set(this._kIdempotency(id, existing.senderKey, existing.messageId), flagged);
+            }
+            return { inserted: false, message: flagged, mutated: false, conflict: true };
+          }
           return { inserted: false, message: existing, mutated: false };
         }
         // TRUST-1: messageId is attacker-choosable, so one account must NEVER be
@@ -621,6 +668,233 @@ export class ThreadStoreService {
       // message.updated on top of message.deposited — otherwise those mutations
       // are persisted but never reach the renderer until a refetch.
       return { inserted: true, message: drained || stored, mutated: Boolean(drained) };
+    });
+  }
+
+  /**
+   * AE-1: append one OriginalMessage fact to the immutable per-thread log.
+   * Fingerprint-keyed and idempotent — re-appending an existing fingerprint
+   * is a no-op. For base messages the (senderAccountId, messageId) index is
+   * maintained; a second DIFFERENT fingerprint under one identity is the
+   * frozen integrity conflict — both facts stay, `conflict` reports it, and
+   * no winner is ever chosen.
+   * @param {{threadId:string, fact:{fingerprint:string, payload:object, receivedAtMs?:number, origin?:string}}} args
+   * @returns {Promise<{appended:boolean, conflict:{senderAccountId,messageId,fingerprints:string[]}|null, fact:object}>}
+   */
+  async appendOriginalFact({ threadId, fact } = {}) {
+    const id = nonEmpty(threadId);
+    const f = fact && typeof fact === "object" ? fact : null;
+    const fingerprint = f ? nonEmpty(f.fingerprint) : "";
+    const payload = f && f.payload && typeof f.payload === "object" ? f.payload : null;
+    if (!id || !fingerprint || !payload) {
+      throw new Error("ThreadStoreService.appendOriginalFact requires threadId, fact.fingerprint, fact.payload");
+    }
+    const kind = nonEmpty(payload.kind);
+    const senderAccountId = nonEmpty(payload.senderAccountId);
+    if (!kind || !senderAccountId) {
+      throw new Error("ThreadStoreService.appendOriginalFact requires payload.kind and payload.senderAccountId");
+    }
+    return this._withThreadLock(id, async () => {
+      const key = this._kOriginalFact(id, fingerprint);
+      const existing = await this.kv.get(key);
+      if (existing && typeof existing === "object") {
+        return { appended: false, conflict: null, fact: existing };
+      }
+      const now = asInt(this.clock(), Date.now());
+      const row = {
+        fingerprint,
+        kind,
+        threadId: id,
+        senderAccountId,
+        messageId: nonEmpty(payload.messageId) || null,
+        targetMessageId: nonEmpty(payload.targetMessageId) || null,
+        targetFingerprint: nonEmpty(payload.targetFingerprint) || null,
+        receivedAtMs: asInt(f.receivedAtMs, now),
+        origin: nonEmpty(f.origin) || "live",
+        payload,
+      };
+      await this.kv.set(key, row);
+      let conflict = null;
+      if (kind === MESSAGE_KIND && row.messageId) {
+        const indexKey = this._kOriginalsIndex(id);
+        const rawIndex = await this.kv.get(indexKey);
+        const index = rawIndex && typeof rawIndex === "object"
+          && rawIndex.byMessage && typeof rawIndex.byMessage === "object"
+          ? rawIndex
+          : { byMessage: {} };
+        // The \u0000 separator makes the composite key structurally distinct
+        // from any bare payload-controlled string (no __proto__ collisions).
+        const identityKey = senderAccountId + "\u0000" + row.messageId;
+        const entryRaw = index.byMessage[identityKey];
+        const entry = entryRaw && typeof entryRaw === "object" && Array.isArray(entryRaw.fingerprints)
+          ? { fingerprints: entryRaw.fingerprints.slice(), conflicted: entryRaw.conflicted === true }
+          : { fingerprints: [], conflicted: false };
+        if (!entry.fingerprints.includes(fingerprint)) entry.fingerprints.push(fingerprint);
+        if (entry.fingerprints.length > 1) {
+          entry.conflicted = true;
+          conflict = { senderAccountId, messageId: row.messageId, fingerprints: entry.fingerprints.slice() };
+        }
+        index.byMessage[identityKey] = entry;
+        await this.kv.set(indexKey, index);
+      }
+      return { appended: true, conflict, fact: row };
+    });
+  }
+
+  /** AE-1: load one fact by fingerprint (null when absent). */
+  async getOriginalFact({ threadId, fingerprint } = {}) {
+    const id = nonEmpty(threadId);
+    const fp = nonEmpty(fingerprint);
+    if (!id || !fp) return null;
+    const row = await this.kv.get(this._kOriginalFact(id, fp));
+    return row && typeof row === "object" ? row : null;
+  }
+
+  /**
+   * AE-1: every fact fingerprint in a thread, sorted — the digest/inventory
+   * seam AE-2's convergence loop reads.
+   */
+  async listOriginalFingerprints({ threadId } = {}) {
+    const id = nonEmpty(threadId);
+    if (!id) return [];
+    const prefix = this._kOriginalFact(id, "");
+    const keys = await this.kv.keys(prefix);
+    return keys
+      .map((key) => key.slice(prefix.length))
+      .filter((fp) => fp.length > 0)
+      .sort();
+  }
+
+  /**
+   * AE-1: base-kind facts recorded under a messageId (optionally narrowed to
+   * one sender) — the sender-side `targetFingerprint` resolution for
+   * mutations, and the conflict-inspection read. More than one fact for a
+   * single (sender, messageId) identity = the frozen integrity conflict.
+   */
+  async findBaseFactsByMessageId({ threadId, messageId, senderAccountId = null } = {}) {
+    const id = nonEmpty(threadId);
+    const mid = nonEmpty(messageId);
+    if (!id || !mid) return [];
+    const rawIndex = await this.kv.get(this._kOriginalsIndex(id));
+    const byMessage = rawIndex && typeof rawIndex === "object"
+      && rawIndex.byMessage && typeof rawIndex.byMessage === "object"
+      ? rawIndex.byMessage
+      : {};
+    const wantedSender = nonEmpty(senderAccountId);
+    const fingerprints = [];
+    for (const identityKey of Object.keys(byMessage)) {
+      const sep = identityKey.indexOf("\u0000");
+      if (sep < 0) continue;
+      const sender = identityKey.slice(0, sep);
+      const keyMid = identityKey.slice(sep + 1);
+      if (keyMid !== mid) continue;
+      if (wantedSender && sender !== wantedSender) continue;
+      const entry = byMessage[identityKey];
+      if (entry && Array.isArray(entry.fingerprints)) {
+        for (const fp of entry.fingerprints) {
+          if (typeof fp === "string" && fp.length > 0 && !fingerprints.includes(fp)) fingerprints.push(fp);
+        }
+      }
+    }
+    const facts = [];
+    for (const fp of fingerprints) {
+      const row = await this.kv.get(this._kOriginalFact(id, fp));
+      if (row && typeof row === "object") facts.push(row);
+    }
+    return facts;
+  }
+
+  /**
+   * MessageCommitAck: create/replace the durable pending-commit row for one
+   * signed outbound message. Keyed by messageId (one outstanding claim per
+   * outbound message); the fingerprint is the claim the eventual ack must
+   * match. Throws on missing identity fields — a pending row that cannot
+   * name what it is waiting for is unrepairable.
+   */
+  async putPendingCommit({
+    messageId,
+    threadId,
+    fingerprint,
+    recipientAccountId,
+    firstSentAtMs,
+    attempts = 0,
+    nextRetryAtMs,
+    lastAttemptAtMs = null,
+  } = {}) {
+    const mid = nonEmpty(messageId);
+    const id = nonEmpty(threadId);
+    const fp = nonEmpty(fingerprint);
+    const recipient = nonEmpty(recipientAccountId);
+    if (!mid || !id || !fp || !recipient) {
+      throw new Error("ThreadStoreService.putPendingCommit requires messageId, threadId, fingerprint, recipientAccountId");
+    }
+    const now = asInt(this.clock(), Date.now());
+    const row = {
+      messageId: mid,
+      threadId: id,
+      fingerprint: fp,
+      recipientAccountId: recipient,
+      firstSentAtMs: asInt(firstSentAtMs, now),
+      attempts: Number.isInteger(attempts) && attempts >= 0 ? attempts : 0,
+      nextRetryAtMs: asInt(nextRetryAtMs, now),
+      lastAttemptAtMs: Number.isInteger(lastAttemptAtMs) ? lastAttemptAtMs : null,
+    };
+    await this.kv.set(this._kCommitPending(mid), row);
+    return row;
+  }
+
+  /** MessageCommitAck: the pending-commit row for a messageId (null when none). */
+  async getPendingCommit({ messageId } = {}) {
+    const mid = nonEmpty(messageId);
+    if (!mid) return null;
+    const row = await this.kv.get(this._kCommitPending(mid));
+    return row && typeof row === "object" ? row : null;
+  }
+
+  /** MessageCommitAck: terminal consume (verified proof) or explicit drop. */
+  async deletePendingCommit({ messageId } = {}) {
+    const mid = nonEmpty(messageId);
+    if (!mid) return false;
+    await this.kv.delete(this._kCommitPending(mid));
+    return true;
+  }
+
+  /** MessageCommitAck: every outstanding pending-commit row (the sweep's input). */
+  async listPendingCommits() {
+    const prefix = this._ownerPrefix(COMMIT_PENDING_PREFIX);
+    const keys = await this.kv.keys(prefix);
+    const rows = [];
+    for (const key of keys) {
+      const row = await this.kv.get(key);
+      if (row && typeof row === "object" && nonEmpty(row.messageId)) rows.push(row);
+    }
+    return rows;
+  }
+
+  /**
+   * AE-1: flag the projection row for a message whose identity is in
+   * integrity conflict. The originals log holds the truth (both facts);
+   * this only surfaces it. Returns the updated row, or null when no
+   * projection row exists (e.g. rotated out by the per-thread cap).
+   */
+  async markMessageConflicted({ threadId, messageId } = {}) {
+    const id = nonEmpty(threadId);
+    const mid = nonEmpty(messageId);
+    if (!id || !mid) return null;
+    return this._withThreadLock(id, async () => {
+      const messages = await this._loadMessages(id);
+      const at = messages.findIndex((row) => row.messageId === mid);
+      if (at < 0) return null;
+      const current = messages[at];
+      if (current.conflicted === true) return current;
+      const now = asInt(this.clock(), Date.now());
+      const updated = coerceMessageRow({ ...current, conflicted: true }, now);
+      messages[at] = updated;
+      await this.kv.set(this._kMessages(id), messages.slice(0, MAX_MESSAGES_PER_THREAD));
+      if (current.senderKey && current.messageId) {
+        await this.kv.set(this._kIdempotency(id, current.senderKey, current.messageId), updated);
+      }
+      return updated;
     });
   }
 

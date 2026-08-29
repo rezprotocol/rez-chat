@@ -111,8 +111,16 @@ test("a delegated identity boots a cert-mode chat server: C claims, C binds, C s
   // PeerLinkService constructed in cert-mode.
   assert.equal(bootstrapped.peerLinkService.hasAdminRoot, false);
 
-  // The inbox claimant is the DEVICE key C, not the account identity.
-  assert.equal(bootstrapped.inboxClaimant.claimantPublicKeyB64, d.deviceKey.deviceKeyPair.publicKeyB64);
+  // F8 (plans/F8_REZCHAT_ROLE_SPLIT_PLAN.md): the inbox claimant is a FRESH
+  // RANDOM key — it is neither the device key C nor the account identity B.
+  // The pre-F8 contract asserted claimant === C, which was the session/claim
+  // role conflation F8 removed; the node routes deliveries by whatever
+  // claimant key the claim presents (CAPABILITY_MODEL §8), so nothing needs
+  // the old symmetry.
+  assert.notEqual(bootstrapped.inboxClaimant.claimantPublicKeyB64, d.deviceKey.deviceKeyPair.publicKeyB64,
+    "claimant is not the device key");
+  assert.notEqual(bootstrapped.inboxClaimant.claimantPublicKeyB64, d.chatServerIdentity.publicKeyB64,
+    "claimant is not the account/chat-server identity");
 
   // The account-key authority signer THROWS — any residual account-sign
   // consumer fails loud instead of missigning.

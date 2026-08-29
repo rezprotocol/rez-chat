@@ -92,6 +92,10 @@ export class ChatMessage extends RRecord {
     this.editedAtMs = raw.editedAtMs == null ? null : toFiniteNumber(raw.editedAtMs, 0);
     this.tombstonedAtMs = raw.tombstonedAtMs == null ? null : toFiniteNumber(raw.tombstonedAtMs, 0);
     this.reactions = coerceReactions(raw.reactions);
+    // AE-1 integrity-conflict marker: the same sender signed two DIFFERENT
+    // facts under this messageId. Both facts live in the originals log; the
+    // projection surfaces the conflict and never picks a winner.
+    this.conflicted = raw.conflicted === true;
 
     this._seal();
   }

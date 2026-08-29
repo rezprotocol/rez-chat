@@ -43,6 +43,19 @@ export const ACCOUNT_STATE_EVENT_KIND = "rez.account.state.v1";
 export const ACCOUNT_STATE_OPS = Object.freeze([
   "contact.upsert",
   "contact.remove",
+  // Device activation (plans/DEVICE_ACTIVATION_PLAN.md). Same channel, same
+  // sealing, same lamport ordering domain as the state they close:
+  //   activation.baselineComplete → { activationId, horizonLamport } — the
+  //     approver/sibling's attestation that the full relationship baseline
+  //     for THIS activation attempt (activationId = the ceremony's leaf
+  //     certId) has been sent; every event from this origin at ≤
+  //     horizonLamport is the baseline. Valid only when bound to the
+  //     activation the receiving device is actually running.
+  //   activation.baselineRequest → { activationId } — a BOOTSTRAPPING
+  //     device's liveness re-request (stall recovery). NEVER a completeness
+  //     substitute: only a valid marker produces READY.
+  "activation.baselineComplete",
+  "activation.baselineRequest",
 ]);
 
 // The op-tagged payload's required string fields. Keeps the record honest without
@@ -51,6 +64,8 @@ export const ACCOUNT_STATE_OPS = Object.freeze([
 const OP_REQUIRED_FIELDS = Object.freeze({
   "contact.upsert": ["accountId", "relationshipState"],
   "contact.remove": ["accountId"],
+  "activation.baselineComplete": ["activationId"],
+  "activation.baselineRequest": ["activationId"],
 });
 
 const MAX_PAYLOAD_JSON_BYTES = 4096;

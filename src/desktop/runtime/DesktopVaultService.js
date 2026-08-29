@@ -369,9 +369,10 @@ export class DesktopVaultService {
           deviceKeyPair,
           certChain: bundle.certChain,
           cachedDeviceSet: bundle.cachedDeviceSet === undefined ? null : bundle.cachedDeviceSet,
-          // P1#2 L3.5: persist the device-link ceremony's pre-registered home inbox so the
-          // delegated device claims exactly it on boot (the keystore validates canonicality).
-          inboxId: inboxId === undefined ? null : inboxId,
+          // P1#2 L3.5 / R3: persist the device-link ceremony's pre-registered home inbox —
+          // the envelope's bootstrapInboxId — so the delegated device claims exactly it on
+          // boot (the keystore validates canonicality).
+          bootstrapInboxId: inboxId === undefined ? null : inboxId,
         },
       });
       const envelope = await keystoreStore.getKeystoreEnvelope();
@@ -447,9 +448,11 @@ export class DesktopVaultService {
         hasAdminRoot: false,
         certChain: cloneJson(unlocked.certChain),
         accountIdentityDhKeyPair: cloneJson(unlocked.accountIdentityDhKeyPair),
-        // P1#2 L3.5: the device-link ceremony's pre-registered home inbox (null for a legacy
-        // delegated keystore) — bootstrap claims exactly this inbox instead of minting one.
-        inboxId: unlocked.inboxId === undefined ? null : unlocked.inboxId,
+        // P1#2 L3.5 / R3: the device-link ceremony's pre-registered home inbox (null for a
+        // legacy delegated keystore). The envelope names it bootstrapInboxId; on DESKTOP it
+        // IS the runtime inbox (legacy role — no portable phase in this topology), so it maps
+        // onto the vault identity's `inboxId` and bootstrap claims exactly it.
+        inboxId: unlocked.bootstrapInboxId === undefined ? null : unlocked.bootstrapInboxId,
       };
       this.#pendingChatServerIdentity = null;
     } else if (this.#pendingChatServerIdentity && this.#pendingChatServerIdentity.accountId) {
@@ -721,7 +724,16 @@ export class DesktopVaultService {
       publicKeyB64: ident.publicKeyB64,
       privateKeyB64: delegated ? null : ident.privateKeyB64,
       hasAdminRoot: delegated ? false : true,
-      ...(delegated ? { certChain: cloneJson(ident.certChain) } : {}),
+      // P1#2 L3.5 / P1.3-pre: the ceremony's pre-registered home inbox rides
+      // with the delegated identity — bootstrapChatServer reads exactly this
+      // field so InboxClaimant claims the REGISTERED inbox instead of minting
+      // a fresh one. unlock() has always carried it on the active account;
+      // omitting it here silently severed the enrollment→boot handoff (and
+      // with it, activation-baseline delivery to the bootstrap inbox).
+      ...(delegated ? {
+        certChain: cloneJson(ident.certChain),
+        inboxId: ident.inboxId === undefined ? null : ident.inboxId,
+      } : {}),
       // Account identity-DH key (X25519), shared across all of the account's
       // devices — threaded into PeerLinkService for the device-set peer-scoped
       // seal (Audit P1). Seed-derived or compatibility-preserved on a primary,

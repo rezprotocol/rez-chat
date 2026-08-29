@@ -18,5 +18,15 @@ export class ChatMessageEditPayloadV1 extends WirePayloadRecord {
     newText: { type: "string", trim: false, maxLength: MAX_TEXT_LENGTH },
     senderAccountId: { type: "string", required: true, trim: true },
     editedAtMs: { type: "int", required: true },
+    // AE-1: the authoritative mutation edge — the fingerprint of the target
+    // OriginalMessage (targetMessageId stays for indexing/debug only).
+    targetFingerprint: { type: "string", trim: true },
+    // AE-1 signed OriginalMessage fields (rules in originalMessageShapes.js).
+    signerPublicKeyB64: { type: "string", trim: true },
+    senderDeviceId: { type: "string", trim: true },
+    senderAuthorityEpoch: { type: "int", nullable: true },
+    senderCertChain: { type: "array" },
+    contentHash: { type: "string", trim: true },
+    sig: { type: "string", trim: true },
   };
 }

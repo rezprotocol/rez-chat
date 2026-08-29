@@ -34,15 +34,21 @@ const MAX_STALE_RETRIES = 3;
 export class ServerAccountMutationService extends BaseServerService {
   #clock;
   #authorityStateCache; // peerAccountId -> { revocationState, epoch, fetchedAtMs }
+  #ownAuthorityCache; // { state, fetchedAtMs } | null — the OWN account's verified authority state
   #opCounter;
 
   constructor({ bus, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
     this.#authorityStateCache = new Map();
+    this.#ownAuthorityCache = null;
     this.#opCounter = 0;
     this._register("account-mutation", "submit", (payload) => this.submitMutation(payload || {}));
     this._register("account-mutation", "peerRevocationState", (payload) => this.getPeerRevocationState(payload || {}));
+    // M4: the claimant-clean reader of the OWN account's published authority
+    // state — the data-plane revocation source sibling transmission composes
+    // with the device roster (plan §7b security rule).
+    this._register("account-mutation", "ownAuthorityState", (payload) => this.getOwnAuthorityState(payload || {}));
   }
 
   #sdk() {
@@ -62,12 +68,73 @@ export class ServerAccountMutationService extends BaseServerService {
   isEnabled() {
     const peerLinks = this.#peerLinks();
     const sdk = this.#sdk();
-    return Boolean(
-      peerLinks
-        && typeof peerLinks.buildDeviceSetRecordForPeer === "function"
-        && peerLinks.deviceId
-        && sdk && sdk.devices && sdk.identity,
-    );
+    if (!(peerLinks
+      && typeof peerLinks.buildDeviceSetRecordForPeer === "function"
+      && peerLinks.deviceId
+      && sdk)) {
+      return false;
+    }
+    // M4/F8: `sdk.devices` and `sdk.identity` are ACCOUNT-mode getters that
+    // THROW on a claimant client by design. The READER paths this gate also
+    // guards (peerRevocationState — AE-2 admission's revocation source) are
+    // pure data-plane and must stay available on a claimant runtime; only the
+    // mutation submit needs the account surface, and reaching for it there
+    // still fails loud (the F8 property, preserved, not worked around).
+    if (this.bus.runtime && this.bus.runtime.sessionMode === "claimant") return true;
+    return Boolean(sdk.devices && sdk.identity);
+  }
+
+  /**
+   * M4 (plan §7b security rule): the OWN account's current verified authority
+   * state, read entirely on the DATA plane — durable-record fetch off the
+   * claimant session + local verification against the account PUBLIC key. No
+   * account authority is expressed anywhere on this path.
+   *
+   * Established-vs-unavailable follows the AE-2 philosophy exactly:
+   *   - record fetched + verified          → { established: true, revocationState, epoch }
+   *   - NO record published (never any
+   *     revocations — the pre-S11 path)    → { established: true, revocationState: null, epoch: 0 }
+   *   - fetch/verify failed                → { established: false, reason } — the caller
+   *     DEFERS outbound sibling sync; stale revocations must never fail open.
+   * Bounded-staleness cached with the same TTL as the peer reader.
+   */
+  async getOwnAuthorityState({ forceRefresh = false } = {}) {
+    const peerLinks = this.#peerLinks();
+    const durableRecords = this.#durableRecords();
+    if (!peerLinks || typeof peerLinks.ownAuthorityStateCoordinates !== "function"
+      || typeof peerLinks.openOwnAuthorityStateRecord !== "function") {
+      return { established: false, reason: "peerLinks own-authority surface unavailable" };
+    }
+    if (!durableRecords) {
+      return { established: false, reason: "sdk.durableRecords unavailable" };
+    }
+    const existing = this.#ownAuthorityCache;
+    if (!forceRefresh && existing && (this.#clock() - existing.fetchedAtMs) < AUTHORITY_STATE_CACHE_TTL_MS) {
+      return existing.state;
+    }
+    let state;
+    try {
+      const coords = await peerLinks.ownAuthorityStateCoordinates();
+      const record = await durableRecords.get(coords);
+      if (!record) {
+        state = { established: true, revocationState: null, epoch: 0 };
+      } else {
+        const opened = await peerLinks.openOwnAuthorityStateRecord({ record, nowMs: this.#clock() });
+        state = { established: true, revocationState: this.#project(opened.revocationState), epoch: opened.epoch };
+      }
+    } catch (err) {
+      const reason = err && err.message ? err.message : String(err);
+      this.logger.error("[ServerAccountMutationService] own authority-state fetch/verify failed — sibling transmission must defer: " + reason);
+      // NOT cached: the next round retries rather than sitting on a failure.
+      return { established: false, reason };
+    }
+    this.#ownAuthorityCache = { state, fetchedAtMs: this.#clock() };
+    return state;
+  }
+
+  /** Drop the cached OWN authority state (e.g. after this runtime published a new epoch). */
+  invalidateOwnAuthorityState() {
+    this.#ownAuthorityCache = null;
   }
 
   #newOpId() {

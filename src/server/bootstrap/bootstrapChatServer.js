@@ -31,6 +31,12 @@ export async function bootstrapChatServer({
   allowChatServerIdentityRotation = false,
   allowLegacyAccountIdentityDhAdoption = false,
   onLegacyAccountIdentityDhAdopted = null,
+  // F8: which session model the chat server runs. The DEFAULT stays the
+  // shipped identity-bearing path — this bootstrap is shared by callers that
+  // cannot know the home topology, and the mode is a topology fact. The
+  // LAUNCHER opts into "claimant" where it KNOWS the target is its own local
+  // fs sidecar (src/index.js resolveSessionMode).
+  sessionMode = "account-legacy",
 } = {}) {
   if (typeof nodeDataDir !== "string" || nodeDataDir.trim().length === 0) {
     throw new Error("bootstrapChatServer requires nodeDataDir");
@@ -110,6 +116,7 @@ export async function bootstrapChatServer({
     ),
     allowLegacyAccountIdentityDhAdoption: hasAdminRoot && allowLegacyAccountIdentityDhAdoption === true,
     onLegacyAccountIdentityDhAdopted,
+    sessionMode,
     logger,
   });
   return { ...bootstrapped, identity };

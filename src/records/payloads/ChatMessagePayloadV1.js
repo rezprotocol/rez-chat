@@ -44,6 +44,15 @@ export class ChatMessagePayloadV1 extends WirePayloadRecord {
     text: { type: "string", trim: false, maxLength: MAX_TEXT_LENGTH },
     inReplyToMessageId: { type: "string", trim: true },
     channelId: { type: "string", trim: true, maxLength: 64 },
+    // AE-1 signed OriginalMessage fields (all-or-none envelope group — the
+    // rules and canonical signable bytes live in originalMessageShapes.js).
+    // Absent (empty/null) = legacy unsigned payload, byte-compatible.
+    signerPublicKeyB64: { type: "string", trim: true },
+    senderDeviceId: { type: "string", trim: true },
+    senderAuthorityEpoch: { type: "int", nullable: true },
+    senderCertChain: { type: "array" },
+    contentHash: { type: "string", trim: true },
+    sig: { type: "string", trim: true },
   };
 
   validate() {

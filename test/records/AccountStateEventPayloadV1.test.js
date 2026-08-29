@@ -65,5 +65,14 @@ test("rejects a non-rez:dev originDeviceId and a non-positive lamport", () => {
 });
 
 test("ACCOUNT_STATE_OPS is the exact op vocabulary", () => {
-  assert.deepEqual([...ACCOUNT_STATE_OPS], ["contact.upsert", "contact.remove"]);
+  // Device activation (plans/DEVICE_ACTIVATION_PLAN.md) added the two
+  // activation ops: the baseline-completion marker (bound to the activation
+  // transaction) and the liveness re-request. Same channel, same sealing,
+  // same lamport ordering domain — deliberately NOT a parallel record type.
+  assert.deepEqual([...ACCOUNT_STATE_OPS], [
+    "contact.upsert",
+    "contact.remove",
+    "activation.baselineComplete",
+    "activation.baselineRequest",
+  ]);
 });

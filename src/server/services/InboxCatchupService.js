@@ -16,6 +16,18 @@ const DEFAULT_MAX_DECRYPT_ATTEMPTS = 8;
 // seconds-to-minutes) yet bounded — measured from first-failure so genuine
 // recovery of an old offline message still gets the full window.
 const DEFAULT_MAX_QUARANTINE_AGE_MS = 30 * 60 * 1000;
+// M5 (plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md, approved ruling): the age bound
+// counts WALL-CLOCK time — which on a suspended phone elapses entirely while
+// the app is dead, so a deposit that first-failed just before suspension
+// would otherwise quarantine on its FIRST post-wake attempt with zero real
+// retries. Suspended time is not retry time: age may only quarantine a
+// deposit that has had at least this many real decode/apply opportunities.
+// 3 = enough genuine retries to prove poison, small enough that a flood
+// still quarantines fast (the attempt bound of 8 is untouched and still
+// catches independently). Internal constant, same no-negotiation stance as
+// the commit-retry schedule. Desktop change is nil in practice — a live
+// desktop accrues 3 attempts long before 30 minutes.
+const QUARANTINE_MIN_ATTEMPTS_FOR_AGE = 3;
 // REZ-11: a deposit that has failed to decrypt MANY times is almost certainly
 // poison being rescanned on every reconnect (O(buffer) crypto/IO per reconnect on
 // a flaky link). Once it crosses this attempt threshold, hold it under a short
@@ -95,6 +107,12 @@ export class InboxCatchupService extends BaseServerService {
     this.#draining = false;
     this.#pending = false;
     this.#offReconnect = null;
+    // M2 (plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md): pull is
+    // directive-addressable. A wake whose socket survived (or is a
+    // not-yet-detected zombie) can force a drain instead of waiting for the
+    // 30s interval — which does not fire while suspended. Same coalesced
+    // entry point as every other trigger.
+    this._register("inbox", "drain", () => this.requestDrain());
   }
 
   async start() {
@@ -121,7 +139,20 @@ export class InboxCatchupService extends BaseServerService {
       }, this.#periodicDrainMs);
       if (this.#periodicTimer && typeof this.#periodicTimer.unref === "function") this.#periodicTimer.unref();
     }
-    await this.requestDrain();
+    // M1 (offline-tolerant boot): a retryable failure here means the runtime
+    // has no usable session yet (the pool reported NOT_READY/UNREACHABLE
+    // during an offline boot). The drain is not lost — the reconnect hook
+    // registered above re-requests it the moment a session binds, and
+    // `inbox.caughtup` is only emitted by a drain that actually completed.
+    // Anything without the retryable flag is a real wiring error and still
+    // fails start.
+    try {
+      await this.requestDrain();
+    } catch (err) {
+      if (!(err && err.retryable === true)) throw err;
+      this.logger.warn("[InboxCatchupService] initial drain deferred until reconnect (offline): "
+        + (err && err.message ? err.message : err));
+    }
   }
 
   async stop() {
@@ -433,7 +464,10 @@ export class InboxCatchupService extends BaseServerService {
     }
     const ageMs = firstSeenAtMs > 0 ? (nowMs - firstSeenAtMs) : 0;
     const tooManyAttempts = attempts >= this.#maxDecryptAttempts;
-    const tooOld = firstSeenAtMs > 0 && ageMs >= this.#maxQuarantineAgeMs;
+    // M5: age may only quarantine after real attempts — suspended wall-clock
+    // is not retry time (see QUARANTINE_MIN_ATTEMPTS_FOR_AGE).
+    const tooOld = firstSeenAtMs > 0 && ageMs >= this.#maxQuarantineAgeMs
+      && attempts >= QUARANTINE_MIN_ATTEMPTS_FOR_AGE;
     if (tooManyAttempts || tooOld) {
       const reason = tooManyAttempts ? "attempts" : "age";
       this.logger.error(
@@ -481,6 +515,7 @@ export class InboxCatchupService extends BaseServerService {
       result = await this.#pipeline.retryApplyOutbox(mailboxId, {
         maxAttempts: this.#maxDecryptAttempts,
         maxAgeMs: this.#maxQuarantineAgeMs,
+        minAttemptsForAge: QUARANTINE_MIN_ATTEMPTS_FOR_AGE,
         nowMs: this.#clock(),
       });
     } catch (err) {
@@ -578,7 +613,10 @@ export class InboxCatchupService extends BaseServerService {
     }
     const ageMs = firstSeenAtMs > 0 ? (nowMs - firstSeenAtMs) : 0;
     const tooManyAttempts = attempts >= this.#maxDecryptAttempts;
-    const tooOld = firstSeenAtMs > 0 && ageMs >= this.#maxQuarantineAgeMs;
+    // M5: age may only quarantine after real attempts — suspended wall-clock
+    // is not retry time (see QUARANTINE_MIN_ATTEMPTS_FOR_AGE).
+    const tooOld = firstSeenAtMs > 0 && ageMs >= this.#maxQuarantineAgeMs
+      && attempts >= QUARANTINE_MIN_ATTEMPTS_FOR_AGE;
     if (tooManyAttempts || tooOld) {
       this.logger.error(
         "[InboxCatchupService] quarantining undecryptable deposit mailboxId=" + mailboxId

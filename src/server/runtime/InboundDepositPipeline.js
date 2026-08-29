@@ -386,7 +386,7 @@ export class InboundDepositPipeline {
     return run;
   }
 
-  async #retryApplyOutbox(mailboxId, { maxAttempts = 0, maxAgeMs = 0, nowMs = Date.now() } = {}) {
+  async #retryApplyOutbox(mailboxId, { maxAttempts = 0, maxAgeMs = 0, minAttemptsForAge = 0, nowMs = Date.now() } = {}) {
     const applied = [];
     const quarantined = [];
     if (!this.#outbox || typeof this.#outbox.listPending !== "function") {
@@ -415,7 +415,13 @@ export class InboundDepositPipeline {
           ? Math.max(0, nowMs - res.firstStagedAtMs)
           : 0;
         const overAttempts = Number.isFinite(maxAttempts) && maxAttempts > 0 && res.attempts >= maxAttempts;
-        const overAge = Number.isFinite(maxAgeMs) && maxAgeMs > 0 && ageMs >= maxAgeMs;
+        // M5 (mobile plan §7): the age bound counts wall-clock — which on a
+        // suspended device elapses with ZERO retries run. The attempts floor
+        // makes wall-clock alone unable to quarantine: an entry must have had
+        // real CPU opportunities before age may drop it.
+        const attemptsFloorMet = !(Number.isFinite(minAttemptsForAge) && minAttemptsForAge > 0)
+          || res.attempts >= minAttemptsForAge;
+        const overAge = Number.isFinite(maxAgeMs) && maxAgeMs > 0 && ageMs >= maxAgeMs && attemptsFloorMet;
         if (overAttempts || overAge) {
           // Poison apply: stop retrying forever. Drop from the outbox and report
           // it so the drain surfaces a visible System notice (no silent loss).

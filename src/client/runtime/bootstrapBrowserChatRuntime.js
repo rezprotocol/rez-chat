@@ -4,6 +4,7 @@ import {
   base64ToBytes,
 } from "@rezprotocol/sdk/client";
 import { bootstrapChatRuntime } from "../../server/bootstrap/bootstrapChatRuntime.js";
+import { mapUnlockedAccountToRuntimeIdentity } from "../../server/bootstrap/unlockedAccountIdentity.js";
 import { browserChatRuntimeDbName } from "./browserRuntimeStorage.js";
 
 export { browserChatRuntimeDbName } from "./browserRuntimeStorage.js";
@@ -15,25 +16,15 @@ export async function bootstrapBrowserChatRuntime({ account, uplinks, logger = c
   if (!Array.isArray(uplinks) || uplinks.length === 0) {
     throw new Error("bootstrapBrowserChatRuntime requires uplinks");
   }
-  const hasAdminRoot = account.hasAdminRoot !== false;
-  const identityKeyPair = account.identityKeyPair && typeof account.identityKeyPair === "object"
-    ? account.identityKeyPair
-    : null;
-  const deviceKeyPair = account.deviceKeyPair && typeof account.deviceKeyPair === "object"
-    ? account.deviceKeyPair
-    : null;
-  if (!deviceKeyPair || !deviceKeyPair.publicKeyB64 || !deviceKeyPair.privateKeyB64) {
-    throw new Error("bootstrapBrowserChatRuntime account is missing deviceKeyPair");
-  }
-  if (hasAdminRoot && (!identityKeyPair || !identityKeyPair.publicKeyB64 || !identityKeyPair.privateKeyB64)) {
-    throw new Error("bootstrapBrowserChatRuntime primary account is missing identityKeyPair");
-  }
-  const publicKeyB64 = hasAdminRoot
-    ? identityKeyPair.publicKeyB64
-    : String(account.identityPublicKey || "").trim();
+  // P1.3c SSOT: the unlock-result → runtime identity/deviceKey projection is
+  // shared with the mobile boot mapper. The browser topology boots the
+  // LEGACY inbox role (the delegated ceremony inbox IS its runtime primary),
+  // which is bootstrapChatRuntime's default — the mapping itself is
+  // role-free.
+  const { hasAdminRoot, identity, deviceKey } = mapUnlockedAccountToRuntimeIdentity(account);
   const storagePrivateKeyB64 = hasAdminRoot
-    ? identityKeyPair.privateKeyB64
-    : deviceKeyPair.privateKeyB64;
+    ? identity.privateKeyB64
+    : deviceKey.deviceKeyPair.privateKeyB64;
   const cryptoProvider = new BrowserCryptoProvider();
   const storageEncKey = await cryptoProvider.hkdfSha256(base64ToBytes(storagePrivateKeyB64), {
     salt: new TextEncoder().encode(
@@ -49,19 +40,8 @@ export async function bootstrapBrowserChatRuntime({ account, uplinks, logger = c
     cryptoProvider,
   });
   return bootstrapChatRuntime({
-    identity: {
-      accountId: String(account.accountId || "").trim(),
-      publicKeyB64,
-      privateKeyB64: hasAdminRoot ? identityKeyPair.privateKeyB64 : "",
-      hasAdminRoot,
-      accountIdentityDhKeyPair: account.accountIdentityDhKeyPair || null,
-      certChain: hasAdminRoot ? null : account.certChain,
-      inboxId: hasAdminRoot ? null : account.inboxId,
-    },
-    deviceKey: {
-      deviceId: String(account.deviceId || "").trim(),
-      deviceKeyPair,
-    },
+    identity,
+    deviceKey,
     storageProvider,
     cryptoProvider,
     uplinks,

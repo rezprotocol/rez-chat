@@ -53,6 +53,9 @@ test("a snapshot carries versions, counts and capabilities — never rows", asyn
   assert.deepEqual(snap.counts, { contacts: 3, groups: 1 });
   assert.deepEqual(snap.capabilities, {
     durableInbox: true, multiDeviceFanout: false, delegatedDevices: true,
+    // M4: the durable-state-derived flag reported alongside the per-session
+    // home capability (false here — no runtime.accountMultiDevice set).
+    accountMultiDevice: false,
   });
   // The rows themselves must never appear — only how many there were.
   assert.ok(!JSON.stringify(snap).includes("\"a\":1"));

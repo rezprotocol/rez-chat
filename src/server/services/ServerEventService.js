@@ -6,6 +6,11 @@ import {
 } from "../../records/index.js";
 import { getPayloadEntry } from "../../records/payloads/index.js";
 import { MESSAGE_KIND as CHAT_MESSAGE_KIND } from "../../records/payloads/ChatMessagePayloadV1.js";
+import {
+  isOriginalMessageKind,
+  originalMessageAuthPresence,
+  verifyOriginalMessageForAdmission,
+} from "../../records/payloads/originalMessageShapes.js";
 import { E2eeDeliveryAckV1, base64ToBytes } from "@rezprotocol/sdk/client";
 import { BaseServerService } from "../base/BaseServerService.js";
 import { ServerDeferredMessageBuffer } from "./ServerDeferredMessageBuffer.js";
@@ -364,6 +369,94 @@ export class ServerEventService extends BaseServerService {
       return;
     }
 
+    // Set when a signed base message passed admission AND its fact is in the
+    // immutable log for this thread — the MessageCommitAck emission input
+    // (the ack site below fires only after the projection commit, so the
+    // frozen order authenticate → verify → fact append → projection commit →
+    // ACK holds by construction).
+    let admittedFingerprint = "";
+    // AE-1 admission (plan §4): a SIGNED OriginalMessage is verified as a NEW
+    // ADMISSION at this one ingest seam — the transport (live session today,
+    // sibling transfer in AE-2) is never authority. Fail-closed: a signed
+    // record that does not verify, and a partial signed-envelope group, are
+    // DROPPED — a signed record is never downgraded to "unsigned". Unsigned
+    // payloads keep the legacy live-path admission (the sealed session
+    // authenticates them) and are NOT sync-eligible (no fact is recorded).
+    if (decodedPayload && isOriginalMessageKind(decodedPayload.kind)) {
+      const authPresence = originalMessageAuthPresence(decodedPayload);
+      if (authPresence === "partial") {
+        this.logger.warn("[ServerEventService] dropped " + decodedPayload.kind
+          + ": partial signed-fact envelope group (all-or-none by contract)");
+        return;
+      }
+      if (authPresence === "all") {
+        const runtimePeerLinks = this.bus.runtime && this.bus.runtime.peerLinks ? this.bus.runtime.peerLinks : null;
+        const cryptoProvider = runtimePeerLinks && runtimePeerLinks.cryptoProvider ? runtimePeerLinks.cryptoProvider : null;
+        if (cryptoProvider) {
+          const admission = await verifyOriginalMessageForAdmission({
+            payloadJson: decodedPayload,
+            cryptoProvider,
+            nowMs: this.#clock(),
+            // Forward-looking revocation (rev4 Q4): wired once a peer
+            // authority-state cache exists receiver-side; until then
+            // admission still enforces signature, chain anchoring to the
+            // sender account, and every cert time window.
+            revocationState: null,
+          });
+          if (!admission.ok) {
+            this.logger.warn("[ServerEventService] dropped signed " + decodedPayload.kind
+              + " admission: " + admission.reason);
+            return;
+          }
+          if (threadId) {
+            // Append the verified fact to the immutable log BEFORE the
+            // projection write, so both sides of a conflict are always
+            // retained. Throws propagate (P1.1 discipline): the durable
+            // cursor must not advance past an unrecorded fact — the append
+            // is fingerprint-idempotent on retry.
+            const appended = await this.bus.stores.threadStore.appendOriginalFact({
+              threadId,
+              fact: {
+                fingerprint: admission.fingerprint,
+                payload: decodedPayload,
+                receivedAtMs: this.#clock(),
+                origin: "live",
+              },
+            });
+            // Appended OR already held (an idempotent duplicate resend still
+            // re-emits the commit ack — plan §5's idempotent-resend case).
+            if (decodedPayload.kind === CHAT_MESSAGE_KIND) {
+              admittedFingerprint = admission.fingerprint;
+            }
+            if (appended.conflict) {
+              // The FROZEN conflict semantic (plan §5): both facts stay, no
+              // winner is chosen; the projection row is flagged so the
+              // thread shows "conflicted — canonical content undetermined".
+              this.logger.warn("[ServerEventService] integrity conflict for ("
+                + appended.conflict.senderAccountId + ", " + appended.conflict.messageId + "): "
+                + appended.conflict.fingerprints.length + " distinct signed facts under one id");
+              const flagged = await this.bus.stores.threadStore.markMessageConflicted({
+                threadId,
+                messageId: appended.conflict.messageId,
+              });
+              if (flagged) {
+                const conflictedMessage = flagged instanceof ChatMessage
+                  ? flagged
+                  : new ChatMessage({ ...flagged, threadId });
+                this._emit("message.updated", new MessageUpdatedEvent({ threadId, message: conflictedMessage }));
+              }
+            }
+          }
+        } else {
+          // A runtime without crypto cannot VERIFY, so it must not pretend
+          // to have admitted an authenticated fact — the payload is handled
+          // as live-unsigned (session-authenticated projection only).
+          this.logger.warn("[ServerEventService] no cryptoProvider available; treating signed "
+            + decodedPayload.kind + " as live-unsigned (no fact recorded)");
+        }
+      }
+    }
+
     // Registry-driven dispatch: look up the kind in PAYLOAD_KIND_REGISTRY
     // and let the entry's handler consume it. The default rez.chat.message.v1
     // entry returns `false` so the deposit flows through to the message-
@@ -508,18 +601,51 @@ export class ServerEventService extends BaseServerService {
       if (ackPeerAccountId && ackPeerInboxId) {
         const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
         if (sdk && typeof sdk.sealForPeer === "function" && sdk.mesh) {
-          const ackRecord = new E2eeDeliveryAckV1({
-            senderAccountId: this.ownerAccountId,
-            messageIds: [messageId],
-          });
-          sdk.sealForPeer({
-            peerAccountId: ackPeerAccountId,
-            plaintextBodyBytes: ackRecord.toBytes(),
-            deliverInboxId: ackPeerInboxId,
-          }).then((sealed) => sdk.mesh.dispatch(
-            sealed.object,
-            sealed.address,
-          )).catch((ackErr) => {
+          // MessageCommitAck cutover (plan §7 decision 1 — REPLACE, hard
+          // cutover by message regime): an admitted SIGNED message emits the
+          // signed commit proof; an unsigned legacy message keeps the legacy
+          // delivery ack byte-identically. The legacy record is the fallback
+          // for a signed message ONLY when this runtime cannot make the
+          // claim: no signing machinery (configuration-absent), or a broken
+          // signer — which must never mint a false commit claim but should
+          // keep transport-level recovery evidence flowing while the sender
+          // retries. Same sealed peer channel either way (frozen §8.4: the
+          // ack is never provider-visible). The claim's thread binding is
+          // the SIGNED threadId (the sender's own id for the thread), not
+          // our locally-resolved one.
+          const signedThreadBinding = typeof decodedPayload.threadId === "string"
+            ? decodedPayload.threadId.trim() : "";
+          const dispatchAck = async () => {
+            let ackBytes = null;
+            if (admittedFingerprint && signedThreadBinding) {
+              try {
+                const ackJson = await this.bus.services.messages.buildCommitAck({
+                  messageId,
+                  messageFingerprint: admittedFingerprint,
+                  threadId: signedThreadBinding,
+                  committedAtMs: now,
+                });
+                if (ackJson) ackBytes = new TextEncoder().encode(JSON.stringify(ackJson));
+              } catch (buildErr) {
+                this.logger.error("[ServerEventService] commit-ack build failed; falling back to legacy delivery ack",
+                  buildErr && buildErr.message ? buildErr.message : buildErr);
+              }
+            }
+            if (!ackBytes) {
+              const ackRecord = new E2eeDeliveryAckV1({
+                senderAccountId: this.ownerAccountId,
+                messageIds: [messageId],
+              });
+              ackBytes = ackRecord.toBytes();
+            }
+            const sealed = await sdk.sealForPeer({
+              peerAccountId: ackPeerAccountId,
+              plaintextBodyBytes: ackBytes,
+              deliverInboxId: ackPeerInboxId,
+            });
+            await sdk.mesh.dispatch(sealed.object, sealed.address);
+          };
+          dispatchAck().catch((ackErr) => {
             this.logger.error("[ServerEventService] delivery ack send failed", ackErr && ackErr.message ? ackErr.message : ackErr);
           });
         }
