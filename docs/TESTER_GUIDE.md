@@ -89,14 +89,14 @@ Everyone involved was someone you already shared a group with.
 Grab the newest release from the
 [Releases page](https://github.com/rezprotocol/rez-chat/releases).
 
-The release marked **Latest** is `v0.6.0-rc.7`, and that is the one you want — no
+The release marked **Latest** is `v0.6.0-rc.8`, and that is the one you want — no
 hunting through pre-releases.
 
 > **If you already have Rez Chat installed, check its version.** Anything older
 > than `v0.6.0-rc.6` cannot connect since the relay reset. `v0.5.2` in
 > particular is far enough back that auto-update cannot carry it — reinstall
 > from the link above instead. If you are on any `v0.6.0-rc.*`, auto-update will
-> bring you to `rc.7` on its own.
+> bring you to `rc.8` on its own.
 
 | Platform | Download | Notes |
 |---|---|---|
