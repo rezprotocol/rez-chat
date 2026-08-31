@@ -15,6 +15,7 @@ import { MESSAGE_EDIT_KIND } from "../src/records/payloads/ChatMessageEditPayloa
 class MemoryKV {
   constructor() {
     this._data = new Map();
+    this._failSetIncludes = "";
   }
 
   async get(key) {
@@ -22,7 +23,15 @@ class MemoryKV {
   }
 
   async set(key, value) {
+    if (this._failSetIncludes && String(key).includes(this._failSetIncludes)) {
+      this._failSetIncludes = "";
+      throw new Error("injected set failure");
+    }
     this._data.set(key, value);
+  }
+
+  failNextSetIncluding(fragment) {
+    this._failSetIncludes = String(fragment || "");
   }
 
   async delete(key) {
@@ -53,9 +62,9 @@ const PEER = "acct_peer";
 const THREAD = "th_facts";
 let NOW = 1756000000000;
 
-async function makeStore() {
+async function makeStore(storageProvider = new MemoryStorageProvider()) {
   const store = new ThreadStoreService({
-    storageProvider: new MemoryStorageProvider(),
+    storageProvider,
     ownerAccountId: OWNER,
     clock: () => NOW,
   });
@@ -104,6 +113,37 @@ test("appendOriginalFact: append-only, fingerprint-idempotent", async () => {
   assert.equal(fact.origin, "live", "the original admission origin is preserved on replay");
 
   assert.deepEqual(await store.listOriginalFingerprints({ threadId: THREAD }), ["fp_a"]);
+});
+
+test("appendOriginalFact repairs a derived-index write that failed after the fact committed", async () => {
+  const storageProvider = new MemoryStorageProvider();
+  const store = await makeStore(storageProvider);
+  const payload = signedBasePayload({ contentHash: "fp_repair" });
+  storageProvider._kv.failNextSetIncluding("app:originals_index/");
+
+  await assert.rejects(
+    store.appendOriginalFact({ threadId: THREAD, fact: { fingerprint: "fp_repair", payload, origin: "local" } }),
+    /injected set failure/,
+  );
+  assert.notEqual(
+    await store.getOriginalFact({ threadId: THREAD, fingerprint: "fp_repair" }),
+    null,
+    "the authoritative fact committed before the derived index fault",
+  );
+  assert.equal(
+    (await store.findBaseFactsByMessageId({ threadId: THREAD, messageId: "m1", senderAccountId: PEER })).length,
+    0,
+    "the injected fault reproduced the missing derived index",
+  );
+
+  const retry = await store.appendOriginalFact({
+    threadId: THREAD,
+    fact: { fingerprint: "fp_repair", payload, origin: "local" },
+  });
+  assert.equal(retry.appended, false, "the fact remains append-only on repair");
+  assert.equal(retry.conflict, null);
+  const repaired = await store.findBaseFactsByMessageId({ threadId: THREAD, messageId: "m1", senderAccountId: PEER });
+  assert.deepEqual(repaired.map((fact) => fact.fingerprint), ["fp_repair"]);
 });
 
 test("second fingerprint under one (sender, messageId) identity = integrity conflict, both facts retained", async () => {

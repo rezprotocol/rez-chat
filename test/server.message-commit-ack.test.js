@@ -33,15 +33,22 @@ const FAKE_KEYS = {
 const THREAD = "th_ab";
 
 class AppKV {
-  constructor() { this._data = new Map(); }
+  constructor() { this._data = new Map(); this._failSetIncludes = ""; }
   async get(key) { return this._data.get(key); }
-  async set(key, value) { this._data.set(key, value); }
+  async set(key, value) {
+    if (this._failSetIncludes && String(key).includes(this._failSetIncludes)) {
+      this._failSetIncludes = "";
+      throw new Error("injected set failure");
+    }
+    this._data.set(key, value);
+  }
   async delete(key) { this._data.delete(key); }
   async keys(prefix) {
     const out = [];
     for (const k of this._data.keys()) if (k.startsWith(prefix)) out.push(k);
     return out;
   }
+  failNextSetIncluding(fragment) { this._failSetIncludes = String(fragment || ""); }
 }
 class AppStorageProvider {
   constructor() { this._stores = new Map(); }
@@ -245,6 +252,40 @@ test("normal delivery: signed send → admitted commit → verified MessageCommi
   assert.equal(network.kinds().filter((k) => k === MESSAGE_COMMIT_ACK_KIND).length, 2, "the duplicate re-emitted the ack");
   assert.equal((await rowOf(alice, "m1")).status, "delivered", "duplicate proof is a harmless no-op");
   assert.equal((await pendingOf(alice)).length, 0);
+});
+
+test("a commit ack delivered before dispatch resolves consumes the pre-opened intent without leaving an immortal retry", async (t) => {
+  const { network, alice, bob } = await setupPair();
+  t.after(() => teardown(alice, bob));
+  alice.app.bus.runtime.sdk.mesh.dispatch = async (object) => {
+    network.push(object);
+    await network.drain();
+    return {};
+  };
+
+  await sendSigned(alice, { messageId: "m_sync_ack", text: "ack inside dispatch" });
+
+  assert.equal((await rowOf(alice, "m_sync_ack")).status, "delivered");
+  assert.equal((await pendingOf(alice)).length, 0, "the synchronously consumed intent is never recreated after dispatch");
+  assert.equal(network.kinds().filter((kind) => kind === MESSAGE_COMMIT_ACK_KIND).length, 1);
+});
+
+test("a local signed-fact persistence fault fails before external dispatch and repairs cleanly on retry", async (t) => {
+  const storage = new AppStorageProvider();
+  const { network, alice, bob } = await setupPair({ aliceStorage: storage });
+  t.after(() => teardown(alice, bob));
+  storage.getKeyValueStore(alice.account.accountId).failNextSetIncluding("app:originals_index/");
+
+  await assert.rejects(
+    sendSigned(alice, { messageId: "m_fact_fault", text: "must stay local" }),
+    /injected set failure/,
+  );
+  assert.equal(network.wireLog.length, 0, "nothing crossed the transport without durable fact state");
+  assert.equal((await pendingOf(alice)).length, 0, "retry intent is not opened until fact persistence succeeds");
+
+  await sendSigned(alice, { messageId: "m_fact_fault", text: "must stay local" });
+  assert.equal(network.wireLog.length, 1, "retry repaired the index and dispatched exactly once");
+  assert.equal((await pendingOf(alice)).length, 1);
 });
 
 test("no commit → the retry loop re-fans-out the EXACT same OriginalMessage and the row survives", async (t) => {

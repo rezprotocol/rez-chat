@@ -353,10 +353,59 @@ export class ThreadStoreService {
     if (!id) throw new Error("ThreadStoreService.deleteThread requires threadId");
     return this._withThreadLock(id, async () => {
       const existing = await this.getThread(id);
-      if (!existing) return false;
+      let deleted = Boolean(existing);
+
+      // A thread delete is a hard local delete. The projection is not the
+      // whole conversation: immutable facts, their identity index,
+      // idempotency rows, buffered mutations, and commit-retry intents all
+      // carry the same thread's content or can resurrect its behavior after
+      // the visible row is gone. Remove every owned row, including legacy
+      // orphan state left by older partial deletes.
+      const originalKeys = await this.kv.keys(this._kOriginalFact(id, ""));
+      for (const key of originalKeys) {
+        await this.kv.delete(key);
+        deleted = true;
+      }
+
+      const originalsIndexKey = this._kOriginalsIndex(id);
+      const originalsIndex = await this.kv.get(originalsIndexKey);
+      if (originalsIndex !== undefined && originalsIndex !== null) {
+        await this.kv.delete(originalsIndexKey);
+        deleted = true;
+      }
+
+      const idempotencyKeys = await this.kv.keys(this._ownerPrefix(IDEMPOTENCY_PREFIX));
+      for (const key of idempotencyKeys) {
+        const row = await this.kv.get(key);
+        if (row && typeof row === "object" && row.threadId === id) {
+          await this.kv.delete(key);
+          deleted = true;
+        }
+      }
+
+      const pendingMutationKeys = await this.kv.keys(this._ownerPrefix(PENDING_MUTATIONS_PREFIX));
+      for (const key of pendingMutationKeys) {
+        const rows = await this.kv.get(key);
+        if (!Array.isArray(rows)) continue;
+        const retained = rows.filter((row) => !(row && typeof row === "object" && row.threadId === id));
+        if (retained.length === rows.length) continue;
+        if (retained.length === 0) await this.kv.delete(key);
+        else await this.kv.set(key, retained);
+        deleted = true;
+      }
+
+      const pendingCommitKeys = await this.kv.keys(this._ownerPrefix(COMMIT_PENDING_PREFIX));
+      for (const key of pendingCommitKeys) {
+        const row = await this.kv.get(key);
+        if (row && typeof row === "object" && row.threadId === id) {
+          await this.kv.delete(key);
+          deleted = true;
+        }
+      }
+
       await this.kv.delete(this._kThread(id));
       await this.kv.delete(this._kMessages(id));
-      return true;
+      return deleted;
     });
   }
 
@@ -698,7 +747,11 @@ export class ThreadStoreService {
       const key = this._kOriginalFact(id, fingerprint);
       const existing = await this.kv.get(key);
       if (existing && typeof existing === "object") {
-        return { appended: false, conflict: null, fact: existing };
+        // The fact row is authoritative. If a prior attempt committed it but
+        // failed before the derived identity index, retry repairs the index
+        // before reporting idempotent success.
+        const conflict = await this._ensureOriginalBaseIndexUnlocked(existing);
+        return { appended: false, conflict, fact: existing };
       }
       const now = asInt(this.clock(), Date.now());
       const row = {
@@ -714,31 +767,42 @@ export class ThreadStoreService {
         payload,
       };
       await this.kv.set(key, row);
-      let conflict = null;
-      if (kind === MESSAGE_KIND && row.messageId) {
-        const indexKey = this._kOriginalsIndex(id);
-        const rawIndex = await this.kv.get(indexKey);
-        const index = rawIndex && typeof rawIndex === "object"
-          && rawIndex.byMessage && typeof rawIndex.byMessage === "object"
-          ? rawIndex
-          : { byMessage: {} };
-        // The \u0000 separator makes the composite key structurally distinct
-        // from any bare payload-controlled string (no __proto__ collisions).
-        const identityKey = senderAccountId + "\u0000" + row.messageId;
-        const entryRaw = index.byMessage[identityKey];
-        const entry = entryRaw && typeof entryRaw === "object" && Array.isArray(entryRaw.fingerprints)
-          ? { fingerprints: entryRaw.fingerprints.slice(), conflicted: entryRaw.conflicted === true }
-          : { fingerprints: [], conflicted: false };
-        if (!entry.fingerprints.includes(fingerprint)) entry.fingerprints.push(fingerprint);
-        if (entry.fingerprints.length > 1) {
-          entry.conflicted = true;
-          conflict = { senderAccountId, messageId: row.messageId, fingerprints: entry.fingerprints.slice() };
-        }
-        index.byMessage[identityKey] = entry;
-        await this.kv.set(indexKey, index);
-      }
+      const conflict = await this._ensureOriginalBaseIndexUnlocked(row);
       return { appended: true, conflict, fact: row };
     });
+  }
+
+  async _ensureOriginalBaseIndexUnlocked(row) {
+    if (!row || row.kind !== MESSAGE_KIND || !nonEmpty(row.messageId)) return null;
+    const threadId = nonEmpty(row.threadId);
+    const senderAccountId = nonEmpty(row.senderAccountId);
+    const fingerprint = nonEmpty(row.fingerprint);
+    if (!threadId || !senderAccountId || !fingerprint) {
+      throw new Error("ThreadStoreService original fact cannot be indexed without thread, sender, and fingerprint");
+    }
+    const indexKey = this._kOriginalsIndex(threadId);
+    const rawIndex = await this.kv.get(indexKey);
+    const index = rawIndex && typeof rawIndex === "object"
+      && rawIndex.byMessage && typeof rawIndex.byMessage === "object"
+      ? rawIndex
+      : { byMessage: {} };
+    // The \u0000 separator makes the composite key structurally distinct
+    // from any bare payload-controlled string (no __proto__ collisions).
+    const identityKey = senderAccountId + "\u0000" + row.messageId;
+    const entryRaw = index.byMessage[identityKey];
+    const entry = entryRaw && typeof entryRaw === "object" && Array.isArray(entryRaw.fingerprints)
+      ? { fingerprints: entryRaw.fingerprints.slice(), conflicted: entryRaw.conflicted === true }
+      : { fingerprints: [], conflicted: false };
+    const changed = !entry.fingerprints.includes(fingerprint);
+    if (changed) entry.fingerprints.push(fingerprint);
+    if (entry.fingerprints.length > 1) entry.conflicted = true;
+    if (changed || !entryRaw || entryRaw.conflicted !== entry.conflicted) {
+      index.byMessage[identityKey] = entry;
+      await this.kv.set(indexKey, index);
+    }
+    return entry.conflicted
+      ? { senderAccountId, messageId: row.messageId, fingerprints: entry.fingerprints.slice() }
+      : null;
   }
 
   /** AE-1: load one fact by fingerprint (null when absent). */

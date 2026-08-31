@@ -280,20 +280,23 @@ export class ServerMessagesService extends BaseServerService {
 
   /**
    * Record this device's OWN signed fact into the immutable per-thread log
-   * (local origin — no admission verify; we authored it). Same error posture
-   * as the outbound projection persist: log + app.error, never blocks the
-   * send.
+   * (local origin — no admission verify; we authored it). This is durable
+   * send state, not a best-effort projection: dispatch must not happen unless
+   * the signed fact is recoverable for ack verification and retry.
    */
   async #recordLocalOriginalFact({ threadId, wirePayload, now }) {
     const contentHash = wirePayload && typeof wirePayload.contentHash === "string" ? wirePayload.contentHash.trim() : "";
     if (!threadId || !contentHash) return;
-    await this.#threadStore.appendOriginalFact({
-      threadId,
-      fact: { fingerprint: contentHash, payload: wirePayload, receivedAtMs: now, origin: "local" },
-    }).catch((err) => {
+    try {
+      await this.#threadStore.appendOriginalFact({
+        threadId,
+        fact: { fingerprint: contentHash, payload: wirePayload, receivedAtMs: now, origin: "local" },
+      });
+    } catch (err) {
       this.logger.error("[ServerMessagesService] local original-fact persist failed", err && err.message ? err.message : err);
       this._emit("app.error", { source: "ServerMessagesService", message: "local original-fact persist failed", severity: "error", err });
-    });
+      throw err;
+    }
   }
 
   /**
@@ -402,21 +405,26 @@ export class ServerMessagesService extends BaseServerService {
     }
     const previewText = this.bus.services.threads.extractPreviewText(wirePayload);
     const packetB64 = JSON.stringify(wirePayload);
+    const signedFingerprint = wirePayload && typeof wirePayload.contentHash === "string"
+      ? wirePayload.contentHash.trim() : "";
 
     if (threadId) {
-      await this.#threadStore.recordOutboundDeposit({
-        threadId,
-        senderKey: this.ownerAccountId,
-        messageId,
-        senderAccountId: this.ownerAccountId,
-        packetB64,
-        acceptedAtMs: now,
-        text: previewText,
-        payload: wirePayload,
-      }).catch((err) => {
+      try {
+        await this.#threadStore.recordOutboundDeposit({
+          threadId,
+          senderKey: this.ownerAccountId,
+          messageId,
+          senderAccountId: this.ownerAccountId,
+          packetB64,
+          acceptedAtMs: now,
+          text: previewText,
+          payload: wirePayload,
+        });
+      } catch (err) {
         this.logger.error("[ServerMessagesService] outbound deposit persist failed", err && err.message ? err.message : err);
         this._emit("app.error", { source: "ServerMessagesService", message: "outbound deposit persist failed", severity: "error", err });
-      });
+        throw err;
+      }
 
       await this.#recordLocalOriginalFact({ threadId, wirePayload, now });
 
@@ -456,6 +464,20 @@ export class ServerMessagesService extends BaseServerService {
     let messageQueued = false;
     let queuedInboxIds = [];
     let sentToGroup = false;
+    let pendingCommitOpened = false;
+    // Linearization point for a signed 1:1 send: the authored fact and its
+    // durable retry intent exist BEFORE any external dispatch can synchronously
+    // deliver a commit proof back to us. A thrown dispatch is ambiguous after
+    // the transport boundary, so the intent remains armed for exact-fact
+    // repair instead of being discarded as a definitive failure.
+    if (signedFingerprint && threadId && threadId.indexOf("th_") === 0) {
+      pendingCommitOpened = await this.#openPendingCommit({
+        threadId,
+        messageId,
+        fingerprint: signedFingerprint,
+        now,
+      });
+    }
     // Every chat thread id is minted with a `th_` prefix (ServerThreadsService /
     // defaultRezConfig), so delivery always routes through #deliverToThread,
     // which seals per-recipient before handing opaque bytes to the mesh. There
@@ -487,6 +509,10 @@ export class ServerMessagesService extends BaseServerService {
         this.#queuedMessages.push({ threadId, messageId, queuedAtMs: now });
         this.#trackQueuedMessage(threadId, messageId, queuedInboxIds);
       }
+      if (pendingCommitOpened) {
+        const pending = await this.#threadStore.getPendingCommit({ messageId });
+        if (!pending) nextStatus = "delivered";
+      }
       await this.#threadStore.setMessageStatus({
         threadId,
         messageId,
@@ -501,17 +527,6 @@ export class ServerMessagesService extends BaseServerService {
         status: nextStatus,
         sentAtMs: eventId ? now : null,
       }));
-      // MessageCommitAck (plan §3): a SIGNED 1:1 send that reached the mesh
-      // (or the node's durable queue) opens a durable pending-commit row —
-      // "delivered" is now a proof, and this row is what the verified ack
-      // consumes. Group sends stay evidence-only (DT-004: a group row never
-      // flips on the first of N member acks). A failed send stays with the
-      // user-visible failed/tap-to-retry path, not the ack-repair loop.
-      const signedFingerprint = wirePayload && typeof wirePayload.contentHash === "string"
-        ? wirePayload.contentHash.trim() : "";
-      if (signedFingerprint && !sentToGroup && (nextStatus === "sent" || nextStatus === "queued")) {
-        await this.#openPendingCommit({ threadId, messageId, fingerprint: signedFingerprint, now });
-      }
     }
 
     return new MessageSendResult({
@@ -1350,11 +1365,14 @@ export class ServerMessagesService extends BaseServerService {
   }
 
   async #openPendingCommit({ threadId, messageId, fingerprint, now } = {}) {
+    const thread = await this.#threadStore.getThread(threadId);
+    if (thread && thread.threadType === "group") return false;
+    const recipientAccountId = thread && typeof thread.peerAccountId === "string"
+      ? thread.peerAccountId.trim() : "";
+    if (!recipientAccountId) {
+      throw new Error("cannot open pending commit without a direct-thread recipient");
+    }
     try {
-      const thread = await this.#threadStore.getThread(threadId);
-      const recipientAccountId = thread && thread.threadType !== "group"
-        && typeof thread.peerAccountId === "string" ? thread.peerAccountId.trim() : "";
-      if (!recipientAccountId) return;
       await this.#threadStore.putPendingCommit({
         messageId,
         threadId,
@@ -1364,13 +1382,14 @@ export class ServerMessagesService extends BaseServerService {
         attempts: 0,
         nextRetryAtMs: now + this.#commitRetryDelayMs(0),
       });
-      this.#scheduleCommitSweep();
     } catch (err) {
-      // The send already happened; a tracking fault must be loud, never fatal.
       this.logger.error("[ServerMessagesService] pending-commit open failed for " + messageId,
         err && err.message ? err.message : err);
       this._emit("app.error", { source: "ServerMessagesService", message: "pending-commit open failed", severity: "error", err });
+      throw err;
     }
+    this.#scheduleCommitSweep();
+    return true;
   }
 
   async #retryPendingCommit(row) {

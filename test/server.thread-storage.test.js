@@ -96,6 +96,65 @@ test("chat thread store owns app-scoped thread, message, and idempotency keys", 
   assert.equal(keys.some((key) => key.startsWith("app:threads/rez:acct:B/")), false);
 });
 
+test("deleteThread removes every thread-owned persistence row, including legacy orphans", async () => {
+  const storageProvider = new MemoryStorageProvider();
+  const store = createThreadStore(storageProvider, "rez:acct:A", () => 1500);
+  const threadId = "th_HARDDELETEAAAAAAAAAAAA";
+  await ensureReadyDirectThread(store, threadId);
+  await store.recordOutboundDeposit({
+    threadId,
+    senderKey: "rez:acct:A",
+    senderAccountId: "rez:acct:A",
+    messageId: "m-delete",
+    packetB64: "AQID",
+    acceptedAtMs: 1500,
+  });
+  await store.appendOriginalFact({
+    threadId,
+    fact: {
+      fingerprint: "fp-delete",
+      payload: {
+        kind: "rez.chat.message.v1",
+        threadId,
+        senderAccountId: "rez:acct:A",
+        messageId: "m-delete",
+      },
+    },
+  });
+  await store.applyEdit({
+    threadId,
+    targetMessageId: "missing-delete",
+    senderAccountId: "rez:acct:A",
+    newText: "buffered",
+    editedAtMs: 1500,
+    receivedAtMs: 1500,
+    allowBuffer: true,
+  });
+  await store.putPendingCommit({
+    messageId: "m-delete",
+    threadId,
+    fingerprint: "fp-delete",
+    recipientAccountId: "rez:acct:peer",
+    firstSentAtMs: 1500,
+    nextRetryAtMs: 2000,
+  });
+
+  assert.equal(await store.deleteThread(threadId), true);
+  const keys = await storageProvider._kv.keys("app:");
+  for (const key of keys) {
+    const value = await storageProvider._kv.get(key);
+    assert.ok(!String(key).includes(threadId), "thread-scoped key was removed: " + key);
+    if (Array.isArray(value)) {
+      assert.ok(!value.some((row) => row && row.threadId === threadId), "buffered mutation/message row was removed: " + key);
+    } else if (value && typeof value === "object") {
+      assert.notEqual(value.threadId, threadId, "hashed/indexed row was removed: " + key);
+    }
+  }
+  assert.equal(await store.getPendingCommit({ messageId: "m-delete" }), null);
+  assert.deepEqual(await store.listOriginalFingerprints({ threadId }), []);
+  assert.equal(await store.deleteThread(threadId), false, "a fully-cleaned thread becomes a true no-op");
+});
+
 test("chat thread store supports queued outbound lifecycle without moving ownership to node", async () => {
   const store = createThreadStore(new MemoryStorageProvider(), "rez:acct:owner", () => 2000);
   const threadId = "th_QUEUEDAAAAAAAAAAAAAAAAA";
