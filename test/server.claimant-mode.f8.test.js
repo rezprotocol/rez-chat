@@ -5,7 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
-import { bytesToBase64 } from "@rezprotocol/core";
+import { bytesToBase64, MemoryStorageProvider as CoreMemoryStorageProvider } from "@rezprotocol/core";
 import { NodeCryptoProvider, startRezNode } from "@rezprotocol/node";
 
 import { InboxClaimant } from "../src/server/inbox/InboxClaimant.js";
@@ -13,6 +13,7 @@ import { ServerRuntimeService } from "../src/server/services/ServerRuntimeServic
 import { AccountControlChannel } from "../src/server/runtime/AccountControlChannel.js";
 import { ChatServerBus } from "../src/server/app/ChatServerBus.js";
 import { bootstrapChatServer } from "../src/server/bootstrap/bootstrapChatServer.js";
+import { bootstrapChatRuntime } from "../src/server/bootstrap/bootstrapChatRuntime.js";
 import { resolveSessionMode } from "../src/index.js";
 
 // F8 acceptance (plans/F8_REZCHAT_ROLE_SPLIT_PLAN.md) — two tracks:
@@ -211,6 +212,34 @@ test("legacy track: the default configuration reports the identity-bearing path 
   });
   assert.equal(runtime.sessionMode, "account-legacy");
   assert.equal(bus.runtime.sessionMode, "account-legacy");
+});
+
+test("F9 Option B: runtime bootstrap selects legacy claims for shared-home sessions and v2 leases for claimant sessions", async () => {
+  const legacyIdentity = { ...accountIdentity(), accountId: "rez:acct:" + "a".repeat(64) };
+  const legacy = await bootstrapChatRuntime({
+    identity: legacyIdentity,
+    storageProvider: new CoreMemoryStorageProvider(),
+    cryptoProvider: CRYPTO,
+    uplinks: ["ws://unused.test/ws"],
+    sessionMode: "account-legacy",
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const legacyClaim = legacy.inboxClaimant.claimStore.get(legacy.inboxClaimant.inboxId);
+  assert.equal(legacyClaim.generation, undefined, "shared-home claim keeps the legacy wire/storage contract");
+  assert.equal(legacyClaim.closePublicKeyB64, undefined);
+
+  const portableIdentity = { ...accountIdentity(), accountId: "rez:acct:" + "b".repeat(64) };
+  const portable = await bootstrapChatRuntime({
+    identity: portableIdentity,
+    storageProvider: new CoreMemoryStorageProvider(),
+    cryptoProvider: CRYPTO,
+    uplinks: ["ws://unused.test/ws"],
+    sessionMode: "claimant",
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const portableClaim = portable.inboxClaimant.claimStore.get(portable.inboxClaimant.inboxId);
+  assert.equal(portableClaim.generation, 1, "claimant topology keeps the portable lease contract");
+  assert.equal(typeof portableClaim.closePublicKeyB64, "string");
 });
 
 // ---- F8.1: the SHIPPING desktop launcher uses the claimant path ----

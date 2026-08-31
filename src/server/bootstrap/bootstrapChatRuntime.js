@@ -156,6 +156,11 @@ export async function bootstrapChatRuntime({
         },
     delegatedInboxId: !hasAdminRoot && typeof identity.inboxId === "string" ? identity.inboxId : null,
     role: inboxRole,
+    // F9 Option B: a shared-home/account session uses the legacy claim
+    // contract; only a claimant-mode local/portable topology mints a v2
+    // lease. This choice is made before connecting and is never inferred
+    // from a rejection (which would create a downgrade path).
+    portableLease: sessionMode === "claimant",
     // ONE InboxClaimStore per storage domain: when the portable establisher
     // is wired (the enrollment session), the runtime's claimant MUST share
     // its store instance — two cached instances over one KV key are

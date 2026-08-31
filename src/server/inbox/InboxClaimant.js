@@ -26,7 +26,7 @@ export class InboxClaimant {
   #cryptoProvider;
   #kvStore;
 
-  static async bootstrap({ storageProvider, cryptoProvider, identity = null, delegatedInboxId = null, role = "legacy", claimStore = null } = {}) {
+  static async bootstrap({ storageProvider, cryptoProvider, identity = null, delegatedInboxId = null, role = "legacy", claimStore = null, portableLease = true } = {}) {
     if (!storageProvider || typeof storageProvider.getKeyValueStore !== "function") {
       throw new Error("InboxClaimant.bootstrap requires storageProvider");
     }
@@ -35,6 +35,9 @@ export class InboxClaimant {
     }
     if (role !== "legacy" && role !== "enrollment" && role !== "portable") {
       throw new Error("InboxClaimant.bootstrap role must be \"legacy\", \"enrollment\" or \"portable\"");
+    }
+    if (typeof portableLease !== "boolean") {
+      throw new Error("InboxClaimant.bootstrap portableLease must be boolean");
     }
     // P1.3b: InboxClaimStore caches the WHOLE claims array in memory and
     // persists it whole — two instances over one storage are last-writer-wins
@@ -72,7 +75,7 @@ export class InboxClaimant {
       }
       let claim = claimStore.get(ceremony);
       if (!claim) {
-        const fresh = await claimStore.createClaim({ inboxId: ceremony });
+        const fresh = await claimStore.createClaim({ inboxId: ceremony, portableLease });
         claim = await claimStore.persist(fresh);
         if (identity && typeof identity.publicKeyB64 === "string"
           && identity.publicKeyB64 === claim.claimantPublicKeyB64) {
@@ -138,7 +141,7 @@ export class InboxClaimant {
       // session identity (CAPABILITY_MODEL §8), so nothing needs the
       // symmetry. `inboxId: target` still claims the exact ceremony inbox
       // when set; null mints a fresh one.
-      const fresh = await claimStore.createClaim({ inboxId: target });
+      const fresh = await claimStore.createClaim({ inboxId: target, portableLease });
       claim = await claimStore.persist(fresh);
       await kvStore.set(PRIMARY_INBOX_KEY, claim.inboxId);
       // The distinctness is asserted, not conventional: a fresh claim whose
