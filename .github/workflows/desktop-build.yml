@@ -68,28 +68,28 @@ jobs:
         with:
           repository: rezprotocol/rez-core
           path: rez-core
-          ref: a34ebd890bf88d4904012fb3d7dbf10511a69b94
+          ref: 89c23c62e3e8eea8efab90e425785c912681135e
 
       - name: Checkout rez-sdk
         uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-sdk
           path: rez-sdk
-          ref: cd993439f7bc48fd2c82cd8e706ceb83d903ab5c
+          ref: 2db12a2ae7798e86b8e2635c159ec748db2fb8c3
 
       - name: Checkout rez-node
         uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-node
           path: rez-node
-          ref: fb3b75d7887db2258bc57b28e9df5b97de3365c5
+          ref: 9d45e79139f7ce847f88c7be25d1578f506432ae
 
       - name: Checkout rez-ui
         uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-ui
           path: rez-ui
-          ref: 2258e0b822b169e58871aebd89ecb505215635e0
+          ref: c49399b562f6badc53833d05b18a703e5f28e3ca
 
       - name: Setup Node
         uses: actions/setup-node@v6

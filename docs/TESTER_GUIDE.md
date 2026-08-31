@@ -89,7 +89,7 @@ Everyone involved was someone you already shared a group with.
 Grab the newest release from the
 [Releases page](https://github.com/rezprotocol/rez-chat/releases).
 
-The release marked **Latest** is `v0.6.0-rc.9`, and that is the one you want — no
+The release marked **Latest** is `v0.6.0-rc.10`, and that is the one you want — no
 hunting through pre-releases.
 
 > **If you already have Rez Chat installed, check its version.** Anything older
