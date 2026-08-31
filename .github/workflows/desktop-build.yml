@@ -5,7 +5,8 @@ name: Desktop Build
 # plus the updater's latest.json).
 #
 # The repo is the standalone rez-chat. The four sibling Rez packages
-# (rez-core, rez-sdk, rez-node, rez-ui) are checked out at sibling paths so
+# (rez-core, rez-sdk, rez-node, rez-ui) are checked out at immutable revisions
+# and sibling paths so
 # rez-chat/package.json's `file:../<sibling>` deps resolve at npm-install
 # time; `--install-links` copies them into node_modules as real directories
 # so tauri.conf.json's bundle.resources entries can reach them.
@@ -67,28 +68,28 @@ jobs:
         with:
           repository: rezprotocol/rez-core
           path: rez-core
-          ref: main
+          ref: a34ebd890bf88d4904012fb3d7dbf10511a69b94
 
       - name: Checkout rez-sdk
         uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-sdk
           path: rez-sdk
-          ref: main
+          ref: b39830b1d775307af4706af78dc9881abca9e016
 
       - name: Checkout rez-node
         uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-node
           path: rez-node
-          ref: main
+          ref: b43fda5b5a52a066e02f0008e1ca6c177a961109
 
       - name: Checkout rez-ui
         uses: actions/checkout@v6
         with:
           repository: rezprotocol/rez-ui
           path: rez-ui
-          ref: main
+          ref: 2258e0b822b169e58871aebd89ecb505215635e0
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -125,7 +126,7 @@ jobs:
         # `--install-links` copies the sibling `file:..` deps into
         # rez-chat/node_modules as real directories (not symlinks) so the
         # Tauri bundler's resources map can copy them into the app.
-        run: npm install --install-links --no-audit --no-fund
+        run: npm ci --install-links --no-audit --no-fund
         working-directory: rez-chat
 
       - name: Build web assets
