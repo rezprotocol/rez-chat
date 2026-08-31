@@ -45,7 +45,7 @@ function createBus() {
           threadType: "direct",
         }),
         recordOutboundDeposit: async () => {},
-        upsertDepositedMessage: async () => {},
+        upsertDepositedMessage: async (args) => ({ inserted: true, message: args }),
         setMessageStatus: async () => {},
       },
       threadIndex: {
@@ -198,8 +198,12 @@ test("ServerFileTransferService receive path persists ChatImagePayloadV1 and emi
   const receiverBus = createBus();
   const receiverStorage = new TestStorageProvider();
   const upsertCalls = [];
+  const persistedMessageIds = new Set();
   receiverBus.stores.threadStore.upsertDepositedMessage = async (args) => {
     upsertCalls.push(args);
+    const inserted = !persistedMessageIds.has(args.messageId);
+    persistedMessageIds.add(args.messageId);
+    return { inserted, message: args };
   };
   const receiver = new ServerFileTransferService({
     bus: receiverBus, storageProvider: receiverStorage, ownerAccountId: "rez:acct:test-receiver", clock: () => 2000,
@@ -254,6 +258,30 @@ test("ServerFileTransferService receive path persists ChatImagePayloadV1 and emi
   // No app.error must have been emitted from the receive path.
   const errors = receiverBus._events.filter((e) => e.eventName === "app.error");
   assert.equal(errors.length, 0, "no app.error should be emitted on the receive path");
+
+  // Replay the exact authenticated transfer. The transfer layer may complete
+  // it again, but the chat projection must converge on the same message id and
+  // must not emit a second deposited event.
+  for (const deposit of sentDeposits) {
+    const body = JSON.parse(new TextDecoder().decode(deposit.plaintextBodyBytes));
+    const threadId = typeof body.threadId === "string" ? body.threadId : "";
+    const senderAccountId = typeof body.senderAccountId === "string" ? body.senderAccountId : "";
+    let record = null;
+    if (body.kind === "rez.file.manifest.v1") record = FileManifestV1.fromJSON(body);
+    else if (body.kind === "rez.file.chunk.v1") record = FileChunkV1.fromJSON(body);
+    else throw new Error("unexpected deposit kind: " + body.kind);
+    await receiver.handleIncomingPayload(record, { senderAccountId, threadId });
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(upsertCalls.length, 2, "replay should reach the idempotent message upsert");
+  assert.equal(upsertCalls[1].messageId, upsertCalls[0].messageId,
+    "same sender/thread/transfer lineage must derive the same message id");
+  assert.equal(
+    receiverBus._events.filter((e) => e.eventName === "runtime.event.message.deposited").length,
+    1,
+    "replay must not emit a duplicate runtime message",
+  );
 });
 
 // Regression: sendFile used to emit message.deposited with status="sent" but

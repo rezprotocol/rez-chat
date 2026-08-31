@@ -9,6 +9,16 @@ function defaultAttachmentPreview(mimeType, fileName) {
   if (typeof fileName === "string" && fileName.trim()) return fileName.trim();
   return "File";
 }
+
+function receivedFileMessageId({ senderAccountId, threadId, transferId }) {
+  const material = JSON.stringify([
+    "rez:chat:received-file-message:v1",
+    senderAccountId,
+    threadId,
+    transferId,
+  ]);
+  return "img_recv_" + Hash.sha256Hex(material);
+}
 import {
   FileSendParams,
   FileSendResult,
@@ -374,7 +384,15 @@ export class ServerFileTransferService extends BaseServerService {
     }
 
     const now = this.#clock();
-    const messageId = "img_recv_" + now + "_" + transferId;
+    // The transfer completion callback is at-least-once: a manifest/chunk
+    // replay can complete the same authenticated transfer again. Bind the
+    // projection identity to that stable lineage instead of the local clock,
+    // otherwise every replay creates a second chat message.
+    const messageId = receivedFileMessageId({
+      senderAccountId: resolvedSender,
+      threadId: resolvedThreadId,
+      transferId,
+    });
     const captionText = typeof manifest.text === "string" ? manifest.text : "";
     const channelId = this.#transferChannels.get(transferId) || "";
     this.#transferChannels.delete(transferId);
@@ -387,19 +405,28 @@ export class ServerFileTransferService extends BaseServerService {
       channelId,
     });
 
-    await this.bus.stores.threadStore.upsertDepositedMessage({
-      messageId,
-      threadId: resolvedThreadId,
-      senderKey: resolvedSender,
-      packetB64: JSON.stringify(imagePayload.toJSON()),
-      acceptedAtMs: now,
-      senderAccountId: resolvedSender || null,
-      status: "delivered",
-      text: captionText,
-      payload: imagePayload,
-    }).catch((err) => {
+    let persistResult;
+    try {
+      persistResult = await this.bus.stores.threadStore.upsertDepositedMessage({
+        messageId,
+        threadId: resolvedThreadId,
+        senderKey: resolvedSender,
+        packetB64: JSON.stringify(imagePayload.toJSON()),
+        acceptedAtMs: now,
+        senderAccountId: resolvedSender || null,
+        status: "delivered",
+        text: captionText,
+        payload: imagePayload,
+      });
+    } catch (err) {
       this.logger.error("[ServerFileTransferService] inbound image persist failed", err && err.message ? err.message : err);
-    });
+      this._emit("app.error", { source: "ServerFileTransferService", message: "inbound image persist failed", severity: "error", err });
+      return;
+    }
+
+    // A duplicate completion has already converged in the message store. Do
+    // not re-emit it or perturb the thread index as if it were new work.
+    if (!persistResult || persistResult.inserted === false) return;
 
     const previewText = captionText || defaultAttachmentPreview(manifest.mimeType, manifest.fileName);
     const indexRecord = await this.bus.stores.threadIndex.upsertFromMessage({
