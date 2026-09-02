@@ -57,12 +57,79 @@ export async function ensureChatServerIdentity({
   }
 
   if (storedRecord) {
-    if (!expectedIdentity) return storedRecord;
+    if (!expectedIdentity) {
+      // GHSA-7gc9-4c96-2rxm: a vault-custody row deliberately holds no private
+      // key, so there is nothing to boot from without the vault. Fail loud —
+      // NEVER fall through to the generate branch below, which would mint a
+      // second account and orphan this one.
+      if (storedRecord.hasAdminRoot !== false && storedRecord.rootKeyCustody === "vault") {
+        const err = new Error(
+          "ensureChatServerIdentity: stored identity " + storedRecord.accountId
+          + " keeps its root key in the vault (rootKeyCustody='vault'), so an expectedIdentity "
+          + "is required to boot. Refusing to generate a replacement account.",
+        );
+        err.code = "ROOT_KEY_IN_VAULT_BUT_NOT_SUPPLIED";
+        throw err;
+      }
+      return storedRecord;
+    }
     const expectedPub = String(expectedIdentity.publicKeyB64 || "").trim();
     if (!expectedPub) {
       throw new Error("ensureChatServerIdentity: expectedIdentity is missing publicKeyB64");
     }
+    // Needed by the scrub below; the admin-root persist path re-derives its own.
+    const expectedPriv = String(expectedIdentity.privateKeyB64 || "").trim();
     if (storedRecord.publicKeyB64 === expectedPub) {
+      // GHSA-7gc9-4c96-2rxm — the scrub, and the ONLY place cleartext root key
+      // material is removed from disk.
+      //
+      // Ruling (Noah, 2026-08-30): remove the on-disk copy only once the key is
+      // PROVEN to be where it should be. The proof is this equality: the vault
+      // just handed us a private key, and it is byte-identical to the one on
+      // disk. That establishes the envelope opens and yields the same key on
+      // THIS machine, so the disk copy is provably redundant rather than
+      // presumed so. If they ever differ we scrub nothing and fall through to
+      // the mismatch handling below.
+      const storedPriv = String(storedRecord.privateKeyB64 || "").trim();
+      const isAdminRoot = storedRecord.hasAdminRoot !== false;
+      if (isAdminRoot && storedRecord.rootKeyCustody === "inline" && storedPriv) {
+        if (storedPriv !== expectedPriv) {
+          const err = new Error(
+            "ensureChatServerIdentity: stored identity " + storedRecord.accountId
+            + " has the expected public key but a DIFFERENT private key. Refusing to scrub — "
+            + "this is key confusion, not an upgrade.",
+          );
+          err.code = "ROOT_KEY_MISMATCH_SAME_PUBKEY";
+          throw err;
+        }
+        const scrubbed = new StoredServerIdentity({
+          accountId: storedRecord.accountId,
+          deviceId: storedRecord.deviceId,
+          publicKeyB64: storedRecord.publicKeyB64,
+          privateKeyB64: "",
+          rootKeyCustody: "vault",
+        });
+        await kv.set(STORE_KEY, scrubbed.toJSON());
+        console.warn("[chat-server] scrubbed the cleartext root key from local storage for "
+          + storedRecord.accountId + "; the vault envelope is now its only home (GHSA-7gc9-4c96-2rxm)");
+        // The RUNTIME identity still needs the key — it just no longer comes
+        // off disk. `expectedIdentity` (the vault) is now its sole source.
+        return new StoredServerIdentity({
+          accountId: storedRecord.accountId,
+          deviceId: storedRecord.deviceId,
+          publicKeyB64: storedRecord.publicKeyB64,
+          privateKeyB64: expectedPriv,
+        });
+      }
+      if (isAdminRoot && storedRecord.rootKeyCustody === "vault") {
+        // Already scrubbed. Rehydrate the runtime identity from the vault.
+        return new StoredServerIdentity({
+          accountId: storedRecord.accountId,
+          deviceId: storedRecord.deviceId,
+          publicKeyB64: storedRecord.publicKeyB64,
+          privateKeyB64: expectedPriv,
+        });
+      }
       return storedRecord;
     }
     if (!allowOverwrite) {
@@ -106,14 +173,25 @@ export async function ensureChatServerIdentity({
     if (!expectedAccountId || !expectedPub || !expectedPriv) {
       throw new Error("ensureChatServerIdentity: expectedIdentity must include accountId, publicKeyB64, privateKeyB64");
     }
+    // GHSA-7gc9-4c96-2rxm: the private key is NOT persisted. The vault
+    // envelope supplies it at every boot (rez-chat/src/index.js is the only
+    // production caller and always does), so writing it here only ever created
+    // a second, unprotected copy.
+    const deviceId = `dev:${randomBytes(8).toString("hex")}`;
     const record = new StoredServerIdentity({
       accountId: expectedAccountId,
-      deviceId: `dev:${randomBytes(8).toString("hex")}`,
+      deviceId,
+      publicKeyB64: expectedPub,
+      privateKeyB64: "",
+      rootKeyCustody: "vault",
+    });
+    await kv.set(STORE_KEY, record.toJSON());
+    return new StoredServerIdentity({
+      accountId: expectedAccountId,
+      deviceId,
       publicKeyB64: expectedPub,
       privateKeyB64: expectedPriv,
     });
-    await kv.set(STORE_KEY, record.toJSON());
-    return record;
   }
 
   const identity = await Identity.generate({ cryptoProvider });
