@@ -190,10 +190,17 @@ test("GHSA-7gc9: an upgraded boot SCRUBS a legacy cleartext row — but only onc
   });
 
   const row = await readStoredRow(rootDir);
-  assert.equal(row.privateKeyB64, "", "the cleartext key is gone from disk");
+  assert.equal(row.privateKeyB64, "", "the cleartext key is gone from the row");
   assert.equal(row.rootKeyCustody, "vault");
   assert.equal(row.deviceId, "dev:legacyfixture", "deviceId must survive the scrub");
   assert.equal(runtime.privateKeyB64, expected.privateKeyB64, "the account still boots");
+
+  // The assertion that actually proves the advisory is fixed for EXISTING
+  // installs — which is the path every current user takes. Checking only the
+  // parsed row would still pass if the write left the prior file behind under
+  // another name, or wrote a new version alongside the old one.
+  assert.equal(fileContainingSecret(rootDir, expected.privateKeyB64), null,
+    "the scrub must remove the key from every file on disk, not just from the row it rewrote");
 });
 
 test("GHSA-7gc9: same public key but a DIFFERENT private key refuses to scrub — key confusion is not an upgrade", async () => {
