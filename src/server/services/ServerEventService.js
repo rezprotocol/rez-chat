@@ -82,6 +82,10 @@ export class ServerEventService extends BaseServerService {
     return this.#handlePeerlinkUserMessage(data);
   }
 
+  async applyDeliveryAck(data) {
+    return this.#handleDeliveryAck({ body: data });
+  }
+
   async #handlePeerLinkUpdated(event) {
     const frame = event && typeof event === "object" ? event : {};
     const body = frame.body && typeof frame.body === "object" ? frame.body : frame;

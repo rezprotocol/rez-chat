@@ -214,15 +214,20 @@ export class ChatServerApp {
   }
 
   async stop() {
-    if (!this.#started) return;
-    this.bus.emit("server.stopping", {});
-    const list = [...this.#services].reverse();
-    for (const service of list) {
-      if (service && typeof service.stop === "function") {
-        await service.stop();
+    if (this.#started) {
+      this.bus.emit("server.stopping", {});
+      const list = [...this.#services].reverse();
+      for (const service of list) {
+        if (service && typeof service.stop === "function") {
+          await service.stop();
+        }
       }
+      this.#started = false;
     }
-    this.#started = false;
+    const peerLinks = this.bus.runtime && this.bus.runtime.peerLinks;
+    if (peerLinks && typeof peerLinks.close === "function") {
+      await peerLinks.close();
+    }
   }
 
   #createStores(storageProvider) {

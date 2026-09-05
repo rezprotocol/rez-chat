@@ -145,7 +145,7 @@ function makeApplyPipeline() {
   return { pipeline, outbox };
 }
 
-test("M5 apply-outbox: minAttemptsForAge holds the age drop until real apply attempts ran", async () => {
+test("M5 apply-outbox: the attempts floor delays parking and age never authorizes deletion", async () => {
   const { pipeline, outbox } = makeApplyPipeline();
   await pipeline.submit(frame(7)); // stage + apply failure (attempts=1), staged at Date.now()
 
@@ -158,16 +158,18 @@ test("M5 apply-outbox: minAttemptsForAge holds the age drop until real apply att
   assert.equal((await outbox.listPending(MBOX)).length, 1, "still staged, still recoverable");
 
   retry = await pipeline.retryApplyOutbox(MBOX, bounds);            // attempts → 3: floor met
-  assert.equal(retry.quarantined.length, 1);
-  assert.equal(retry.quarantined[0].reason, "age");
-  assert.equal((await outbox.listPending(MBOX)).length, 0, "quarantined once attempts proved poison");
+  assert.deepEqual(retry.quarantined, []);
+  assert.equal((await outbox.listPending(MBOX)).length, 1, "retained once the floor parks it");
+  await pipeline.retryApplyOutbox(MBOX, bounds);
+  assert.equal((await outbox.listPending(MBOX))[0].attempts, 3, "parked without another application attempt");
 });
 
-test("M5 apply-outbox: omitting minAttemptsForAge keeps the legacy behavior (no floor)", async () => {
-  const { pipeline } = makeApplyPipeline();
+test("M5 apply-outbox: omitting the floor lets age park work but never delete it", async () => {
+  const { pipeline, outbox } = makeApplyPipeline();
   await pipeline.submit(frame(9)); // attempts=1
   const farFuture = Date.now() + 30 * 24 * 60 * 60 * 1000;
   const retry = await pipeline.retryApplyOutbox(MBOX, { maxAttempts: 100, maxAgeMs: 60_000, nowMs: farFuture });
-  assert.equal(retry.quarantined.length, 1, "no floor requested → age fires as before");
-  assert.equal(retry.quarantined[0].reason, "age");
+  assert.deepEqual(retry.quarantined, []);
+  await pipeline.retryApplyOutbox(MBOX, { maxAttempts: 100, maxAgeMs: 60_000, nowMs: farFuture });
+  assert.equal((await outbox.listPending(MBOX))[0].attempts, 2, "age parked the retained entry without waiting for a floor");
 });

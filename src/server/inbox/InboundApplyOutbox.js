@@ -13,8 +13,10 @@ const MAILBOX_PREFIX = "chat-server:inbox:apply-outbox:v1:";
  * durable KV — BEFORE the cursor may advance. The cursor advances once the
  * plaintext is staged-or-applied (never on decrypt alone). Application is then
  * retried from the outbox (no re-decrypt needed); an entry is removed once
- * applied, and a poison entry (repeated apply failures) is surfaced as a System
- * notice and dropped so it can't retry forever.
+ * applied. Repeatedly failing entries are retained and parked by the pipeline
+ * for the runtime, not deleted at a retry bound. There is no lifetime retention
+ * cap or durable failure notice yet (rezprotocol/rez-sdk#3). Restart allows
+ * another attempt; clearing a transient fault alone does not unpark an entry.
  *
  * Audit P1.2 (crash-consistency): each mailbox's staged entries live in ONE KV
  * value (a `{ [dedupId]: entry }` map under a single per-mailbox key), so every

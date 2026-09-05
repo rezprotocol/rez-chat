@@ -4,17 +4,11 @@ import assert from "node:assert/strict";
 import { ServerPeerLinkProtocolService } from "../src/server/services/ServerPeerLinkProtocolService.js";
 import { InboundDepositPipeline } from "../src/server/runtime/InboundDepositPipeline.js";
 
-// DT-002 characterization pins for the control-branch consumption contract
-// (DT-006 §4.2/§4.4, corrected in rev 4). These pin what IS, defects
-// included:
+// DT-302 regression pins for the control-branch consumption contract
+// (DT-006 §4.2/§4.4, corrected in rev 4):
 //
-//   1. A decrypted delivery-ack returns `consumed:true` while its durable
-//      effect (setMessageStatus via the delivery.ack bus event) rides an
-//      UNAWAITED async chain — processDeposit resolves before the effect
-//      lands. Crash in that window = the ack is lost with no recovery
-//      (DT-008; resolved by DT-302's opaque durable work). When DT-302
-//      lands, the first pin below MUST flip: the effect becomes durable
-//      before the consumed:true return.
+//   1. The protocol service returns durable opaque work plus a typed ack. The
+//      pipeline awaits the app effect and only then marks the work applied.
 //   2. The ack's sender authority is the DECRYPT, not the plaintext:
 //      a mismatched plaintext senderAccountId is ignored (still consumed).
 //   3. The pipeline maps a no-user-message result to `durable = consumed`
@@ -50,14 +44,6 @@ function makeAckService({ plaintextSender = PEER } = {}) {
   const bus = {
     emit(name, payload) {
       emitted.push({ name, payload });
-      if (name === "delivery.ack") {
-        // Model ServerEventService.#handleDeliveryAck: an async handler whose
-        // durable write completes strictly later than the emit.
-        (async () => {
-          await new Promise((r) => setTimeout(r, 20));
-          effectDone = true;
-        })();
-      }
     },
   };
   const svc = new ServerPeerLinkProtocolService({ bus, ownerAccountId: OWNER, logger: SILENT });
@@ -72,31 +58,49 @@ function makeAckService({ plaintextSender = PEER } = {}) {
       encrypted: true,
       snapshot: { peerAccountId: PEER },
       event: null,
+      deliveryWork: {
+        owner: OWNER,
+        sealedDigest: "12".repeat(32),
+        plaintextB64: Buffer.from(inner, "utf8").toString("base64"),
+        authenticatedSenderAccountId: PEER,
+      },
     }),
+    markDeliveryWorkApplied: async () => {},
   });
   const acksNoted = [];
   svc._noteDeliveryAckReceived = (sender) => { acksNoted.push(sender); };
-  return { svc, emitted, acksNoted, effectLanded: () => effectDone };
+  return {
+    svc,
+    emitted,
+    acksNoted,
+    effectLanded: () => effectDone,
+    applyDeliveryAck: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      effectDone = true;
+    },
+  };
 }
 
-test("pin (defect, DT-008): delivery-ack returns consumed:true BEFORE its durable effect lands — the crash window exists", async () => {
-  const { svc, emitted, acksNoted, effectLanded } = makeAckService();
+test("DT-302: delivery-ack application is awaited before the pipeline reports completion", async () => {
+  const { svc, emitted, acksNoted, effectLanded, applyDeliveryAck } = makeAckService();
+  const pipeline = new InboundDepositPipeline({
+    peerLinkProtocol: svc,
+    events: {
+      applyDeliveryAck,
+      applyUserMessage: async () => true,
+      processDeposit: async () => ({}),
+    },
+    logger: SILENT,
+  });
 
-  const result = await svc.processDeposit(ackFrame());
+  const result = await pipeline.submit(ackFrame());
 
   assert.equal(result.consumed, true);
   assert.equal(result.decryptOk, true);
-  assert.equal("userMessage" in result, false, "control packet yields no userMessage");
-  assert.equal(emitted.some((e) => e.name === "delivery.ack"), true, "effect was emitted fire-and-forget");
+  assert.equal(result.applied, true);
+  assert.equal(emitted.some((e) => e.name === "delivery.ack"), false, "effect does not use fire-and-forget events");
   assert.deepEqual(acksNoted, [PEER], "recovery evidence cleared for the AUTHENTICATED sender");
-  // THE DEFECT: processDeposit already reported consumed (=ack-safe) while
-  // the status write has not happened. A crash here loses the ack forever —
-  // the ratchet advanced, the deposit gets ack-deleted, the peer never
-  // re-sends. DT-302 flips this assertion.
-  assert.equal(effectLanded(), false, "consumed:true returned before the durable effect landed (crash window)");
-
-  await new Promise((r) => setTimeout(r, 40));
-  assert.equal(effectLanded(), true, "without a crash, the effect does land eventually");
+  assert.equal(effectLanded(), true, "completion is not reported before the durable effect lands");
 });
 
 test("pin: delivery-ack sender authority is the decrypt — mismatched plaintext sender is ignored but still consumed", async () => {
@@ -127,4 +131,13 @@ test("pin: the pipeline maps a no-user-message result to durable=consumed — th
   assert.equal(status.consumed, true);
   assert.equal(status.durable, true,
     "durable falls back to consumed when there is no userMessage — catch-up will ack-DELETE the only ciphertext copy");
+});
+
+test("classifier reports malformed JSON without logging decrypted content", () => {
+  const warnings = [];
+  const svc = new ServerPeerLinkProtocolService({ bus: { emit() {} }, ownerAccountId: OWNER, logger: { ...SILENT, warn: (...args) => warnings.push(args) } });
+  const classified = svc.classifyDeliveryWork({ owner: OWNER, sealedDigest: "ab".repeat(32), plaintextB64: Buffer.from("private-invalid-json-secret").toString("base64"), authenticatedSenderAccountId: PEER });
+  assert.ok(classified.userMessage);
+  assert.equal(warnings.length, 1);
+  assert.equal(JSON.stringify(warnings).includes("private-invalid-json-secret"), false);
 });

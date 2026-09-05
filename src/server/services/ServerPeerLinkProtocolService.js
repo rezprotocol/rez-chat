@@ -128,6 +128,67 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
     // here. See memory feedback_inbound_deposit_pipeline_must_be_awaited_calls.
   }
 
+  async listPendingDeliveryWork() {
+    const peerLinks = this._peerLinkService();
+    if (!peerLinks || typeof peerLinks.listPendingDeliveryWork !== "function") return [];
+    return peerLinks.listPendingDeliveryWork(this.ownerAccountId);
+  }
+
+  async markDeliveryWorkApplied(sealedDigest) {
+    const peerLinks = this._peerLinkService();
+    if (!peerLinks || typeof peerLinks.markDeliveryWorkApplied !== "function") return;
+    await peerLinks.markDeliveryWorkApplied({ ownerAccountId: this.ownerAccountId, sealedDigest });
+  }
+
+  classifyDeliveryWork(work, { mailboxId = "", eventId = "", snapshot = null } = {}) {
+    if (!work || typeof work !== "object" || typeof work.plaintextB64 !== "string") {
+      throw new Error("classifyDeliveryWork requires durable decrypted work");
+    }
+    if (work.owner !== this.ownerAccountId) {
+      throw new Error("durable decrypted work owner mismatch");
+    }
+    const authenticatedSender = typeof work.authenticatedSenderAccountId === "string"
+      ? work.authenticatedSenderAccountId.trim() : "";
+    let inner = null;
+    try {
+      inner = JSON.parse(new TextDecoder().decode(base64ToBytes(work.plaintextB64)));
+    } catch (err) {
+      this.logger.warn("[ServerPeerLinkProtocolService] decrypted payload is not JSON; passing to user-message decoding", {
+        sealedDigest: work.sealedDigest,
+        errorName: err && err.name ? err.name : "DecodeError",
+      });
+      inner = null;
+    }
+    if (inner && inner.kind === "rez.delivery.ack"
+        && typeof inner.senderAccountId === "string"
+        && Array.isArray(inner.messageIds)) {
+      if (authenticatedSender && inner.senderAccountId.trim() !== authenticatedSender) {
+        this.logger.warn("[ServerPeerLinkProtocolService] delivery-ack sender mismatch (claimed "
+          + inner.senderAccountId.trim() + " != authenticated " + authenticatedSender + "); ignoring");
+        return { deliveryIgnored: true };
+      }
+      return {
+        deliveryAck: {
+          senderAccountId: authenticatedSender,
+          messageIds: inner.messageIds,
+        },
+      };
+    }
+    return {
+      userMessage: {
+        mailboxId: work.sourceMailboxId || mailboxId,
+        eventId: work.sourceEventId || eventId || ("delivery:" + work.sealedDigest),
+        plaintextB64: work.plaintextB64,
+        senderAccountId: authenticatedSender || null,
+        snapshot,
+      },
+    };
+  }
+
+  noteDeliveryAckApplied(senderAccountId) {
+    this._noteDeliveryAckReceived(senderAccountId);
+  }
+
   /**
    * Decrypt + handle one inbound mailbox deposit. Protocol bodies (handshake,
    * ack, reject, rehandshake, delivery-ack) are applied in place and resolve
@@ -396,6 +457,7 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         decResult = await peerLinks.decryptDirectMessageAnyPeer({
           ownerAccountId: this.ownerAccountId,
           packetBytes: payloadBytes,
+          deliveryContext: { mailboxId, eventId },
         });
       } catch (decErr) {
         this.logger.error("[ServerPeerLinkProtocolService] E2EE decryption failed", decErr && decErr.message ? decErr.message : decErr);
@@ -419,6 +481,9 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
         // it is applied, or a rehandshake lands) can decrypt it. Acking here would
         // destroy a message we simply can't read YET (the desktop data-loss bug).
         return { consumed: false, decryptOk: false, reason: isThreadNotReady ? "thread-not-ready" : "decrypt-failed" };
+      }
+      if (decResult && decResult.deliveryDuplicate === true && !decResult.deliveryWork) {
+        return { consumed: true, decryptOk: true, deliveryDuplicate: true };
       }
       if (!decResult || !(decResult.plaintextBytes instanceof Uint8Array)) {
         return { consumed: false, decryptOk: false, reason: "decrypt-empty" };
@@ -449,12 +514,27 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       // The cryptographically-authenticated sender of THIS packet (from the
       // decrypted peer-link snapshot). Never a plaintext field.
       const snapshot = decResult.snapshot;
-      const decryptedSender = snapshot && typeof snapshot.peerAccountId === "string"
-        ? snapshot.peerAccountId.trim() : "";
+      const durableWork = decResult.deliveryWork || null;
+      const decryptedSender = durableWork && typeof durableWork.authenticatedSenderAccountId === "string"
+        ? durableWork.authenticatedSenderAccountId.trim()
+        : (snapshot && typeof snapshot.peerAccountId === "string" ? snapshot.peerAccountId.trim() : "");
       // REZ-4: record that this peer's link is alive in the receive direction so
       // sender-side ack-timeout recovery won't re-key a demonstrably-live link.
       if (decryptedSender) {
         this.#lastInboundDecryptAtMsByPeer.set(decryptedSender, this.#clock());
+      }
+
+      // DT-302: once a ratchet receive has committed, dispatch from the durable
+      // SDK-owned work record rather than reclassifying the transient decrypt
+      // result. Startup recovery calls this same classifier, so live and replay
+      // paths cannot disagree about sender authority or effect type.
+      if (durableWork) {
+        return {
+          consumed: true,
+          decryptOk: true,
+          deliveryWork: durableWork,
+          ...this.classifyDeliveryWork(durableWork, { mailboxId, eventId, snapshot }),
+        };
       }
 
       try {
@@ -470,17 +550,20 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
           if (decryptedSender && inner.senderAccountId.trim() !== decryptedSender) {
             this.logger.warn("[ServerPeerLinkProtocolService] delivery-ack sender mismatch (claimed "
               + inner.senderAccountId.trim() + " != authenticated " + decryptedSender + "); ignoring");
-            return { consumed: true, decryptOk: true };
+            return { consumed: true, decryptOk: true, deliveryWork: durableWork, deliveryIgnored: true };
           }
           // A delivery-ack proves THIS peer decrypted a message we sent — the
           // us->peer direction is healthy right now. Clear its unacked tally so
           // sender-side recovery never re-invites a live link.
-          this._noteDeliveryAckReceived(decryptedSender);
-          this._emit("delivery.ack", {
-            senderAccountId: decryptedSender,
-            messageIds: inner.messageIds,
-          });
-          return { consumed: true, decryptOk: true };
+          return {
+            consumed: true,
+            decryptOk: true,
+            deliveryWork: durableWork,
+            deliveryAck: {
+              senderAccountId: decryptedSender,
+              messageIds: inner.messageIds,
+            },
+          };
         }
       } catch {
         // not JSON or not a protocol message — fall through as user message
@@ -499,10 +582,11 @@ export class ServerPeerLinkProtocolService extends BaseServerService {
       return {
         consumed: true,
         decryptOk: true,
+        deliveryWork: durableWork,
         userMessage: {
-          mailboxId,
-          eventId,
-          plaintextB64: bytesToBase64(decResult.plaintextBytes),
+          mailboxId: durableWork && durableWork.sourceMailboxId ? durableWork.sourceMailboxId : mailboxId,
+          eventId: durableWork && durableWork.sourceEventId ? durableWork.sourceEventId : eventId,
+          plaintextB64: durableWork ? durableWork.plaintextB64 : bytesToBase64(decResult.plaintextBytes),
           senderAccountId: decryptedSender || null,
           snapshot: snapshot || null,
         },

@@ -43,6 +43,14 @@ import { depositIdentity } from "./depositIdentity.js";
  * count and per-entry re-attempt cap (a poison frame is dropped, never wedges).
  */
 export class InboundDepositPipeline {
+  /** sealedDigest -> { attempts, exhausted }: per-runtime retry bound for durable delivery work. Never a reason to delete. */
+  #durableRetryFailures = new Map();
+
+  // Composite mailbox/event keys only; source plaintext stays in the outbox.
+  // Parking is per-runtime. Restart permits another attempt even when the
+  // persisted failure count already exceeds the bound.
+  #parkedOutboxEntries = new Set();
+
   #peerLinkProtocol;
   #events;
   #processedLog;
@@ -278,6 +286,8 @@ export class InboundDepositPipeline {
     const consumed = Boolean(status && status.consumed);
     const decryptOk = Boolean(status && status.decryptOk);
     const hasUserMessage = Boolean(status && status.userMessage);
+    const hasDeliveryAck = Boolean(status && status.deliveryAck);
+    const hasDurableWork = Boolean(status && status.deliveryWork);
 
     // Audit P1.1 — durable post-decrypt staging. The double ratchet has now
     // advanced past this ciphertext, so it can never be re-decrypted. STAGE the
@@ -285,7 +295,7 @@ export class InboundDepositPipeline {
     // failure can be retried from the outbox instead of losing the message when
     // the cursor prunes the ciphertext.
     let staged = true;
-    if (hasUserMessage && this.#outbox) {
+    if (hasUserMessage && this.#outbox && !hasDurableWork) {
       staged = false;
       try {
         await this.#outbox.stage(mailboxId, dedupId, status.userMessage);
@@ -309,6 +319,23 @@ export class InboundDepositPipeline {
           + (err && err.message ? err.message : err));
       }
     }
+    let ackApplied = false;
+    if (hasDeliveryAck) {
+      try {
+        if (typeof this.#events.applyDeliveryAck !== "function") {
+          throw new Error("events.applyDeliveryAck is unavailable");
+        }
+        await this.#events.applyDeliveryAck(status.deliveryAck);
+        if (typeof this.#peerLinkProtocol.noteDeliveryAckApplied === "function") {
+          this.#peerLinkProtocol.noteDeliveryAckApplied(status.deliveryAck.senderAccountId);
+        }
+        ackApplied = true;
+      } catch (err) {
+        applied = false;
+        this.#logger.error("[InboundDepositPipeline] delivery-ack apply failed: "
+          + (err && err.message ? err.message : err));
+      }
+    }
     try {
       await this.#events.processDeposit(frame);
     } catch (err) {
@@ -324,8 +351,8 @@ export class InboundDepositPipeline {
     // delivered message unackable — the cursor stuck, then a doomed re-decrypt
     // wrongly surfaced it as poison.) A non-message deposit (handshake/ack)
     // inherits the consume signal. Ack layers gate on `durable`, never a bare decrypt.
-    const durableUserMessage = staged || userApplied;
-    if (hasUserMessage && this.#outbox && staged) {
+    const durableUserMessage = hasDurableWork || staged || userApplied;
+    if (hasUserMessage && this.#outbox && !hasDurableWork && staged) {
       // Reconcile the staged copy with the apply outcome: drop it once applied,
       // else count the failure so the retry pass can poison-bound it.
       if (userApplied) {
@@ -335,11 +362,25 @@ export class InboundDepositPipeline {
       }
     }
 
+    if (hasDurableWork) {
+      const effectApplied = status.deliveryIgnored === true
+        || (hasUserMessage && userApplied)
+        || (hasDeliveryAck && ackApplied);
+      if (effectApplied && typeof this.#peerLinkProtocol.markDeliveryWorkApplied === "function") {
+        try {
+          await this.#peerLinkProtocol.markDeliveryWorkApplied(status.deliveryWork.sealedDigest);
+        } catch (err) {
+          this.#logger.error("[InboundDepositPipeline] durable delivery markApplied failed: "
+            + (err && err.message ? err.message : err));
+        }
+      }
+    }
+
     // Mark processed (dedup the one non-idempotent step, re-decrypt) only once the
     // deposit is durably recoverable — never while a stage+apply double-failure
     // means it is not. Marked AFTER apply so the dedup reflects the real outcome
     // (the submit queue serializes, so there is no in-flight redelivery to race).
-    const shouldMark = decryptOk && (!hasUserMessage || durableUserMessage);
+    const shouldMark = decryptOk && (hasDurableWork || !hasUserMessage || durableUserMessage);
     if (this.#processedLog && dedupId && shouldMark) {
       try {
         await this.#processedLog.mark(mailboxId, dedupId);
@@ -349,7 +390,7 @@ export class InboundDepositPipeline {
       }
     }
 
-    const durable = hasUserMessage ? durableUserMessage : consumed;
+    const durable = hasDurableWork ? true : (hasUserMessage ? durableUserMessage : consumed);
     return { consumed, decryptOk, alreadyProcessed: false, applied, durable };
   }
 
@@ -376,9 +417,11 @@ export class InboundDepositPipeline {
    * Retry application of staged-but-unapplied outbox entries for a mailbox (the
    * cursor may already have advanced past them — the plaintext lives in the
    * outbox, never re-decrypted). Serialized on the same submit queue. Entries
-   * that exceed the poison bound are dropped and RETURNED so the caller can
-   * surface a visible System notice. Returns { applied: string[], quarantined:
-   * Array<{ dedupId, attempts, ageMs, reason }> }.
+   * that exceed the retry bound are retained and parked for this runtime. A
+   * transient notice is not a durable disposition and cannot authorize deletion.
+   * Restart allows another attempt; clearing a fault alone does not unpark work.
+   * Returns { applied: string[], quarantined: [] }; the latter remains for caller
+   * compatibility, but neither retained-work path emits a dropped-message notice.
    */
   retryApplyOutbox(mailboxId, opts = {}) {
     const run = this.#tail.then(() => this.#retryApplyOutbox(mailboxId, opts));
@@ -389,6 +432,98 @@ export class InboundDepositPipeline {
   async #retryApplyOutbox(mailboxId, { maxAttempts = 0, maxAgeMs = 0, minAttemptsForAge = 0, nowMs = Date.now() } = {}) {
     const applied = [];
     const quarantined = [];
+    if (typeof this.#peerLinkProtocol.listPendingDeliveryWork === "function"
+        && typeof this.#peerLinkProtocol.classifyDeliveryWork === "function") {
+      let durablePending = [];
+      try {
+        durablePending = await this.#peerLinkProtocol.listPendingDeliveryWork();
+      } catch (err) {
+        this.#logger.error("[InboundDepositPipeline] durable delivery listPending failed: "
+          + (err && err.message ? err.message : err));
+      }
+      for (const work of durablePending) {
+        const digest = work && typeof work.sealedDigest === "string" ? work.sealedDigest : "";
+        const priorFailure = digest ? this.#durableRetryFailures.get(digest) : null;
+        if (priorFailure && priorFailure.exhausted === true) {
+          // Over the bound for THIS runtime. The work is deliberately RETAINED
+          // (see the catch below); we just stop spending CPU on it until the
+          // next restart resets the in-memory counter.
+          continue;
+        }
+        try {
+          const classified = this.#peerLinkProtocol.classifyDeliveryWork(work, { mailboxId });
+          if (classified.userMessage) {
+            await this.#events.applyUserMessage(classified.userMessage);
+          } else if (classified.deliveryAck) {
+            if (typeof this.#events.applyDeliveryAck !== "function") {
+              throw new Error("events.applyDeliveryAck is unavailable");
+            }
+            await this.#events.applyDeliveryAck(classified.deliveryAck);
+            if (typeof this.#peerLinkProtocol.noteDeliveryAckApplied === "function") {
+              this.#peerLinkProtocol.noteDeliveryAckApplied(classified.deliveryAck.senderAccountId);
+            }
+          }
+          await this.#peerLinkProtocol.markDeliveryWorkApplied(work.sealedDigest);
+          if (digest) this.#durableRetryFailures.delete(digest);
+          applied.push("delivery:" + work.sealedDigest);
+        } catch (err) {
+          this.#logger.error("[InboundDepositPipeline] durable delivery retry failed for "
+            + (digest || "<unknown>") + ": "
+            + (err && err.message ? err.message : err));
+          // Bound the RETRIES, not the work. Without a bound a permanently-failing
+          // record — malformed payload, an owner mismatch after a profile
+          // restore, a thread that can never become ready — is re-classified and
+          // re-applied on EVERY pass, forever. This deliberately does NOT mirror
+          // the apply-outbox loop below: that loop deletes on its bound, and
+          // deleting is the wrong answer here (see the RETAIN comment further
+          // down for why). Nothing is pushed to `quarantined` from this path on
+          // purpose — no drop happened, so a drop notice would be a lie.
+          if (!digest) continue;
+          const prev = this.#durableRetryFailures.get(digest);
+          const attempts = (prev && Number.isFinite(prev.attempts) ? prev.attempts : 0) + 1;
+          this.#durableRetryFailures.set(digest, { attempts });
+          // Age runs from the work record's PERSISTED createdAtMs, so the bound
+          // survives restarts. Note this is NOT a lifetime cap: the work is never
+          // deleted, so it lives until a durable disposition exists to surface it
+          // (rezprotocol/rez-sdk#3). Attempts are in-memory and reset on restart,
+          // which is deliberate: a device that keeps restarting fails the floor
+          // and therefore never parks on wall-clock alone. That errs toward
+          // retrying an undelivered message, never toward abandoning one — the
+          // M5 rule (plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md). The cost is the
+          // mirror image: parked work is not retried until restart even if the
+          // underlying fault clears. Both are accepted for the interim.
+          const createdAtMs = Number(work && work.createdAtMs);
+          const ageMs = (Number.isFinite(createdAtMs) && Number.isFinite(nowMs))
+            ? Math.max(0, nowMs - createdAtMs)
+            : 0;
+          const overAttempts = Number.isFinite(maxAttempts) && maxAttempts > 0 && attempts >= maxAttempts;
+          const attemptsFloorMet = !(Number.isFinite(minAttemptsForAge) && minAttemptsForAge > 0)
+            || attempts >= minAttemptsForAge;
+          const overAge = Number.isFinite(maxAgeMs) && maxAgeMs > 0 && ageMs >= maxAgeMs && attemptsFloorMet;
+          if (!overAttempts && !overAge) continue;
+          // RETAIN, do not drop. An earlier revision called markDeliveryWorkApplied
+          // here and then pushed a `quarantined` entry — but that entry is a
+          // transient array that becomes a bus event and a session-local UI
+          // notice, not a durable record. Deleting the plaintext first and
+          // notifying second is silent loss whenever no UI is listening or the
+          // process dies between the two lines: replay state reads `applied`,
+          // the next drain finds no pending work and no notice, and the
+          // message is simply gone. The older outbox path had the same flaw;
+          // both paths now retain work instead of trusting a transient notice.
+          //
+          // Interim (review, 2026-08-30): keep the work pending and stop retrying
+          // it for this runtime. Nothing is deleted, so a future durable
+          // disposition can still surface it. The real fix — persist an
+          // idempotent quarantine/notice record BEFORE finalizing the work, and
+          // replay notices on reconnect — belongs to the DT-302 design
+          // (rezprotocol/rez-sdk#3), which owns the durable work store.
+          this.#durableRetryFailures.set(digest, { attempts, exhausted: true });
+          this.#logger.error("[InboundDepositPipeline] durable delivery work " + digest
+            + " exceeded its retry bound (" + (overAge ? "age" : "attempts") + ", attempts=" + attempts
+            + ", ageMs=" + ageMs + "); RETAINED and parked for this runtime, not dropped");
+        }
+      }
+    }
     if (!this.#outbox || typeof this.#outbox.listPending !== "function") {
       return { applied, quarantined };
     }
@@ -403,6 +538,8 @@ export class InboundDepositPipeline {
     for (const entry of pending) {
       const dedupId = entry && typeof entry.dedupId === "string" ? entry.dedupId : "";
       if (!dedupId) continue;
+      const retryKey = JSON.stringify([mailboxId, dedupId]);
+      if (this.#parkedOutboxEntries.has(retryKey)) continue;
       try {
         await this.#events.applyUserMessage(entry.userMessage);
         await this.#markOutboxApplied(mailboxId, dedupId);
@@ -417,16 +554,21 @@ export class InboundDepositPipeline {
         const overAttempts = Number.isFinite(maxAttempts) && maxAttempts > 0 && res.attempts >= maxAttempts;
         // M5 (mobile plan §7): the age bound counts wall-clock — which on a
         // suspended device elapses with ZERO retries run. The attempts floor
-        // makes wall-clock alone unable to quarantine: an entry must have had
-        // real CPU opportunities before age may drop it.
+        // makes wall-clock alone unable to park a barely-tried entry. Neither
+        // this age bound nor the attempt bound authorizes deletion.
         const attemptsFloorMet = !(Number.isFinite(minAttemptsForAge) && minAttemptsForAge > 0)
           || res.attempts >= minAttemptsForAge;
         const overAge = Number.isFinite(maxAgeMs) && maxAgeMs > 0 && ageMs >= maxAgeMs && attemptsFloorMet;
         if (overAttempts || overAge) {
-          // Poison apply: stop retrying forever. Drop from the outbox and report
-          // it so the drain surfaces a visible System notice (no silent loss).
-          await this.#markOutboxApplied(mailboxId, dedupId);
-          quarantined.push({ dedupId, attempts: res.attempts, ageMs, reason: overAge ? "age" : "attempts" });
+          // Retain the only recoverable plaintext. Drop-then-notify loses the
+          // message when no UI is listening or the process dies before the event.
+          // A durable disposition/replay contract must precede finalization
+          // (rezprotocol/rez-sdk#3); until then only successful apply may remove it.
+          this.#parkedOutboxEntries.add(retryKey);
+          this.#logger.error("[InboundDepositPipeline] apply-outbox entry " + dedupId
+            + " in " + mailboxId + " exceeded its retry bound ("
+            + (overAge ? "age" : "attempts") + ", attempts=" + res.attempts
+            + ", ageMs=" + ageMs + "); RETAINED and parked for this runtime, not dropped");
         }
       }
     }

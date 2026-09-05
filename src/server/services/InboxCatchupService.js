@@ -213,8 +213,9 @@ export class InboxCatchupService extends BaseServerService {
     // decrypted-but-unapplied payloads staged in the apply-outbox. This runs
     // for the legacy/fs path too: a message acked as `durable` (staged) but not
     // yet applied has the outbox as its ONLY recovery path (the buffer copy may
-    // be gone / un-re-decryptable), and poison entries surface as System notices
-    // rather than vanishing. Previously this ran only in the durable branch, so
+    // be gone / un-re-decryptable). Over-bound application work is retained and
+    // parked, not deleted based on a transient System notice. Previously this
+    // ran only in the durable branch, so
     // a legacy-path staged-but-unapplied entry was stranded forever.
     await this.#retryApplyOutbox(mailboxId);
 
@@ -505,9 +506,9 @@ export class InboxCatchupService extends BaseServerService {
   // the deposit identity (durable seq or legacy eventId), and how hard we tried; the
   // thread/sender/content are unknowable (the ciphertext never decrypted). The UI
   // renders it as a "couldn't be delivered" failed-message notice (System thread).
-  // Drive the pipeline's apply-outbox retry, then surface any poison entries it
-  // gave up on as quarantine notices (System thread). Bounds come from the same
-  // poison knobs as decrypt quarantine, so the two paths behave consistently.
+  // Drive the pipeline's retained-work retry. Application bounds now park work;
+  // they do not authorize deletion. Keep compatibility with pipelines returning
+  // quarantine results, but this event-only surface is NOT a durable disposition.
   async #retryApplyOutbox(mailboxId) {
     if (!this.#pipeline || typeof this.#pipeline.retryApplyOutbox !== "function") return;
     let result = null;
