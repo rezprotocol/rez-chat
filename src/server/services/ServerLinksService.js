@@ -1,5 +1,8 @@
 import dns from "node:dns";
+import http from "node:http";
+import https from "node:https";
 import net from "node:net";
+import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { SlidingWindowRateLimiter } from "@rezprotocol/node";
 import { LinksUnfurlParams, LinksUnfurlResult } from "../../records/index.js";
@@ -29,6 +32,24 @@ const UNFURL_RATE_LIMITER = new SlidingWindowRateLimiter({
 });
 
 const dnsLookup = promisify(dns.lookup);
+const NON_PUBLIC_IPV4 = new net.BlockList();
+const NON_PUBLIC_IPV6 = new net.BlockList();
+for (const [network, prefix] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
+  ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15],
+  ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 4],
+  ["240.0.0.0", 4],
+]) {
+  NON_PUBLIC_IPV4.addSubnet(network, prefix, "ipv4");
+}
+for (const [network, prefix] of [
+  ["::", 128], ["::1", 128], ["::ffff:0:0", 96], ["64:ff9b:1::", 48],
+  ["100::", 64], ["2001::", 23], ["2002::", 16], ["3fff::", 20],
+  ["5f00::", 16], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
+]) {
+  NON_PUBLIC_IPV6.addSubnet(network, prefix, "ipv6");
+}
 
 /**
  * ServerLinksService: opaque http(s) URL → cached OpenGraph preview.
@@ -48,6 +69,7 @@ export class ServerLinksService extends BaseServerService {
   #store;
   #clock;
   #fetch;
+  #dnsLookup;
 
   constructor({
     bus,
@@ -55,14 +77,16 @@ export class ServerLinksService extends BaseServerService {
     ownerAccountId = null,
     clock = () => Date.now(),
     fetchImpl = null,
+    dnsLookupImpl = dnsLookup,
     logger = console,
   } = {}) {
     super({ bus, ownerAccountId, logger });
     if (!linkPreviewStore) throw new Error("ServerLinksService requires linkPreviewStore");
     this.#store = linkPreviewStore;
     this.#clock = clock;
-    this.#fetch = typeof fetchImpl === "function" ? fetchImpl
-      : (typeof fetch === "function" ? fetch.bind(globalThis) : null);
+    this.#fetch = typeof fetchImpl === "function" ? fetchImpl : fetchPinnedUrl;
+    if (typeof dnsLookupImpl !== "function") throw new Error("ServerLinksService requires dnsLookupImpl");
+    this.#dnsLookup = dnsLookupImpl;
     this._register("links", "unfurl", (payload) => this.unfurl(payload));
   }
 
@@ -118,6 +142,7 @@ export class ServerLinksService extends BaseServerService {
       });
     }
     if (!response.ok) {
+      await cancelResponseBody(response);
       return new LinkPreview({
         url,
         fetchedAtMs: this.#clock(),
@@ -126,6 +151,7 @@ export class ServerLinksService extends BaseServerService {
     }
     const contentType = String(response.headers.get("content-type") || "").toLowerCase();
     if (!contentType.includes("html") && !contentType.includes("xml")) {
+      await cancelResponseBody(response);
       return new LinkPreview({
         url,
         canonicalUrl: String(response.url || url),
@@ -171,9 +197,15 @@ export class ServerLinksService extends BaseServerService {
         err && err.message ? err.message : err);
       return "";
     }
-    if (!response.ok) return "";
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      return "";
+    }
     const contentType = String(response.headers.get("content-type") || "").toLowerCase().split(";")[0].trim();
-    if (!ALLOWED_IMAGE_TYPES.has(contentType)) return "";
+    if (!ALLOWED_IMAGE_TYPES.has(contentType)) {
+      await cancelResponseBody(response);
+      return "";
+    }
     const buf = await readCappedBytes(response, IMAGE_BYTE_LIMIT);
     if (!buf || buf.length === 0) return "";
     const base64 = Buffer.from(buf).toString("base64");
@@ -187,25 +219,24 @@ export class ServerLinksService extends BaseServerService {
    * returns a public IP at lookup time and a private IP at fetch time)
    * and via `redirect: "follow"` to a private-IP Location URL.
    *
-   * Residual TOCTOU: the OS resolver may legitimately return different IPs
-   * between our pre-flight `dns.lookup` and the inner `fetch()`'s own
-   * resolution. The window is tight (typically <100ms with normal DNS
-   * cache TTLs) and an attacker exploiting it must control authoritative
-   * DNS for the requested hostname.
+   * The request connects to the exact vetted address while preserving the
+   * original Host header and TLS SNI. DNS is never resolved a second time.
    */
   async #safeFetch(initialUrl, init) {
     let url = initialUrl;
     let hops = 0;
     while (true) {
-      await assertSafeUrlWithDns(url);
+      const pinnedAddress = await resolveSafeUrlWithDns(url, this.#dnsLookup);
       const response = await fetchWithTimeout(this.#fetch, url, {
         ...init,
         redirect: "manual",
+        pinnedAddress,
       }, FETCH_TIMEOUT_MS);
       const status = response.status;
       if (status >= 300 && status < 400) {
         const location = response.headers.get("location");
         if (!location) return response;
+        await cancelResponseBody(response);
         hops += 1;
         if (hops > MAX_REDIRECTS) {
           throw new Error("too_many_redirects");
@@ -231,7 +262,7 @@ function isSafeHttpUrl(raw) {
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
   if (parsed.username || parsed.password) return false;
-  const host = parsed.hostname.toLowerCase();
+  const host = hostnameWithoutIpv6Brackets(parsed).toLowerCase();
   if (!host || host === "localhost") return false;
   // String-level SSRF pre-filter. The DNS-resolved IP is then checked in
   // assertSafeUrlWithDns(). Both guards are required: this one catches
@@ -253,19 +284,19 @@ function isSafeHttpUrl(raw) {
  * internet. Required to close the DNS-rebinding bypass of isSafeHttpUrl
  * (SECURITY_AUDIT HIGH-10).
  */
-async function assertSafeUrlWithDns(rawUrl) {
+async function resolveSafeUrlWithDns(rawUrl, lookup = dnsLookup) {
   const parsed = new URL(rawUrl);
-  const host = parsed.hostname;
+  const host = hostnameWithoutIpv6Brackets(parsed);
   // Literal IP: pre-filter already rejected the common cases, but cover
   // the remainder (e.g. 100.64/10 CGNAT, fc00::/7 ULA, fe80::/10 link-local
   // expressed in compressed form).
   if (net.isIP(host)) {
     if (isPrivateIp(host)) throw new Error("rejected_private_ip");
-    return;
+    return { address: host, family: net.isIP(host) };
   }
   let addrs;
   try {
-    addrs = await dnsLookup(host, { all: true });
+    addrs = await lookup(host, { all: true });
   } catch (err) {
     throw new Error("dns_lookup_failed: " + (err && err.message ? err.message : "unknown"));
   }
@@ -273,11 +304,14 @@ async function assertSafeUrlWithDns(rawUrl) {
     throw new Error("dns_no_records");
   }
   for (const entry of addrs) {
-    if (!entry || typeof entry.address !== "string") continue;
+    if (!entry || typeof entry.address !== "string" || (entry.family !== 4 && entry.family !== 6)) {
+      throw new Error("dns_invalid_record");
+    }
     if (isPrivateIp(entry.address)) {
       throw new Error("rejected_private_ip");
     }
   }
+  return { address: addrs[0].address, family: addrs[0].family };
 }
 
 /**
@@ -289,44 +323,14 @@ async function assertSafeUrlWithDns(rawUrl) {
 function isPrivateIp(addr) {
   if (typeof addr !== "string" || addr.length === 0) return true;
   const ipv = net.isIP(addr);
-  if (ipv === 4) return isPrivateIpv4(addr);
-  if (ipv === 6) return isPrivateIpv6(addr);
+  if (ipv === 4) return NON_PUBLIC_IPV4.check(addr, "ipv4");
+  if (ipv === 6) return NON_PUBLIC_IPV6.check(addr, "ipv6");
   return true; // not a parseable IP — fail closed
 }
 
-function isPrivateIpv4(addr) {
-  const parts = addr.split(".");
-  if (parts.length !== 4) return true;
-  const o0 = Number(parts[0]);
-  const o1 = Number(parts[1]);
-  if (!Number.isFinite(o0) || !Number.isFinite(o1)) return true;
-  if (o0 === 0) return true;
-  if (o0 === 10) return true;
-  if (o0 === 127) return true;
-  if (o0 === 169 && o1 === 254) return true;
-  if (o0 === 172 && o1 >= 16 && o1 <= 31) return true;
-  if (o0 === 192 && o1 === 168) return true;
-  if (o0 === 100 && o1 >= 64 && o1 <= 127) return true; // CGNAT 100.64.0.0/10
-  if (o0 >= 224) return true; // multicast + reserved
-  return false;
-}
-
-function isPrivateIpv6(addr) {
-  const lower = addr.toLowerCase();
-  if (lower === "::" || lower === "::1") return true;
-  // IPv4-mapped: ::ffff:a.b.c.d — dispatch to IPv4 check
-  const v4MappedMatch = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (v4MappedMatch) return isPrivateIpv4(v4MappedMatch[1]);
-  // Expand and inspect the first 16-bit group for fc00::/7 and fe80::/10.
-  // We don't need a full IPv6 expander — only the leading group matters.
-  const head = lower.split(":")[0];
-  if (head.length === 0) return false;
-  const headNum = Number.parseInt(head, 16);
-  if (!Number.isFinite(headNum)) return true;
-  if ((headNum & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA
-  if ((headNum & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
-  if ((headNum & 0xff00) === 0xff00) return true; // ff00::/8 multicast
-  return false;
+function hostnameWithoutIpv6Brackets(parsed) {
+  const host = parsed.hostname;
+  return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
 }
 
 async function fetchWithTimeout(fetchFn, url, init, timeoutMs) {
@@ -336,6 +340,67 @@ async function fetchWithTimeout(fetchFn, url, init, timeoutMs) {
     return await fetchFn(url, { ...init, signal: ctrl ? ctrl.signal : undefined });
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+function fetchPinnedUrl(rawUrl, init = {}) {
+  const parsed = new URL(rawUrl);
+  const pinned = init.pinnedAddress;
+  if (!pinned || typeof pinned.address !== "string" || (pinned.family !== 4 && pinned.family !== 6)) {
+    return Promise.reject(new Error("missing_pinned_address"));
+  }
+  const transport = parsed.protocol === "https:" ? https : http;
+  const headers = { ...(init.headers || {}), host: parsed.host };
+  return new Promise((resolve, reject) => {
+    let deadline = null;
+    const clearDeadline = () => {
+      if (!deadline) return;
+      clearTimeout(deadline);
+      deadline = null;
+    };
+    const request = transport.request({
+      protocol: parsed.protocol,
+      hostname: pinned.address,
+      family: pinned.family,
+      port: parsed.port || undefined,
+      path: parsed.pathname + parsed.search,
+      method: "GET",
+      headers,
+      servername: parsed.protocol === "https:" ? parsed.hostname : undefined,
+    }, (incoming) => {
+      incoming.once("end", clearDeadline);
+      incoming.once("close", clearDeadline);
+      const status = incoming.statusCode || 500;
+      const hasNoBody = status === 204 || status === 205 || status === 304;
+      resolve(new Response(hasNoBody ? null : Readable.toWeb(incoming), {
+        status,
+        statusText: incoming.statusMessage || "",
+        headers: incoming.headers,
+      }));
+    });
+    deadline = setTimeout(() => request.destroy(new Error("fetch_timeout")), FETCH_TIMEOUT_MS);
+    request.once("error", (err) => {
+      clearDeadline();
+      reject(err);
+    });
+    const signal = init.signal;
+    if (signal && signal.aborted) {
+      request.destroy(new Error("fetch_aborted"));
+      return;
+    }
+    if (signal && typeof signal.addEventListener === "function") {
+      signal.addEventListener("abort", () => request.destroy(new Error("fetch_aborted")), { once: true });
+    }
+    request.end();
+  });
+}
+
+async function cancelResponseBody(response) {
+  if (!response || !response.body || typeof response.body.cancel !== "function") return;
+  try {
+    await response.body.cancel();
+  } catch (err) {
+    void err;
   }
 }
 

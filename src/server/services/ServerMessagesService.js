@@ -1117,10 +1117,15 @@ export class ServerMessagesService extends BaseServerService {
     });
   }
 
-  async handleDeliveryAck({ threadId, messageIds } = {}) {
+  async handleDeliveryAck({ senderAccountId, threadId, messageIds } = {}) {
     const id = typeof threadId === "string" ? threadId.trim() : "";
+    const authenticatedSender = typeof senderAccountId === "string" ? senderAccountId.trim() : "";
     const items = Array.isArray(messageIds) ? messageIds : [];
     if (items.length === 0) return;
+    if (!authenticatedSender) {
+      this.logger.warn("[ServerMessagesService] delivery ack without authenticated sender ignored");
+      return;
+    }
     const now = this.#clock();
     for (const item of items) {
       const messageId = typeof item === "string" ? item.trim() : "";
@@ -1131,6 +1136,14 @@ export class ServerMessagesService extends BaseServerService {
         || (queuedEntry && typeof queuedEntry.threadId === "string" ? queuedEntry.threadId : "")
         || (typeof pendingThreadId === "string" ? pendingThreadId : "");
       if (!resolvedThreadId) continue;
+      const thread = await this.#threadStore.getThread(resolvedThreadId);
+      const expectedSender = thread && thread.threadType !== "group"
+        && typeof thread.peerAccountId === "string" ? thread.peerAccountId : "";
+      if (!expectedSender || expectedSender !== authenticatedSender) {
+        this.logger.warn("[ServerMessagesService] delivery ack sender mismatch for " + messageId
+          + " (authenticated " + authenticatedSender + ", expected " + (expectedSender || "<none>") + "); ignoring");
+        continue;
+      }
       // Hard cutover by message regime (plan §7 decision 1): a SIGNED send's
       // "delivered" is a PROOF carried only by a verified MessageCommitAck.
       // A legacy delivery ack for a message with an open pending-commit row
@@ -1148,9 +1161,6 @@ export class ServerMessagesService extends BaseServerService {
         messageId,
         status: "delivered",
         acceptedAtMs: now,
-      }).catch((err) => {
-        this.logger.error("[ServerMessagesService] delivery ack status persist failed", err && err.message ? err.message : err);
-        this._emit("app.error", { source: "ServerMessagesService", message: "delivery ack status persist failed", severity: "error", err });
       });
       this.#queuedMessages = this.#queuedMessages.filter((entry) => !(entry.threadId === resolvedThreadId && entry.messageId === messageId));
       this.#ackPending.delete(messageId);
@@ -1295,26 +1305,27 @@ export class ServerMessagesService extends BaseServerService {
       return true;
     }
 
-    // Terminal success: consume the pending commit and make "delivered" the
-    // proof it now is (decision 3). Group rows never flip on a member ack
-    // (DT-004); the evidence above is their whole consumption.
+    // Terminal success: persist the user-visible status before consuming its
+    // durable proof intent. A failed status write leaves the pending commit
+    // available for an exact retry. Group rows never flip on a member ack
+    // (DT-004); the verified evidence is their whole consumption.
     const resolvedThreadId = pending ? pending.threadId : record.threadId;
-    if (pending) {
-      await this.#threadStore.deletePendingCommit({ messageId: record.messageId });
-      this.#scheduleCommitSweep();
-    }
-    const thread = await this.#threadStore.getThread(resolvedThreadId).catch(() => null);
-    if (thread && thread.threadType !== "group") {
+    const thread = await this.#threadStore.getThread(resolvedThreadId);
+    if (!thread) throw new Error("commit ack references a missing thread");
+    if (thread.threadType !== "group") {
       const now = this.#clock();
       await this.#threadStore.setMessageStatus({
         threadId: resolvedThreadId,
         messageId: record.messageId,
         status: "delivered",
         acceptedAtMs: now,
-      }).catch((err) => {
-        this.logger.error("[ServerMessagesService] commit-ack status persist failed", err && err.message ? err.message : err);
-        this._emit("app.error", { source: "ServerMessagesService", message: "commit-ack status persist failed", severity: "error", err });
       });
+    }
+    if (pending) {
+      await this.#threadStore.deletePendingCommit({ messageId: record.messageId });
+      this.#scheduleCommitSweep();
+    }
+    if (thread.threadType !== "group") {
       this.#queuedMessages = this.#queuedMessages.filter((entry) => !(entry.threadId === resolvedThreadId && entry.messageId === record.messageId));
       this.#ackPending.delete(record.messageId);
       this.#discardQueueTracking(record.messageId);

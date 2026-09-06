@@ -22,6 +22,10 @@ class MemoryKV {
     return this._data.get(key) || null;
   }
 
+  async getStrict(key) {
+    return this._data.has(key) ? this._data.get(key) : undefined;
+  }
+
   async set(key, value) {
     if (this._failSetIncludes && String(key).includes(this._failSetIncludes)) {
       this._failSetIncludes = "";
@@ -350,6 +354,7 @@ const FAKE_KEYS = {
 class AppKV {
   constructor() { this._data = new Map(); }
   async get(key) { return this._data.get(key); }
+  async getStrict(key) { return this._data.has(key) ? this._data.get(key) : undefined; }
   async set(key, value) { this._data.set(key, value); }
   async delete(key) { this._data.delete(key); }
   async keys(prefix) {

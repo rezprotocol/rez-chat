@@ -713,7 +713,8 @@ export class ServerEventService extends BaseServerService {
     const threadId = typeof body.threadId === "string" ? body.threadId.trim() : "";
     const messageIds = Array.isArray(body.messageIds) ? body.messageIds : [];
     if (messageIds.length === 0) return;
-    await this.bus.services.messages.handleDeliveryAck({ threadId, messageIds });
+    const senderAccountId = typeof body.senderAccountId === "string" ? body.senderAccountId.trim() : "";
+    await this.bus.services.messages.handleDeliveryAck({ senderAccountId, threadId, messageIds });
   }
 
   /**

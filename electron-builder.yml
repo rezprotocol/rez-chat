@@ -93,19 +93,17 @@ asarUnpack:
 # runs. better-sqlite3 is the only native module we ship; the other listed
 # deps (bindings, file-uri-to-path, ws) are pure JS.
 npmRebuild: false
-electronVersion: 31.7.7
+electronVersion: 44.2.0
 
 mac:
   hardenedRuntime: true
   gatekeeperAssess: false
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
-  # Notarization is enabled with an explicit teamId so the unsigned-fallback
-  # path (no CSC_LINK secret) doesn't try to notarize. electron-builder's
-  # notarytool driver reads APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD from env;
-  # we don't embed credentials here.
-  notarize:
-    teamId: "8Z6V759KCC"
+  # electron-builder v26 reads the notarization identity from the APPLE_*
+  # environment variables below. Local unsigned builds have no credentials
+  # and skip this step.
+  notarize: true
   # Code-signing inputs (set in CI as repo secrets, or in env locally):
   #   CSC_LINK                       — base64 of the Developer ID .p12 (or file:/https: URL)
   #   CSC_KEY_PASSWORD               — password for that .p12

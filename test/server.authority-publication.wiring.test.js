@@ -17,6 +17,7 @@ import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 class TestKVStore {
   constructor() { this.map = new Map(); }
   async get(k) { return this.map.has(k) ? this.map.get(k) : null; }
+  async getStrict(k) { return this.map.has(k) ? this.map.get(k) : undefined; }
   async set(k, v) { this.map.set(k, v); }
   async put(k, v) { this.map.set(k, v); }
   async delete(k) { this.map.delete(k); }

@@ -205,6 +205,7 @@ async function waitFor(fn, timeoutMs, label) {
 class TestKVStore {
   constructor() { this._data = new Map(); }
   async get(key) { return this._data.has(key) ? this._data.get(key) : null; }
+  async getStrict(key) { return this._data.has(key) ? this._data.get(key) : undefined; }
   async set(key, value) { this._data.set(key, JSON.parse(JSON.stringify(value))); }
   async delete(key) { this._data.delete(key); }
   async keys(prefix) {

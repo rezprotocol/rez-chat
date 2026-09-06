@@ -35,6 +35,8 @@ const THREAD = "th_ab";
 class AppKV {
   constructor() { this._data = new Map(); this._failSetIncludes = ""; }
   async get(key) { return this._data.get(key); }
+  async getStrict(key) { return this._data.has(key) ? this._data.get(key) : undefined; }
+  async getStrict(key) { return this.get(key); }
   async set(key, value) {
     if (this._failSetIncludes && String(key).includes(this._failSetIncludes)) {
       this._failSetIncludes = "";
@@ -219,7 +221,7 @@ function ackFromAccount(account, { messageId, messageFingerprint, threadId = THR
 }
 
 test("normal delivery: signed send → admitted commit → verified MessageCommitAck → delivered; no legacy ack for the signed regime", async (t) => {
-  const { network, alice, bob } = await setupPair();
+  const { network, alice, bob, bobAccount } = await setupPair();
   t.after(() => teardown(alice, bob));
   await sendSigned(alice, { messageId: "m1", text: "hello bob" });
 
@@ -411,12 +413,16 @@ test("a valid ack terminates the retry regardless of which recipient device/path
 });
 
 test("a legacy delivery ack never flips a signed send to delivered (proof-backed status)", async (t) => {
-  const { network, alice, bob } = await setupPair();
+  const { network, alice, bob, bobAccount } = await setupPair();
   t.after(() => teardown(alice, bob));
   await sendSigned(alice, { messageId: "m1", text: "signed regime" });
   network.queue.length = 0;
 
-  await alice.app.bus.services.messages.handleDeliveryAck({ threadId: THREAD, messageIds: ["m1"] });
+  await alice.app.bus.services.messages.handleDeliveryAck({
+    senderAccountId: bobAccount.accountId,
+    threadId: THREAD,
+    messageIds: ["m1"],
+  });
   assert.equal((await rowOf(alice, "m1")).status, "sent", "the legacy ack is transport evidence, not commit proof");
   assert.equal((await pendingOf(alice)).length, 1, "the retry loop keeps running until real proof arrives");
 });
@@ -432,6 +438,61 @@ test("the unsigned legacy regime is unchanged: no fact, no pending commit, legac
   assert.ok(kinds.includes("rez.delivery.ack"), "the unsigned regime keeps the legacy delivery ack");
   assert.ok(!kinds.includes(MESSAGE_COMMIT_ACK_KIND), "no commit claim exists for an unsigned message");
   assert.equal((await bob.app.bus.stores.threadStore.listOriginalFingerprints({ threadId: THREAD })).length, 0);
+});
+
+test("legacy delivery acks are peer-bound and retain retry state when status persistence fails", async (t) => {
+  const storage = new AppStorageProvider();
+  const { network, alice, bob, bobAccount } = await setupPair({ aliceSigner: false, aliceStorage: storage });
+  t.after(() => teardown(alice, bob));
+  await sendSigned(alice, { messageId: "m1", text: "legacy integrity" });
+  network.queue.length = 0;
+
+  await alice.app.bus.services.messages.handleDeliveryAck({
+    senderAccountId: "rez:acct:mallory",
+    threadId: THREAD,
+    messageIds: ["m1"],
+  });
+  assert.equal((await rowOf(alice, "m1")).status, "sent", "a different peer cannot forge delivery");
+
+  storage.getKeyValueStore(alice.account.accountId).failNextSetIncluding("app:messages/");
+  await assert.rejects(() => alice.app.bus.services.messages.handleDeliveryAck({
+    senderAccountId: bobAccount.accountId,
+    threadId: THREAD,
+    messageIds: ["m1"],
+  }), /injected set failure/);
+  assert.equal((await rowOf(alice, "m1")).status, "sent", "failed durability cannot emit terminal state");
+
+  await alice.app.bus.services.messages.handleDeliveryAck({
+    senderAccountId: bobAccount.accountId,
+    threadId: THREAD,
+    messageIds: ["m1"],
+  });
+  assert.equal((await rowOf(alice, "m1")).status, "delivered", "the same authenticated ack remains retryable");
+});
+
+test("commit proof is retained until delivered status is durable", async (t) => {
+  const storage = new AppStorageProvider();
+  const { network, alice, bob, bobAccount } = await setupPair({ aliceStorage: storage });
+  t.after(() => teardown(alice, bob));
+  await sendSigned(alice, { messageId: "m1", text: "proof ordering" });
+  network.queue.length = 0;
+  const pending = (await pendingOf(alice))[0];
+  const ack = new MessageCommitAckV1(ackFromAccount(bobAccount, {
+    messageId: "m1",
+    messageFingerprint: pending.fingerprint,
+  }));
+
+  storage.getKeyValueStore(alice.account.accountId).failNextSetIncluding("app:messages/");
+  await assert.rejects(
+    () => alice.app.bus.services.messages.handleCommitAck(ack, { senderAccountId: bobAccount.accountId }),
+    /injected set failure/,
+  );
+  assert.equal((await rowOf(alice, "m1")).status, "sent");
+  assert.equal((await pendingOf(alice)).length, 1, "proof intent remains durable after status failure");
+
+  await alice.app.bus.services.messages.handleCommitAck(ack, { senderAccountId: bobAccount.accountId });
+  assert.equal((await rowOf(alice, "m1")).status, "delivered");
+  assert.equal((await pendingOf(alice)).length, 0);
 });
 
 test("pending commits survive a sender restart: the durable row drives the resumed retry", async (t) => {

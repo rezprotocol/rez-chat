@@ -39,18 +39,30 @@ async function rebuildBetterSqliteForElectron({ platform, arch } = {}) {
     "[desktop:native] installing better-sqlite3 prebuild for Electron " + target
     + " (" + targetPlatform + "-" + targetArch + ")",
   );
-  await runCommand(process.execPath, [
-    PREBUILD_INSTALL,
-    "--runtime",
-    "electron",
-    "--target",
-    target,
-    "--platform",
-    targetPlatform,
-    "--arch",
-    targetArch,
-    "--force",
-  ], BETTER_SQLITE_ROOT);
+  try {
+    await runCommand(process.execPath, [
+      PREBUILD_INSTALL,
+      "--runtime",
+      "electron",
+      "--target",
+      target,
+      "--platform",
+      targetPlatform,
+      "--arch",
+      targetArch,
+      "--force",
+    ], BETTER_SQLITE_ROOT);
+  } catch (err) {
+    if (targetPlatform !== process.platform || targetArch !== process.arch) throw err;
+    console.warn("[desktop:native] no matching prebuild; compiling better-sqlite3 from source");
+    await runCommand("npm", ["rebuild", "better-sqlite3", "--build-from-source"], CHAT_ROOT, {
+      npm_config_runtime: "electron",
+      npm_config_target: target,
+      npm_config_arch: targetArch,
+      npm_config_dist_url: "https://electronjs.org/headers",
+      npm_config_build_from_source: "true",
+    });
+  }
 }
 
 function electronTargetVersion() {

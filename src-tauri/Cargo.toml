@@ -47,6 +47,12 @@ windows = { version = "0.58", features = [
   "Foundation",
 ] }
 
+# Tauri 2's Linux GTK3 stack still requires glib 0.18.5. This immutable
+# backport is based on the official gtk-rs 0.18 branch head and contains only
+# the two-line VariantStrIter fix for RUSTSEC-2024-0429.
+[patch.crates-io]
+glib = { git = "https://github.com/Quickture/gtk-rs-core", rev = "40b7211287f85b7d06077dcf4457c80a4ab1c57e" }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

@@ -20,6 +20,7 @@ function makeKvStore() {
   const m = new Map();
   return {
     async get(k) { return m.has(k) ? m.get(k) : undefined; },
+    async getStrict(k) { return m.has(k) ? m.get(k) : undefined; },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) {
@@ -33,7 +34,30 @@ function makeKvStore() {
 function makeStorageProvider() {
   const kv = makeKvStore();
   const peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: kv });
-  return { getPeerLinkStorage() { return peerLinkStorage; }, getKeyValueStore() { return kv; }, peerLinkStorage };
+  let activeOwnerId = null;
+  let runtimeEpoch = 0;
+  return {
+    getPeerLinkStorage() { return peerLinkStorage; },
+    getKeyValueStore() { return kv; },
+    async acquireRuntimeOwnership({ ownerId }) {
+      if (activeOwnerId !== null) throw new Error("runtime already active");
+      activeOwnerId = ownerId;
+      runtimeEpoch += 1;
+      let released = false;
+      return {
+        runtimeEpoch,
+        assertActive() {
+          if (released || activeOwnerId !== ownerId) throw new Error("runtime fenced");
+        },
+        async release() {
+          if (released) return;
+          released = true;
+          if (activeOwnerId === ownerId) activeOwnerId = null;
+        },
+      };
+    },
+    peerLinkStorage,
+  };
 }
 
 async function makeDeviceKey() {

@@ -36,8 +36,8 @@ export class InboundApplyOutbox {
   #kvStore;
 
   constructor({ kvStore } = {}) {
-    if (!kvStore || typeof kvStore.get !== "function" || typeof kvStore.set !== "function" || typeof kvStore.delete !== "function") {
-      throw new Error("InboundApplyOutbox requires kvStore with get/set/delete");
+    if (!kvStore || typeof kvStore.getStrict !== "function" || typeof kvStore.set !== "function" || typeof kvStore.delete !== "function") {
+      throw new Error("InboundApplyOutbox requires kvStore with getStrict/set/delete");
     }
     this.#kvStore = kvStore;
   }
@@ -55,8 +55,21 @@ export class InboundApplyOutbox {
 
   // The per-mailbox map of staged entries, normalized to a plain object.
   async #loadMap(mailboxId) {
-    const stored = await this.#kvStore.get(this.#mailboxKey(mailboxId));
-    return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+    const stored = await this.#kvStore.getStrict(this.#mailboxKey(mailboxId));
+    if (stored === undefined) return {};
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
+      throw new Error("InboundApplyOutbox durable mailbox is malformed");
+    }
+    for (const [dedupId, entry] of Object.entries(stored)) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)
+          || entry.mailboxId !== mailboxId || entry.dedupId !== dedupId
+          || !Number.isInteger(entry.attempts) || entry.attempts < 0
+          || !Number.isFinite(entry.firstStagedAtMs)
+          || (entry.lastAttemptAtMs !== null && !Number.isFinite(entry.lastAttemptAtMs))) {
+        throw new Error("InboundApplyOutbox durable entry is malformed");
+      }
+    }
+    return stored;
   }
 
   // Persist the per-mailbox map (one atomic write), pruning to empty → delete so

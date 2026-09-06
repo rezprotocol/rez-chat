@@ -20,6 +20,7 @@ const QUIET = { error() {}, warn() {}, info() {}, log() {} };
 class MemKv {
   constructor() { this.data = new Map(); }
   async get(key) { return this.data.has(key) ? this.data.get(key) : null; }
+  async getStrict(key) { return this.data.has(key) ? this.data.get(key) : undefined; }
   async set(key, value) { this.data.set(key, value); }
   async delete(key) { this.data.delete(key); }
 }

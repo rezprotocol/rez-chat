@@ -13,7 +13,6 @@
     "core:window:allow-show",
     "core:window:allow-set-focus",
     "dialog:default",
-    "opener:default",
     "notification:default",
     "process:allow-restart"
   ]

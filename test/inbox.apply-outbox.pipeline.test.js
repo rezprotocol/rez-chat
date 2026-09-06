@@ -21,6 +21,7 @@ function makeKv() {
   const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
   return {
     async get(k) { return m.has(k) ? clone(m.get(k)) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, clone(v)); },
     async delete(k) { return m.delete(k); },
   };

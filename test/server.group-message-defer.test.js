@@ -15,6 +15,7 @@ import { MESSAGE_KIND } from "../src/records/payloads/ChatMessagePayloadV1.js";
 class TestKVStore {
   constructor() { this._data = new Map(); }
   async get(key) { return this._data.get(key); }
+  async getStrict(key) { return this._data.has(key) ? this._data.get(key) : undefined; }
   async set(key, value) { this._data.set(key, value); }
   async delete(key) { this._data.delete(key); }
   async keys(prefix) {

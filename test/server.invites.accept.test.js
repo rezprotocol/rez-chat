@@ -47,6 +47,10 @@ class TestKVStore {
     return this._data.get(key);
   }
 
+  async getStrict(key) {
+    return this._data.has(key) ? this._data.get(key) : undefined;
+  }
+
   async set(key, value) {
     this._data.set(key, value);
   }

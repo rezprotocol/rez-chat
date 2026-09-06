@@ -9,6 +9,7 @@ function makeKv() {
   const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
   return {
     async get(k) { return m.has(k) ? clone(m.get(k)) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, clone(v)); },
     async delete(k) { return m.delete(k); },
   };
@@ -79,6 +80,7 @@ test("staging is atomic — a failed write strands no invisible entry", async ()
   let failNextSet = false;
   const kv = {
     async get(k) { return m.has(k) ? JSON.parse(JSON.stringify(m.get(k))) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) {
       if (failNextSet) { failNextSet = false; throw new Error("kv set boom"); }
       m.set(k, JSON.parse(JSON.stringify(v)));
@@ -103,6 +105,7 @@ test("a fully-drained mailbox leaves no key behind", async () => {
   const m = new Map();
   const kv = {
     async get(k) { return m.has(k) ? JSON.parse(JSON.stringify(m.get(k))) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, JSON.parse(JSON.stringify(v))); },
     async delete(k) { return m.delete(k); },
   };
@@ -110,4 +113,18 @@ test("a fully-drained mailbox leaves no key behind", async () => {
   await ob.stage(MBOX, "seq:1", { n: 1 });
   await ob.markApplied(MBOX, "seq:1");
   assert.equal(m.size, 0, "the per-mailbox record is removed once empty");
+});
+
+test("corrupt durable plaintext fails closed and cannot be overwritten", async () => {
+  const m = new Map([["chat-server:inbox:apply-outbox:v1:" + MBOX, "corrupt-existing-plaintext"]]);
+  const kv = {
+    async get() { throw new Error("nonstrict read must not be used"); },
+    async getStrict(k) { return m.get(k); },
+    async set(k, v) { m.set(k, v); },
+    async delete(k) { return m.delete(k); },
+  };
+  const ob = new InboundApplyOutbox({ kvStore: kv });
+  await assert.rejects(() => ob.listPending(MBOX), /durable mailbox is malformed/);
+  await assert.rejects(() => ob.stage(MBOX, "seq:new", { text: "new" }), /durable mailbox is malformed/);
+  assert.equal(m.get("chat-server:inbox:apply-outbox:v1:" + MBOX), "corrupt-existing-plaintext");
 });

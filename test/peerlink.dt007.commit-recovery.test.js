@@ -163,6 +163,7 @@ test("DT-302: a committed receive survives a projection crash and rolls forward 
   assert.ok(projectionFailures >= 2, "bounded projection retries were exhausted");
   assert.equal((await kv.keys(DELIVERY_COMMIT_PREFIX)).length, 1, "the durable commit remains recoverable");
   kv.set = originalSet;
+  await b.svc.close();
 
   const restarted = makeService({
     accountId: bob.accountId,
