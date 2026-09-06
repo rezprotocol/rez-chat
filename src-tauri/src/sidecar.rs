@@ -333,8 +333,8 @@ impl Drop for SidecarHandle {
 ///      bundled externalBin follows the RUST target triple, which on a
 ///      Rosetta-installed rustup is x86_64 even on arm64 Macs; loading an
 ///      arm64 .node from an x86_64 node aborts the sidecar.
-///   3. release builds: the bundled sidecar binary next to the app
-///      executable (externalBin), PATH `node` as a last resort.
+///   3. release builds: the app-specific bundled sidecar binary next to the
+///      app executable (externalBin), PATH `node` as a last resort.
 pub fn resolve_node_bin() -> PathBuf {
     if let Ok(env_bin) = std::env::var("REZ_NODE_BIN") {
         let trimmed = env_bin.trim();
@@ -347,7 +347,11 @@ pub fn resolve_node_bin() -> PathBuf {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let bundled = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
+            let bundled = dir.join(if cfg!(windows) {
+                "rez-chat-node.exe"
+            } else {
+                "rez-chat-node"
+            });
             if bundled.exists() {
                 return bundled;
             }

@@ -2,10 +2,10 @@
  * Fetches the official Node.js binary for the Tauri sidecar (externalBin).
  *
  * Tauri's externalBin convention wants per-target-triple names:
- *   src-tauri/binaries/node-aarch64-apple-darwin
- *   src-tauri/binaries/node-x86_64-apple-darwin
- *   src-tauri/binaries/node-x86_64-pc-windows-msvc.exe
- *   src-tauri/binaries/node-x86_64-unknown-linux-gnu
+ *   src-tauri/binaries/rez-chat-node-aarch64-apple-darwin
+ *   src-tauri/binaries/rez-chat-node-x86_64-apple-darwin
+ *   src-tauri/binaries/rez-chat-node-x86_64-pc-windows-msvc.exe
+ *   src-tauri/binaries/rez-chat-node-x86_64-unknown-linux-gnu
  *
  * Usage:
  *   node scripts/fetch-sidecar-node.mjs              # host triple
@@ -27,6 +27,7 @@ const NODE_VERSION = "22.15.0";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHAT_ROOT = path.resolve(__dirname, "..");
 const BIN_DIR = path.join(CHAT_ROOT, "src-tauri", "binaries");
+const SIDECAR_BASENAME = "rez-chat-node";
 
 const TRIPLE_TO_DIST = {
   "aarch64-apple-darwin": { dist: `node-v${NODE_VERSION}-darwin-arm64`, ext: "tar.gz", binPath: "bin/node" },
@@ -58,7 +59,7 @@ async function main() {
     throw new Error("Unknown target triple '" + triple + "'. Known: " + Object.keys(TRIPLE_TO_DIST).join(", "));
   }
   const isWindows = triple.includes("windows");
-  const outName = "node-" + triple + (isWindows ? ".exe" : "");
+  const outName = SIDECAR_BASENAME + "-" + triple + (isWindows ? ".exe" : "");
   const outPath = path.join(BIN_DIR, outName);
   if (fs.existsSync(outPath)) {
     console.log("[fetch-sidecar-node] already present: " + outPath);

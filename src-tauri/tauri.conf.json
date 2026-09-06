@@ -18,7 +18,7 @@
     "targets": ["app", "dmg", "nsis", "appimage", "deb"],
     "icon": ["../build/icon.icns", "../build/icon.ico", "../build/icon.png"],
     "createUpdaterArtifacts": true,
-    "externalBin": ["binaries/node"],
+    "externalBin": ["binaries/rez-chat-node"],
     "resources": {
       "../package.json": "package.json",
       "../src": "src",

@@ -50,7 +50,7 @@ permissions:
 env:
   REZ_CORE_REF: 652d3320c92349aecf8e774e124c63d6546d4230
   REZ_SDK_REF: c5a51bcd9a21e9528f4e315f2a21b85fbdc54b4f
-  REZ_NODE_REF: b1acd746a1a2935571648eb3d2ab0b6c12561020
+  REZ_NODE_REF: 9781e0d7d1a4be7b449734940ab9a80696dc7fc6
   REZ_UI_REF: b90a568fca87415bbdafa8b9d5cf3ec3af2ae548
 
 jobs:
@@ -271,7 +271,7 @@ jobs:
         working-directory: rez-chat
 
       - name: Deep-sign bundled native modules (macOS)
-        # Tauri signs the .app and the bundled `node` externalBin, but treats
+        # Tauri signs the .app and the bundled `rez-chat-node` externalBin, but treats
         # node_modules as plain resources — so the better-sqlite3 native addon
         # ships unsigned and Apple's notary rejects the archive ("not signed
         # with a valid Developer ID certificate" / "no secure timestamp").
@@ -425,7 +425,7 @@ jobs:
           mapfile -t app_candidates < <(
             dpkg-query --listfiles "$package" \
               | grep '^/usr/bin/' \
-              | grep -v '/node$'
+              | grep -v '/rez-chat-node$'
           )
           test "${#app_candidates[@]}" -eq 1
           test -x "${app_candidates[0]}"
