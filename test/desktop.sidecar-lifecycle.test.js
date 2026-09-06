@@ -15,7 +15,10 @@ const CHAT_ROOT = path.resolve(__dirname, "..");
 const SIDECAR_ENTRY = path.join(CHAT_ROOT, "src", "desktop", "sidecar-main.js");
 const MARKER = HostChannel.MARKER;
 
-let nodeWsPortCounter = 38000 + Math.floor(Math.random() * 1000);
+// Keep child sidecar ports below the default ephemeral ranges used by Linux,
+// macOS, and Windows. Tests that choose from an ephemeral range can collide
+// with unrelated outbound connections before the sidecar binds its listener.
+let nodeWsPortCounter = 13000 + Math.floor(Math.random() * 900);
 function nextNodeWsPort() {
   nodeWsPortCounter += 1;
   return nodeWsPortCounter;
