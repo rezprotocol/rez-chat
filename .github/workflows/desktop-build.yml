@@ -20,6 +20,11 @@ name: Desktop Build
 #       macOS code signing + notarization (same Developer ID material as the
 #       Electron pipeline; APPLE_CERTIFICATE is the base64 .p12 previously
 #       stored as CSC_LINK).
+#   WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD / WINDOWS_TIMESTAMP_URL
+#       Windows Authenticode PFX, export password, and the certificate
+#       provider's RFC 3161 timestamp URL. Tag builds fail closed when the
+#       resulting installer is not validly signed; manual smoke runs may use
+#       unsigned artifacts.
 #
 # NOTE (notarization): the bundled Node sidecar (externalBin) and
 # better-sqlite3's .node files inside Resources must be signed as part of
@@ -40,8 +45,136 @@ on:
 permissions:
   contents: write
 
+# Immutable release inputs. Keep the preflight and all platform bundles on
+# exactly one reviewed source set; changing a sibling revision is one edit.
+env:
+  REZ_CORE_REF: 652d3320c92349aecf8e774e124c63d6546d4230
+  REZ_SDK_REF: c5a51bcd9a21e9528f4e315f2a21b85fbdc54b4f
+  REZ_NODE_REF: b1acd746a1a2935571648eb3d2ab0b6c12561020
+  REZ_UI_REF: b90a568fca87415bbdafa8b9d5cf3ec3af2ae548
+
 jobs:
+  preflight:
+    name: Security and recovery preflight
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      REZ_PG_TEST_URL: postgres://postgres:postgres@127.0.0.1:5433/postgres
+      REZ_REDIS_TEST_URL: redis://127.0.0.1:6380
+    steps:
+      - name: Checkout rez-chat
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: rez-chat
+
+      - name: Checkout rez-core
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: rezprotocol/rez-core
+          path: rez-core
+          ref: ${{ env.REZ_CORE_REF }}
+
+      - name: Checkout rez-sdk
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: rezprotocol/rez-sdk
+          path: rez-sdk
+          ref: ${{ env.REZ_SDK_REF }}
+
+      - name: Checkout rez-node
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: rezprotocol/rez-node
+          path: rez-node
+          ref: ${{ env.REZ_NODE_REF }}
+
+      - name: Checkout rez-ui
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: rezprotocol/rez-ui
+          path: rez-ui
+          ref: ${{ env.REZ_UI_REF }}
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22.x"
+          cache: npm
+          cache-dependency-path: rez-chat/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Install rez-chat dependency graph
+        run: npm ci --install-links --no-audit --no-fund
+        working-directory: rez-chat
+
+      - name: Share the single installed dependency graph with sibling tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for repo in rez-core rez-sdk rez-node rez-ui; do
+            ln -s "$GITHUB_WORKSPACE/rez-chat/node_modules" "$GITHUB_WORKSPACE/$repo/node_modules"
+          done
+
+      - name: Audit JavaScript dependencies
+        run: npm audit --audit-level=low
+        working-directory: rez-chat
+
+      - name: Install pinned RustSec scanner
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Audit Rust dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo audit --no-yanked --json > "$RUNNER_TEMP/cargo-audit.json"
+          jq -e '(.vulnerabilities.count == 0) and (((.warnings.unsound // []) | length) == 0)' \
+            "$RUNNER_TEMP/cargo-audit.json"
+        working-directory: rez-chat/src-tauri
+
+      - name: Test rez-core
+        run: npm test
+        working-directory: rez-core
+
+      - name: Test rez-sdk
+        run: npm test
+        working-directory: rez-sdk
+
+      - name: Test rez-node with durable backends
+        run: npm test
+        working-directory: rez-node
+
+      - name: Test rez-ui
+        run: npm test
+        working-directory: rez-ui
+
+      - name: Test rez-chat
+        run: npm test
+        working-directory: rez-chat
+
+      - name: Test encrypted local mesh and restart recovery
+        run: npm run test:e2e:local-mesh
+        working-directory: rez-chat
+
   build:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -59,50 +192,50 @@ jobs:
 
     steps:
       - name: Checkout rez-chat
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           path: rez-chat
 
       - name: Checkout rez-core
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: rezprotocol/rez-core
           path: rez-core
-          ref: 89c23c62e3e8eea8efab90e425785c912681135e
+          ref: ${{ env.REZ_CORE_REF }}
 
       - name: Checkout rez-sdk
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: rezprotocol/rez-sdk
           path: rez-sdk
-          ref: 2db12a2ae7798e86b8e2635c159ec748db2fb8c3
+          ref: ${{ env.REZ_SDK_REF }}
 
       - name: Checkout rez-node
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: rezprotocol/rez-node
           path: rez-node
-          ref: 9d45e79139f7ce847f88c7be25d1578f506432ae
+          ref: ${{ env.REZ_NODE_REF }}
 
       - name: Checkout rez-ui
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: rezprotocol/rez-ui
           path: rez-ui
-          ref: c49399b562f6badc53833d05b18a703e5f28e3ca
+          ref: ${{ env.REZ_UI_REF }}
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22.x"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: rez-chat/src-tauri
 
@@ -120,7 +253,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
-            librsvg2-dev patchelf libsecret-1-dev
+            librsvg2-dev patchelf libsecret-1-dev xvfb
 
       - name: Install rez-chat deps
         # `--install-links` copies the sibling `file:..` deps into
@@ -180,8 +313,37 @@ jobs:
             echo "::error::No better-sqlite3 .node binary found to sign"; exit 1
           fi
 
+      - name: Import Windows signing certificate (tag builds)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) { throw "WINDOWS_CERTIFICATE is required for tag builds" }
+          if (-not $env:WINDOWS_CERTIFICATE_PASSWORD) { throw "WINDOWS_CERTIFICATE_PASSWORD is required for tag builds" }
+          if (-not $env:WINDOWS_TIMESTAMP_URL) { throw "WINDOWS_TIMESTAMP_URL is required for tag builds" }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "rez-windows-signing.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $imported = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          $certificate = $imported | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
+          if (-not $certificate) { throw "Windows signing certificate import failed" }
+          $config = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $certificate.Thumbprint
+                digestAlgorithm = "sha256"
+                timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+              }
+            }
+          }
+          $config | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 "src-tauri/tauri.windows-signing.json"
+          Remove-Item $pfxPath -Force
+
       - name: Build desktop (${{ matrix.target }})
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -201,7 +363,9 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: rez-chat
-          args: --target ${{ matrix.target }}
+          args: >-
+            --target ${{ matrix.target }}
+            ${{ runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v') && '--config src-tauri/tauri.windows-signing.json' || '' }}
           # Tag builds publish to a draft release with updater JSON; manual
           # runs only produce artifacts.
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
@@ -209,9 +373,69 @@ jobs:
           releaseDraft: true
           includeUpdaterJson: true
 
+      - name: Verify Windows Authenticode signature (tag builds)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
+          if (-not $installer) { throw "Windows NSIS installer was not produced" }
+          $signature = Get-AuthenticodeSignature $installer.FullName
+          if ($signature.Status -ne "Valid") {
+            throw "Windows installer signature is $($signature.Status): $($signature.StatusMessage)"
+          }
+        working-directory: rez-chat
+
+      - name: Install Windows artifact for smoke test
+        if: runner.os == 'Windows'
+        id: windows-install
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
+          if (-not $installer) { throw "Windows NSIS installer was not produced" }
+          $installDir = Join-Path $env:RUNNER_TEMP "rez-chat-smoke-install"
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList "/S", "/D=$installDir" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Windows installer exited $($install.ExitCode)" }
+          $app = Get-ChildItem $installDir -Recurse -Filter "Rez Chat.exe" | Select-Object -First 1
+          if (-not $app) { throw "Installed Rez Chat.exe was not found beneath $installDir" }
+          "executable=$($app.FullName)" >> $env:GITHUB_OUTPUT
+        working-directory: rez-chat
+
+      - name: Smoke installed Windows app twice
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          node scripts/verify-packaged-desktop.mjs
+          --executable "${{ steps.windows-install.outputs.executable }}"
+          --data-dir "$env:RUNNER_TEMP\rez-chat-smoke-profile"
+        working-directory: rez-chat
+
+      - name: Validate Linux deb structure
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/deb" -name '*.deb' -print -quit)
+          test -n "$deb"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb" | grep -q '/usr/bin/'
+        working-directory: rez-chat
+
+      - name: Smoke Linux AppImage twice
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/appimage" -name '*.AppImage' -print -quit)
+          test -n "$appimage"
+          chmod +x "$appimage"
+          xvfb-run -a node scripts/verify-packaged-desktop.mjs \
+            --executable "$appimage" \
+            --data-dir "$RUNNER_TEMP/rez-chat-smoke-profile"
+        working-directory: rez-chat
+
       - name: Upload artifacts (manual runs)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: desktop-${{ matrix.target }}
           path: |

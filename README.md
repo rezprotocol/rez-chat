@@ -64,7 +64,9 @@ cargo tauri build
 
 The bundle is written beneath `src-tauri/target/release/bundle/`. On the matching operating system, reproduce a specific CI target by passing its target triple to both `fetch-sidecar-node.mjs` and `cargo tauri build --target`.
 
-The `Desktop Build` GitHub Actions workflow is the canonical release path. Manual runs upload build artifacts; a `v*` tag creates a draft GitHub Release with platform installers and signed updater metadata.
+The `Desktop Build` GitHub Actions workflow is the canonical release path. Before any platform build starts, it audits the JavaScript and Rust dependency graphs, runs the full suites for rez-core, rez-sdk, rez-node, rez-ui, and rez-chat against one pinned source set, and exercises encrypted delivery plus restart recovery on a local mesh. The Windows job silently installs the NSIS artifact and launches it twice; the Linux job validates the Debian package and launches the AppImage twice. Both runtime checks require the bundled sidecar to become healthy, create its durable vault, restart with a fresh instance identity, and exit with its desktop host while no PATH-installed Node is available.
+
+Manual runs upload smoke-tested build artifacts. A `v*` tag creates a draft GitHub Release with platform installers and signed updater metadata. The draft remains unpublished until every matrix job succeeds and a maintainer reviews the run.
 
 ### Deprecated Electron shell
 
@@ -84,6 +86,10 @@ Local macOS builds use a Developer ID Application identity already installed in 
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for the updater private key |
 
 CI imports its Developer ID certificate from `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD`, maps the `APPLE_APP_SPECIFIC_PASSWORD` secret to `APPLE_PASSWORD`, deep-signs the bundled native SQLite module, and lets Tauri sign and notarize the final bundle. The complete release contract lives in [`.github/workflows/desktop-build.yml`](./.github/workflows/desktop-build.yml).
+
+### Code signing (Windows)
+
+Windows tag builds require `WINDOWS_CERTIFICATE` (the raw base64-encoded Authenticode PFX), `WINDOWS_CERTIFICATE_PASSWORD`, and `WINDOWS_TIMESTAMP_URL` (the certificate provider's RFC 3161 timestamp service). The workflow imports the certificate into the runner, signs the NSIS installer, and rejects the build unless Windows reports a valid Authenticode signature. Manual workflow runs may remain unsigned so contributors can exercise the packaging and runtime gates without release credentials.
 
 ---
 
