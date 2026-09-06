@@ -25,6 +25,7 @@ import { startRezChatCore } from "../src/mobile/startRezChatCore.js";
 import { DeviceActivationJournal, ACTIVATION_STATES } from "../src/server/device/DeviceActivationJournal.js";
 import { readPortablePrimaryInboxId } from "../src/server/inbox/PortableInboxEstablisher.js";
 import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
+import { createTestRuntimeOwnership } from "./support/testRuntimeOwnership.js";
 
 /**
  * P1.3d ACCEPTANCE — the full split-transport enrollment handoff under ugly
@@ -218,6 +219,7 @@ class HostStorageProvider {
   constructor() {
     this._stores = new Map();
     this._peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: this.getKeyValueStore(null) });
+    this._acquireRuntimeOwnership = createTestRuntimeOwnership();
   }
   getKeyValueStore(name) {
     const key = name == null ? "" : String(name);
@@ -225,6 +227,7 @@ class HostStorageProvider {
     return this._stores.get(key);
   }
   getPeerLinkStorage() { return this._peerLinkStorage; }
+  acquireRuntimeOwnership(options) { return this._acquireRuntimeOwnership(options); }
 }
 
 function memoryStorageProvider() {

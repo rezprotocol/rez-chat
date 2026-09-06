@@ -23,6 +23,7 @@ import { activateDelegatedDevice } from "../src/mobile/activateDelegatedDevice.j
 import { prepareDelegatedCoreBoot } from "../src/mobile/prepareDelegatedCoreBoot.js";
 import { startRezChatCore } from "../src/mobile/startRezChatCore.js";
 import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
+import { createTestRuntimeOwnership } from "./support/testRuntimeOwnership.js";
 
 /**
  * LIVE local-mesh SPLIT-TRANSPORT ACTIVATION e2e — the P1.3b acceptance
@@ -175,6 +176,7 @@ class HostStorageProvider {
   constructor() {
     this._stores = new Map();
     this._peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: this.getKeyValueStore(null) });
+    this._acquireRuntimeOwnership = createTestRuntimeOwnership();
   }
   getKeyValueStore(name) {
     const key = name == null ? "" : String(name);
@@ -182,6 +184,7 @@ class HostStorageProvider {
     return this._stores.get(key);
   }
   getPeerLinkStorage() { return this._peerLinkStorage; }
+  acquireRuntimeOwnership(options) { return this._acquireRuntimeOwnership(options); }
 }
 
 function memoryStorageProvider() {
