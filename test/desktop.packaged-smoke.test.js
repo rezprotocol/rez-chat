@@ -8,8 +8,9 @@ import { verifyPackagedDesktop } from "../scripts/verify-packaged-desktop.mjs";
 test("packaged verifier requires two healthy starts and reaps each sidecar", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rez-packaged-smoke-"));
   const dataDir = path.join(root, "profile");
-  const fixturePath = path.join(root, "fixture.mjs");
-  fs.writeFileSync(fixturePath, `
+  const serverPath = path.join(root, "server.mjs");
+  const launcherPath = path.join(root, "launcher.mjs");
+  fs.writeFileSync(serverPath, `
     import fs from "node:fs";
     import http from "node:http";
     import path from "node:path";
@@ -39,11 +40,18 @@ test("packaged verifier requires two healthy starts and reaps each sidecar", asy
       }));
     });
   `, "utf8");
+  fs.writeFileSync(launcherPath, `
+    import { spawn } from "node:child_process";
+    const server = spawn(process.execPath, [${JSON.stringify(serverPath)}], {
+      stdio: "inherit",
+    });
+    server.on("exit", (code) => process.exit(code == null ? 1 : code));
+  `, "utf8");
 
   try {
     const result = await verifyPackagedDesktop({
       executable: process.execPath,
-      launchArgs: [fixturePath],
+      launchArgs: [launcherPath],
       dataDir,
       cycles: 2,
       timeoutMs: 10_000,

@@ -57,6 +57,7 @@ jobs:
   preflight:
     name: Security and recovery preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16
@@ -175,6 +176,7 @@ jobs:
 
   build:
     needs: preflight
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -429,7 +431,7 @@ jobs:
           )
           test "${#app_candidates[@]}" -eq 1
           test -x "${app_candidates[0]}"
-          xvfb-run -a node scripts/verify-packaged-desktop.mjs \
+          timeout --signal=TERM --kill-after=30s 6m xvfb-run -a node scripts/verify-packaged-desktop.mjs \
             --executable "${app_candidates[0]}" \
             --data-dir "$RUNNER_TEMP/rez-chat-deb-smoke-profile"
         working-directory: rez-chat
@@ -442,7 +444,7 @@ jobs:
           appimage=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/appimage" -name '*.AppImage' -print -quit)
           test -n "$appimage"
           chmod +x "$appimage"
-          xvfb-run -a node scripts/verify-packaged-desktop.mjs \
+          timeout --signal=TERM --kill-after=30s 6m xvfb-run -a node scripts/verify-packaged-desktop.mjs \
             --executable "$appimage" \
             --data-dir "$RUNNER_TEMP/rez-chat-smoke-profile"
         working-directory: rez-chat

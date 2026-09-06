@@ -198,16 +198,30 @@ async function waitForExit(child, timeoutMs) {
 }
 
 async function terminateProcessTree(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
   if (process.platform === "win32") {
+    if (child.exitCode !== null || child.signalCode !== null) return;
     // Kill only the GUI host. The Windows Job Object must reap the bundled
     // sidecar; waitForPidDeath below turns a broken job fence into a failure.
     await execFileAsync("taskkill", ["/PID", String(child.pid), "/F"]).catch((err) => {
       if (child.exitCode === null && child.signalCode === null) throw err;
     });
   } else {
-    child.kill("SIGTERM");
-    if (!await waitForExit(child, 10_000)) child.kill("SIGKILL");
+    // AppImage launchers can leave the real GUI process beneath them. Put the
+    // launch in its own process group and signal the whole group, including
+    // descendants that inherited our stdout/stderr pipes. Killing only the
+    // launcher can otherwise leave both the app and this verifier alive.
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch (err) {
+      if (!err || err.code !== "ESRCH") throw err;
+    }
+    if (!await waitForExit(child, 10_000)) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch (err) {
+        if (!err || err.code !== "ESRCH") throw err;
+      }
+    }
   }
   await waitForExit(child, 10_000);
 }
@@ -242,6 +256,7 @@ export async function verifyPackagedDesktop(options = {}) {
       env: childEnv,
       cwd: path.dirname(checked.executable),
       stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
       windowsHide: false,
     });
     const output = captureOutput(child, "cycle-" + cycle);
