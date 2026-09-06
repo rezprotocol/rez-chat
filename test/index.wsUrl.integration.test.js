@@ -117,7 +117,11 @@ test("startRezChat applies env overrides for config path, ws port, and data dir"
     REZ_NODE_DATA_DIR: process.env.REZ_NODE_DATA_DIR,
   };
   process.env.REZ_CHAT_CONFIG_PATH = fixture.configPath;
-  const wsPort = 30000 + Math.floor(Math.random() * 20000);
+  // Keep the explicit override below the default ephemeral ranges used by
+  // Linux, macOS, and Windows. Other tests bind port 0 concurrently, so
+  // sampling inside the ephemeral range can collide with a kernel-assigned
+  // listener between selection and startRezChat().
+  const wsPort = 20000 + Math.floor(Math.random() * 10000);
   process.env.REZ_NODE_WS_PORT = String(wsPort);
   process.env.REZ_NODE_DATA_DIR = dataDir;
   let app;
