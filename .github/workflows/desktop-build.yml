@@ -395,8 +395,8 @@ jobs:
           $installDir = Join-Path $env:RUNNER_TEMP "rez-chat-smoke-install"
           $install = Start-Process -FilePath $installer.FullName -ArgumentList "/S", "/D=$installDir" -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "Windows installer exited $($install.ExitCode)" }
-          $app = Get-ChildItem $installDir -Recurse -Filter "Rez Chat.exe" | Select-Object -First 1
-          if (-not $app) { throw "Installed Rez Chat.exe was not found beneath $installDir" }
+          $app = Get-ChildItem $installDir -Recurse -Filter "rez-chat-shell.exe" | Select-Object -First 1
+          if (-not $app) { throw "Installed rez-chat-shell.exe was not found beneath $installDir" }
           "executable=$($app.FullName)" >> $env:GITHUB_OUTPUT
         working-directory: rez-chat
 
@@ -409,7 +409,7 @@ jobs:
           --data-dir "$env:RUNNER_TEMP\rez-chat-smoke-profile"
         working-directory: rez-chat
 
-      - name: Validate Linux deb structure
+      - name: Install and smoke Linux deb twice
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -417,7 +417,21 @@ jobs:
           deb=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/deb" -name '*.deb' -print -quit)
           test -n "$deb"
           dpkg-deb --info "$deb"
-          dpkg-deb --contents "$deb" | grep -q '/usr/bin/'
+          package=$(dpkg-deb --field "$deb" Package)
+          test "$package" = "rez-chat"
+          test "$(dpkg-deb --field "$deb" Architecture)" = "amd64"
+          sudo dpkg --install "$deb"
+          test "$(dpkg-query --show --showformat='${Status}' "$package")" = "install ok installed"
+          mapfile -t app_candidates < <(
+            dpkg-query --listfiles "$package" \
+              | grep '^/usr/bin/' \
+              | grep -v '/node$'
+          )
+          test "${#app_candidates[@]}" -eq 1
+          test -x "${app_candidates[0]}"
+          xvfb-run -a node scripts/verify-packaged-desktop.mjs \
+            --executable "${app_candidates[0]}" \
+            --data-dir "$RUNNER_TEMP/rez-chat-deb-smoke-profile"
         working-directory: rez-chat
 
       - name: Smoke Linux AppImage twice
