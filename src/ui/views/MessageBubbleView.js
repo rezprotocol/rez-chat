@@ -400,7 +400,9 @@ export class MessageBubbleView extends BusComponent {
       "data-message-tombstoned": isTombstoned ? "true" : "false",
     }, otherBubbleChildren);
     if (!isTombstoned) renderAttachmentEl(otherBubbleEl, false);
-    if (!isTombstoned && text) this.#renderLinkPreview(otherBubbleEl, text, false);
+    // No link preview for incoming messages: unfurling fetches the URL from
+    // THIS device, so any contact or group member could learn our IP address
+    // and when we are online by sending a link (audit 2026-09-22).
 
     const contactAvatarHash = stores.contacts.getAvatarHash(speakerId);
     const avatarSlot = h("div", { className: "w-8 h-8 rounded-md overflow-hidden" });
@@ -439,6 +441,10 @@ export class MessageBubbleView extends BusComponent {
   // by URL and returns synchronously from its in-memory cache after the
   // first resolve.
   #renderLinkPreview(bubbleEl, text, isMine) {
+    // Only our own outgoing messages unfurl. The fetch runs from this device;
+    // unfurling a peer-supplied URL discloses our IP address to whoever
+    // controls that URL (audit 2026-09-22). Enforced here, not per call site.
+    if (isMine !== true) return;
     const urls = extractUrls(text);
     const url = urls.length > 0 ? urls[0] : "";
     if (!url) return;
