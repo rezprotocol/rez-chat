@@ -236,7 +236,16 @@ export class ServerMessagesService extends BaseServerService {
     if (this.#epochCache && (now - this.#epochCache.atMs) < 60000) return this.#epochCache.epoch;
     let epoch = 0;
     const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
-    if (sdk && sdk.devices && typeof sdk.devices.getAuthorityState === "function") {
+    if (this.bus.runtime && this.bus.runtime.sessionMode === "claimant") {
+      const authority = this.bus.services && this.bus.services.accountMutation;
+      try {
+        const state = authority && typeof authority.getOwnAuthorityState === "function" ? await authority.getOwnAuthorityState() : null;
+        if (state && state.established && Number.isInteger(state.epoch)) epoch = state.epoch;
+        else this.logger.warn("[ServerMessagesService] claimant authority epoch unavailable; stamping 0");
+      } catch (err) {
+        this.logger.warn("[ServerMessagesService] claimant authority epoch unavailable; stamping 0", err && err.message ? err.message : err);
+      }
+    } else if (sdk && sdk.devices && typeof sdk.devices.getAuthorityState === "function") {
       try {
         const state = await sdk.devices.getAuthorityState();
         epoch = state && Number.isInteger(state.epoch) && state.epoch >= 0 ? state.epoch : 0;
@@ -819,15 +828,28 @@ export class ServerMessagesService extends BaseServerService {
     throw err;
   }
 
+  // Attachment manifests/chunks use the same recipient-device routing and
+  // durable ciphertext retry cache as text and mutations. No native host or
+  // file-transfer service maintains a second roster/fan-out implementation.
+  async dispatchThreadBytes(threadId, plaintextBodyBytes, eventTag) {
+    if (typeof threadId !== "string" || !threadId || !(plaintextBodyBytes instanceof Uint8Array)
+      || typeof eventTag !== "string" || !eventTag) throw new Error("Invalid thread delivery");
+    // Attachment manifests/chunks are not chat messages: receivers emit no
+    // delivery receipt for them, so they must not register an expected receipt
+    // (audit 2026-09-22 B4: each chunk counted toward the peer-link recovery
+    // threshold and triggered re-invites of every quiet group member).
+    return this.#deliverToThread({ threadId, plaintextBodyBytes, eventTag, expectReceipt: false });
+  }
+
   /**
-   * Shared deposit-routing for both `sendMessage` and mutation deliveries.
+   * Shared deposit-routing for text, mutations and attachment deliveries.
    * Resolves a `th_`-style thread to either group fan-out or DM cross-node
    * deposit. Returns `{eventId, queued, queuedInboxIds}` where
    * `queuedInboxIds` is the set of deliverInboxIds the node enqueued for
    * background retry (used to correlate later EVT_OUTBOUND_STATUS frames
    * back to this message).
    */
-  async #deliverToThread({ threadId, plaintextBodyBytes, sdk, eventTag = "", now = Date.now() } = {}) {
+  async #deliverToThread({ threadId, plaintextBodyBytes, sdk, eventTag = "", now = Date.now(), expectReceipt = true } = {}) {
     if (!threadId) return { eventId: "", queued: false, queuedInboxIds: [] };
     const thread = await this.#threadStore.getThread(threadId).catch(() => null);
     const threadType = thread && typeof thread.threadType === "string" ? thread.threadType : "";
@@ -848,6 +870,7 @@ export class ServerMessagesService extends BaseServerService {
           plaintextBodyBytes,
           localInboxId,
           messageId: eventTag,
+          expectReceipt,
         });
         if (fanOut.sentCount > 0) return { eventId: "gw:" + now + ":" + eventTag, queued: false, queuedInboxIds: [], isGroup: true };
         if (fanOut.queuedCount > 0) return { eventId: "", queued: true, queuedInboxIds: fanOut.queuedInboxIds, isGroup: true };
@@ -912,19 +935,20 @@ export class ServerMessagesService extends BaseServerService {
   }
 
   /**
-   * S2.5 Slice 5 — GATED per-device fan-out. Encrypt the message once per
-   * recipient DEVICE (own session) and dispatch to each device's own inbox.
-   * Returns null (caller falls back to the legacy single-device sealForPeer)
-   * UNLESS the E6 fan-out gate is open AND the peer published a resolvable
-   * device set. The gate (`bus.runtime.multiDeviceFanout`) defaults closed and
-   * flips at Slice 8 — so by default this is a no-op and the shipped path is
-   * byte-for-byte unchanged.
+   * Encrypt once per recipient device and dispatch to each device's inbox.
+   * Account sessions require the E6 aggregation gate. Portable claimants use
+   * the public device set independently of their provider's account services.
+   * Returns null for a gated account session or a peer with no published set;
+   * a failed resolution must never silently become single-device delivery.
    * @returns {Promise<{sentCount, queuedCount, queuedInboxIds, deviceCount}|null>}
    */
   async #fanOutToPeerDevices({ sdk, peerAccountId, plaintextBodyBytes, localInboxId, messageId = "" } = {}) {
-    // Gate CLOSED (the default) — every exit below is `return null`, i.e. the legacy
-    // single-device path, byte-for-byte unchanged.
-    if (!this.bus.runtime || this.bus.runtime.multiDeviceFanout !== true) return null;
+    // multiDeviceFanout describes the ACCOUNT HOME's aggregation service.
+    // A claimant's portable provider deliberately has no such service, but
+    // sending to a peer's signed public device set uses only data-plane APIs.
+    // Applying the home gate here silently delivered phone messages to just
+    // one of the recipient's devices. Legacy account sessions keep their gate.
+    if (!this.bus.runtime || (this.bus.runtime.multiDeviceFanout !== true && this.bus.runtime.sessionMode !== "claimant")) return null;
 
     // Gate OPEN (P1#4). From here a `return null` means "deliver to ONE device", and doing that
     // when the peer actually has several silently drops the message for every other device — the
@@ -1516,7 +1540,7 @@ export class ServerMessagesService extends BaseServerService {
     }
   }
 
-  async #sendGroupFanOut({ sdk, groupId, plaintextBodyBytes, localInboxId, messageId = "" } = {}) {
+  async #sendGroupFanOut({ sdk, groupId, plaintextBodyBytes, localInboxId, messageId = "", expectReceipt = true } = {}) {
     if (!sdk || typeof sdk.sealForPeer !== "function" || !sdk.mesh) {
       throw new Error("sendGroupFanOut: sdk unavailable");
     }
@@ -1570,7 +1594,7 @@ export class ServerMessagesService extends BaseServerService {
           sentCount++;
         }
         // Sent or queued — both reach the relay buffer and warrant an ack.
-        if (peerLinkProtocol && typeof peerLinkProtocol.recordOutboundGroupMessage === "function"
+        if (expectReceipt === true && peerLinkProtocol && typeof peerLinkProtocol.recordOutboundGroupMessage === "function"
             && target && typeof target.accountId === "string") {
           peerLinkProtocol.recordOutboundGroupMessage({ peerAccountId: target.accountId });
         }

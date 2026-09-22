@@ -4,7 +4,7 @@ import { BusComponent } from "../base/BusComponent.js";
 const CARD_CLASS = "rounded-lg border border-outline-variant/30 bg-surface-container-low p-space-lg flex flex-col gap-space-md";
 const HEADING_CLASS = "text-headline-sm font-headline-sm text-on-surface";
 const HELP_CLASS = "text-body-sm font-body-sm text-on-surface-variant/70";
-const INPUT_CLASS = "flex-1 bg-surface-container border border-outline-variant/40 rounded-lg px-space-md py-2.5 font-label-technical text-label-technical text-on-surface placeholder:text-outline-variant focus:border-primary/60 focus:ring-1 focus:ring-primary/30 focus:outline-none transition-all";
+const INPUT_CLASS = "min-w-0 flex-1 bg-surface-container border border-outline-variant/40 rounded-lg px-space-md py-2.5 font-label-technical text-label-technical text-on-surface placeholder:text-outline-variant focus:border-primary/60 focus:ring-1 focus:ring-primary/30 focus:outline-none transition-all";
 const PRIMARY_BTN_CLASS = "bg-primary-container text-on-primary-container font-label-technical text-label-technical font-bold px-space-lg py-2.5 rounded-lg hover:bg-primary hover:text-on-primary transition-all cursor-pointer shrink-0 disabled:opacity-50 disabled:cursor-not-allowed";
 const GHOST_BTN_CLASS = "bg-surface-container border border-outline-variant/40 text-on-surface-variant font-label-technical text-label-technical font-bold px-space-lg py-2.5 rounded-lg hover:border-primary/40 hover:text-primary hover:bg-surface-container-high transition-all cursor-pointer self-start disabled:opacity-50 disabled:cursor-not-allowed";
 const ERROR_CLASS = "hidden text-label-micro font-label-technical text-error mt-1";
@@ -49,6 +49,10 @@ export class InviteFormsView extends BusComponent {
     const acceptInput = h("input", {
       type: "text",
       placeholder: "Paste invite code...",
+      autocapitalize: "off",
+      autocorrect: "off",
+      autocomplete: "off",
+      spellcheck: "false",
       className: INPUT_CLASS,
       "data-testid": "invite.accept.input",
     });

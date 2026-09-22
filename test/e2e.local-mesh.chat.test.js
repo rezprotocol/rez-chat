@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { startRezNode } from "@rezprotocol/node";
+import { DeviceRegistrationV1, bytesToBase64 } from "@rezprotocol/core";
+import { NodeCryptoProvider, startRezNode } from "@rezprotocol/node";
 import { bootstrapChatServer } from "../src/server/index.js";
 import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
@@ -71,7 +72,19 @@ function relayOnlyConfig({ dataDir, listenPort, knownRelays }) {
   };
 }
 
-async function startChatLeaf({ tmp, label, entryRelayKeyId, entryRelayPort }) {
+// The shipped desktop configuration: src/index.js resolveSessionMode defaults a
+// primary to "claimant", and every desktop vault supplies a device key, so every
+// signed message names its sender device (audit 2026-09-22 B2/B3).
+async function mintDesktopDeviceKey() {
+  const keyPair = await new NodeCryptoProvider().generateSigningKeyPair();
+  const publicKeyB64 = bytesToBase64(keyPair.publicKey);
+  return {
+    deviceId: DeviceRegistrationV1.deviceIdFor(publicKeyB64),
+    deviceKeyPair: { publicKeyB64, privateKeyB64: bytesToBase64(keyPair.privateKey) },
+  };
+}
+
+async function startChatLeaf({ tmp, label, entryRelayKeyId, entryRelayPort, sessionMode = "account-legacy", deviceKey = null }) {
   const dataDir = path.join(tmp, label);
   await fs.mkdir(dataDir, { recursive: true });
   const wsPort = await getFreePort();
@@ -86,7 +99,7 @@ async function startChatLeaf({ tmp, label, entryRelayKeyId, entryRelayPort }) {
     },
   });
   const wsUrl = "ws://127.0.0.1:" + wsPort + wsPath;
-  const bootstrapped = await bootstrapChatServer({ nodeDataDir: dataDir, wsUrl, logger: silentLogger });
+  const bootstrapped = await bootstrapChatServer({ nodeDataDir: dataDir, wsUrl, logger: silentLogger, sessionMode, deviceKey });
   await bootstrapped.chatServer.start();
   return { label, nodeApp, chat: bootstrapped.chatServer, accountId: bootstrapped.ownerAccountId };
 }
@@ -155,7 +168,25 @@ async function waitForMessageText(chat, threadId, text, label) {
   return msg;
 }
 
-test("live local mesh chat: invite + bidirectional message delivery over a shared relay", { skip: !RUN, timeout: 120_000 }, async () => {
+async function waitForContactName(chat, accountId, displayName, label) {
+  return waitFor(async () => {
+    const result = await chat.bus.call("contacts", "list", {});
+    const items = result && Array.isArray(result.items) ? result.items : [];
+    return items.find((contact) => contact
+      && contact.accountId === accountId
+      && contact.displayName === displayName);
+  }, CHAT_TIMEOUT_MS, label);
+}
+
+async function waitForMessageStatus(chat, threadId, messageId, status, label) {
+  return waitFor(async () => {
+    const result = await chat.bus.call("thread.messages", "list", { threadId, limit: 50 });
+    const items = result && Array.isArray(result.items) ? result.items : [];
+    return items.find((m) => m && m.messageId === messageId && m.status === status);
+  }, CHAT_TIMEOUT_MS, label);
+}
+
+async function runLocalMeshChat({ leafOptions = async () => ({}), expectDeliveredReceipt = false } = {}) {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rez-local-mesh-chat-"));
   const rPort = await getFreePort();
   const started = [];
@@ -172,9 +203,9 @@ test("live local mesh chat: invite + bidirectional message delivery over a share
 
     // Both stacks peer the same relay, so each registers its inbox there and
     // the relay routes deposits between them off its local RouteTable.
-    const alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
+    const alice = await startChatLeaf({ tmp, label: "alice", entryRelayKeyId: relayKeyId, entryRelayPort: rPort, ...await leafOptions() });
     started.push(alice);
-    const bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: relayKeyId, entryRelayPort: rPort });
+    const bob = await startChatLeaf({ tmp, label: "bob", entryRelayKeyId: relayKeyId, entryRelayPort: rPort, ...await leafOptions() });
     started.push(bob);
 
     // Let the mesh form (relay core peering + each leaf↔relay uplink + WS auth).
@@ -196,16 +227,23 @@ test("live local mesh chat: invite + bidirectional message delivery over a share
     await waitForPeerLinkReady(alice.chat, bob.accountId, "Alice peer-link to Bob ready");
     const aliceThreadId = await waitForDirectThread(alice.chat, bob.accountId, "Alice direct thread to Bob");
     const bobThreadId = accepted.threadId;
+    await waitForContactName(alice.chat, bob.accountId, "Bob", "Alice stores Bob's accepted-device name");
+    await waitForContactName(bob.chat, alice.accountId, "Alice", "Bob stores Alice's invite name");
 
     // --- Alice → Bob: real seal→dispatch→deposit→cross-relay→deliver→decrypt ---
     const a2b = "alice→bob over the real local mesh " + Date.now();
+    const a2bMessageId = "a2b_" + Date.now();
     const sent = await alice.chat.bus.call("message", "send", {
-      threadId: aliceThreadId, messageId: "a2b_" + Date.now(),
+      threadId: aliceThreadId, messageId: a2bMessageId,
       payload: { kind: "rez.chat.message.v1", text: a2b },
     });
     assert.equal(sent.threadId, aliceThreadId);
     const gotByBob = await waitForMessageText(bob.chat, bobThreadId, a2b, "Bob receives Alice's message decrypted");
     assert.equal(gotByBob.senderAccountId, alice.accountId, "delivered message credits Alice");
+    if (expectDeliveredReceipt) {
+      // The signed commit receipt crosses back to Alice's device and flips her row.
+      await waitForMessageStatus(alice.chat, aliceThreadId, a2bMessageId, "delivered", "Alice's message is marked delivered by Bob's receipt");
+    }
 
     // --- Bob → Alice: prove the reverse direction routes + decrypts too ---
     const b2a = "bob→alice over the real local mesh " + Date.now();
@@ -222,4 +260,15 @@ test("live local mesh chat: invite + bidirectional message delivery over a share
     }
     await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+test("live local mesh chat: invite + bidirectional message delivery over a shared relay", { skip: !RUN, timeout: 120_000 }, async () => {
+  await runLocalMeshChat();
+});
+
+test("live local mesh chat in the shipped desktop configuration (claimant session + device key): signed send and delivered receipt", { skip: !RUN, timeout: 150_000 }, async () => {
+  await runLocalMeshChat({
+    leafOptions: async () => ({ sessionMode: "claimant", deviceKey: await mintDesktopDeviceKey() }),
+    expectDeliveredReceipt: true,
+  });
 });

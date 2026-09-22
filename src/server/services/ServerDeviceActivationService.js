@@ -97,7 +97,7 @@ export class ServerDeviceActivationService extends BaseServerService {
     }
 
     if (selfInSet) {
-      await this.#journal.markActive();
+      await this.#completeActivation();
       return { publish: true, state: ACTIVATION_STATES.ACTIVE };
     }
 
@@ -185,7 +185,7 @@ export class ServerDeviceActivationService extends BaseServerService {
       try {
         await this._call("device-set", "publishOwnBundle", {});
         await this._call("device-set", "republishToAllPeers", {});
-        await this.#journal.markActive();
+        await this.#completeActivation();
         // AE-2: the freshly ACTIVE sibling's FIRST message convergence —
         // announce thread digests so the immutable fact logs sync (plan §3
         // trigger). Fire-and-forget: a failure never un-commits activation;
@@ -201,5 +201,19 @@ export class ServerDeviceActivationService extends BaseServerService {
       }
     })();
     return this.#committing;
+  }
+
+  async #completeActivation() {
+    // The bounded account session is the last authorized opportunity to
+    // persist current sibling membership before claimant-only steady state.
+    // Publication alone left new phones ACTIVE with no durable roster, which
+    // disabled sibling convergence on their first portable-provider bind.
+    if (this.bus.runtime && this.bus.runtime.multiDeviceFanout === true) {
+      const result = await this._call("device-set", "snapshotRoster", {});
+      if (!result || result.snapshotted !== true) {
+        throw new Error("Device activation requires a durable current sibling roster before ending enrollment");
+      }
+    }
+    await this.#journal.markActive();
   }
 }

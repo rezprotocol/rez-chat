@@ -17,7 +17,8 @@ export class ImportBackupModal extends ModalView {
 
   constructor({ bus } = {}) {
     super({ bus });
-    this.#step = this.#desktop() ? "pick" : "browser-form";
+    const desktop = this.#desktop();
+    this.#step = desktop && desktop.backup && typeof desktop.backup.openFile === "function" ? "pick" : "browser-form";
     this.#envelope = null;
     this.#errorText = "";
     this.#busy = false;
@@ -76,7 +77,7 @@ export class ImportBackupModal extends ModalView {
     cancelBtn.addEventListener("click", () => this.close());
     const form = h("form", { className: "flex flex-col gap-space-md" }, [
       h("p", { className: "text-body-sm font-body-sm text-on-surface-variant" },
-        "Your phrase restores the same Rez account identity and creates a new browser device. Local-only message history is not contained in the phrase; exportable full-history backups remain a desktop feature."),
+        "Your phrase restores the same Rez account identity and creates a new device. Message history is not contained in the phrase."),
       nameInput,
       phraseInput,
       passwordInput,

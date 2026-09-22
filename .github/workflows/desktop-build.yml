@@ -48,9 +48,9 @@ permissions:
 # Immutable release inputs. Keep the preflight and all platform bundles on
 # exactly one reviewed source set; changing a sibling revision is one edit.
 env:
-  REZ_CORE_REF: 652d3320c92349aecf8e774e124c63d6546d4230
-  REZ_SDK_REF: c5a51bcd9a21e9528f4e315f2a21b85fbdc54b4f
-  REZ_NODE_REF: 0413dcb060a159ed6f2cdd78a9fa1fbda4ebc8ba
+  REZ_CORE_REF: 4b158bd93fba90579cd3af2f12e9515faced5a84
+  REZ_SDK_REF: 2e6b6b9b5945df3ee78a43d538113ae8bc0d4011
+  REZ_NODE_REF: 8971c9a7d39bb3433bcf62a6e7a2bd4e89a316b6
   REZ_UI_REF: b90a568fca87415bbdafa8b9d5cf3ec3af2ae548
 
 jobs:

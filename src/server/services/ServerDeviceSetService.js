@@ -115,8 +115,12 @@ export class ServerDeviceSetService extends BaseServerService {
     // MULTI-device record enumerating all active devices; otherwise (fs/desktop or
     // an empty set) fall back to the byte-identical single-device path. The
     // revision is the account's authority epoch (S11) so peers never see a rollback.
+    const epochBefore = this.bus.runtime && this.bus.runtime.multiDeviceFanout === true ? await this.#readRosterEpoch() : null;
     const accountDeviceSet = await this.#accountDeviceSetFromHome();
     const rev = Number.isInteger(revision) && revision >= 1 ? revision : await this.#currentRevision();
+    if (epochBefore !== null && epochBefore !== await this.#readRosterEpoch()) {
+      throw new Error("Account authority changed while reading the device set; retry publication");
+    }
     const built = await this.#peerLinks().buildDeviceSetRecordForPeer({ peerAccountId, nowMs: this.#clock(), revision: rev, accountDeviceSet });
     await durableRecords.put({ record: built.record });
     return { recordKind: built.recordKind, recordId: built.recordId, publisherPublicKeyB64: built.publisherPublicKeyB64 };
@@ -184,37 +188,48 @@ export class ServerDeviceSetService extends BaseServerService {
    */
   async snapshotRoster() {
     if (!this.isEnabled()) return { snapshotted: false, reason: "disabled" };
+    if (this.bus.runtime && this.bus.runtime.sessionMode === "claimant") {
+      throw new Error("Roster snapshot requires an explicit account-control session");
+    }
     const rosterStore = this.bus.stores && this.bus.stores.deviceRosterStore ? this.bus.stores.deviceRosterStore : null;
     if (!rosterStore) return { snapshotted: false, reason: "no-roster-store" };
+    const epochBefore = await this.#readRosterEpoch();
     const devices = await this.#accountDeviceSetFromHome();
     if (!devices) return { snapshotted: false, reason: "no-home-aggregate" };
-    // The revision seam already floors the epoch at 1; the roster wants the
-    // RAW epoch (0 when the home serves none) so the data-plane epoch gate
-    // compares like with like against AccountAuthorityStateV1.epoch.
-    let epoch = 0;
-    const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
-    if (sdk && sdk.devices && typeof sdk.devices.getAuthorityState === "function") {
-      try {
-        const s = await sdk.devices.getAuthorityState();
-        epoch = s && Number.isInteger(s.epoch) ? s.epoch : 0;
-      } catch (err) {
-        // The roster snapshot must not record an epoch it could not read:
-        // failing the snapshot keeps the PREVIOUS roster+epoch intact, which
-        // fails toward defer (safe) — never toward a roster stamped fresher
-        // than it is.
-        const reason = err && err.message ? err.message : String(err);
-        this.logger.error("[ServerDeviceSetService] roster snapshot aborted: authority epoch unavailable: " + reason);
-        return { snapshotted: false, reason: "epoch-unavailable: " + reason };
-      }
+    const epoch = await this.#readRosterEpoch();
+    if (epochBefore !== epoch) {
+      // Never stamp a pre-revocation roster with a post-revocation epoch.
+      // Preserve the old snapshot and let foreground enrollment retry.
+      throw new Error("Account authority changed while reading the device roster; retry the snapshot");
     }
     const snapshot = await rosterStore.replaceFromAggregate({ devices, epoch, snapshotAtMs: this.#clock() });
     return { snapshotted: true, devices: snapshot.devices.length, epoch: snapshot.epoch };
+  }
+
+  async #readRosterEpoch() {
+    const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
+    if (!sdk || !sdk.devices || typeof sdk.devices.getAuthorityState !== "function") {
+      throw new Error("Roster snapshot requires an authenticated authority epoch");
+    }
+    const state = await sdk.devices.getAuthorityState();
+    if (!state || !Number.isSafeInteger(state.epoch) || state.epoch < 0) throw new Error("Roster authority epoch is invalid");
+    return state.epoch;
   }
 
   // The account's home-aggregated active device set (all self-published bundles),
   // or null when the home does not serve it (fs/desktop) or it is empty ⇒ the
   // single-device publish path.
   async #accountDeviceSetFromHome() {
+    if (this.bus.runtime && this.bus.runtime.sessionMode === "claimant") {
+      const rosterStore = this.bus.stores && this.bus.stores.deviceRosterStore;
+      const roster = rosterStore ? await rosterStore.snapshot() : null;
+      if (roster && roster.devices.length > 1) {
+        const error = new Error("Publishing an aggregated device set requires an explicit account-control session");
+        error.code = "ACCOUNT_CONTROL_REQUIRED";
+        throw error;
+      }
+      return null;
+    }
     const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
     if (!sdk || !sdk.devices || typeof sdk.devices.getAccountDeviceSet !== "function") return null;
     try {
@@ -247,6 +262,12 @@ export class ServerDeviceSetService extends BaseServerService {
   // DeviceSetRecordV1 revision is always a positive integer. 1 when the home does
   // not serve authority state (fs/desktop) — the byte-identical default.
   async #currentRevision() {
+    if (this.bus.runtime && this.bus.runtime.sessionMode === "claimant") {
+      const authority = this.bus.services && this.bus.services.accountMutation;
+      const state = authority && typeof authority.getOwnAuthorityState === "function" ? await authority.getOwnAuthorityState() : null;
+      if (!state || state.established !== true) throw new Error("Cannot establish current authority epoch for device-set publication");
+      return Math.max(1, state.epoch);
+    }
     const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
     if (sdk && sdk.devices && typeof sdk.devices.getAuthorityState === "function") {
       try {

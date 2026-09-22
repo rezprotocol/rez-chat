@@ -18,7 +18,7 @@ import { createKeyValueBackedPeerLinkStorage } from "@rezprotocol/sdk/peer-link"
 import { SeedKeys } from "@rezprotocol/sdk/crypto/seedDerivation";
 import { Bip39 } from "@rezprotocol/sdk/crypto/bip39";
 import { bootstrapChatServer } from "../src/server/index.js";
-import { enrollDelegatedDevice } from "../src/mobile/enrollDelegatedDevice.js";
+import { enrollDelegatedDevice } from "./helpers/enrollDelegatedDevice.js";
 import { activateDelegatedDevice } from "../src/mobile/activateDelegatedDevice.js";
 import { prepareDelegatedCoreBoot } from "../src/mobile/prepareDelegatedCoreBoot.js";
 import { startRezChatCore } from "../src/mobile/startRezChatCore.js";

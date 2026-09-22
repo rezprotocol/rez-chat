@@ -37,7 +37,7 @@ import {
  *
  * Stateless between rounds by design: no durable sync state, no timers.
  * Triggers: activation commit (the new sibling's first convergence),
- * (re)connect, and the on-demand directives. Round counters (in-memory,
+ * (re)connect, newly committed inbound facts, and on-demand directives. Round counters (in-memory,
  * windowed) bound pathological exchange loops; a permanently-rejected fact
  * is remembered for the process lifetime so it is not re-requested forever.
  */
@@ -360,6 +360,18 @@ export class ServerSiblingSyncService extends BaseServerService {
    */
   async #revocationStateFor(senderAccountId) {
     if (senderAccountId === this.ownerAccountId) {
+      if (this.bus.runtime && this.bus.runtime.sessionMode === "claimant") {
+        const authority = this.bus.services && this.bus.services.accountMutation;
+        if (!authority || typeof authority.getOwnAuthorityState !== "function") return { ok: false, reason: "own authority source unavailable" };
+        try {
+          const state = await authority.getOwnAuthorityState();
+          return state && state.established === true
+            ? { ok: true, revocationState: state.revocationState }
+            : { ok: false, reason: "own authority state unestablished" };
+        } catch (err) {
+          return { ok: false, reason: "own authority state fetch failed: " + (err && err.message ? err.message : "unknown") };
+        }
+      }
       const sdk = this.#sdk();
       if (!sdk || !sdk.devices || typeof sdk.devices.getAuthorityState !== "function") {
         return { ok: false, reason: "own authority state unavailable" };

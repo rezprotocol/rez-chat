@@ -1,9 +1,9 @@
 /**
  * Bus-driven entry: boots the class-based ChatApp and scene host directly.
  */
-// MUST stay the first import: installs window.rezDesktop under the Tauri
-// shell before the synchronous bridge detection below runs. No-op under
-// Electron (preload owns the bridge) and in plain browsers.
+// Native host bridges must install before synchronous runtime detection.
+// Mobile runs first; the desktop shim recognizes its existing bridge.
+import "./mobile/installMobileUiBridge.js";
 import "./ui/desktop/installRezDesktopShim.js";
 import "./styles/fonts.css";
 import "./styles/tailwind.css";
@@ -86,6 +86,7 @@ const app = new ChatApp({
   logger: console,
 });
 await app.start();
+if (globalThis.__REZ_MOBILE__ === true) globalThis.__REZ_MOBILE_READY__ = true;
 
 if (!desktopBridge && "serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch((err) => {

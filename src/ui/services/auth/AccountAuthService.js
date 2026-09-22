@@ -6,12 +6,10 @@ import {
   openBrowserRecoveryMnemonic,
   sealBrowserRecoveryMnemonic,
   resealKeystoreEnvelope,
-  IndexedDbStorageProvider,
   unlockKeystoreAccount,
 } from "@rezprotocol/sdk/client";
 import { SESSION_STATUS } from "../../stores/SessionStore.js";
 import { nonEmptyString } from "../../../records/index.js";
-import { browserChatRuntimeDbName } from "../../../client/runtime/browserRuntimeStorage.js";
 
 export class AccountAuthService {
   constructor({
@@ -19,6 +17,7 @@ export class AccountAuthService {
     authBootstrapService,
     cryptoProvider = null,
     deviceLinkRunner = null,
+    accountDataPurger = null,
     logger = console,
   } = {}) {
     if (!sessionStore || !authBootstrapService) {
@@ -28,6 +27,7 @@ export class AccountAuthService {
     this._authBootstrapService = authBootstrapService;
     this._cryptoProvider = cryptoProvider;
     this._deviceLinkRunner = typeof deviceLinkRunner === "function" ? deviceLinkRunner : null;
+    this._accountDataPurger = typeof accountDataPurger === "function" ? accountDataPurger : null;
     this._logger = logger;
     this._account = null;
     this._pendingServerSyncEnvelope = null;
@@ -74,7 +74,8 @@ export class AccountAuthService {
     if (has) throw new Error("Account already exists. Unlock with your password.");
 
     const recoveryStore = this._authBootstrapService.getRecoveryStore(accountId);
-    if (!recoveryStore) throw new Error("Browser account recovery storage is unavailable");
+    const recoveryKeystoreStore = this._authBootstrapService.getRecoveryKeystoreStore(accountId);
+    if (!recoveryStore) throw new Error("Account recovery storage is unavailable");
     const mnemonic = await generateBrowserMnemonic({ words: 24 });
     const recovery = await deriveBrowserAccountRecovery(mnemonic);
     const recoveryEnvelope = await sealBrowserRecoveryMnemonic({
@@ -92,10 +93,18 @@ export class AccountAuthService {
         cryptoProvider: this._cryptoProvider,
         identity: recovery.identity,
       });
+      const createdEnvelope = await store.getKeystoreEnvelope();
+      const recoveryKeystoreEnvelope = await resealKeystoreEnvelope({
+        envelope: createdEnvelope,
+        oldPassword: pwd,
+        newPassword: mnemonic,
+        cryptoProvider: this._cryptoProvider,
+      });
+      await recoveryKeystoreStore.putKeystoreEnvelope(recoveryKeystoreEnvelope);
       await this._authBootstrapService.addAccount(accountId, name);
       registryAdded = true;
     } catch (err) {
-      await this._cleanupFailedBrowserAccount(accountId, store, recoveryStore, registryAdded);
+      await this._cleanupFailedAccount(accountId, store, recoveryStore, registryAdded, recoveryKeystoreStore);
       throw err;
     }
 
@@ -116,10 +125,10 @@ export class AccountAuthService {
     if (!name) throw new Error("Enter a name for this device.");
     if (pwd.length < 8) throw new Error("Password must be at least 8 characters.");
     if (!this._deviceLinkRunner) {
-      throw new Error("Browser device linking is unavailable in this build.");
+      throw new Error("Device linking is unavailable in this build.");
     }
     if (this._authBootstrapService.hasLegacyStore() || !this._authBootstrapService.hasAccountRegistry()) {
-      throw new Error("Browser device linking requires account-partitioned browser storage.");
+      throw new Error("Device linking requires account-partitioned storage.");
     }
 
     const accounts = await this._authBootstrapService.listAccounts();
@@ -143,15 +152,15 @@ export class AccountAuthService {
       });
     } catch (err) {
       // A failure after persistence but before confirmation must not leave a
-      // browser account that looks usable. The primary's durable ceremony
+      // account that looks usable. The primary's durable ceremony
       // journal owns the corresponding compensating revoke.
       if (await store.hasKeystore()) {
-        await this._cleanupFailedBrowserAccount(storeKey, store, null, true);
+        await this._cleanupFailedAccount(storeKey, store, null, true);
       }
       throw err;
     }
     if (!linked || !linked.persistence || linked.persistence.storeKey !== storeKey) {
-      throw new Error("Device linking completed without a durable browser keystore.");
+      throw new Error("Device linking completed without a durable keystore.");
     }
     const result = await this.unlock({ accountId: linked.persistence.storeKey, password: pwd });
     this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
@@ -163,6 +172,8 @@ export class AccountAuthService {
       ? result.delegation
       : null;
     if (!delegation) throw new Error("Device linking returned no delegation bundle.");
+    const bootstrapInboxId = result && typeof result.inboxId === "string" ? result.inboxId.trim() : "";
+    if (!bootstrapInboxId) throw new Error("Device linking returned no bootstrap inboxId.");
     let registryAdded = false;
     try {
       const created = await createDelegatedKeystoreAccount({
@@ -179,7 +190,7 @@ export class AccountAuthService {
           // R3: the ceremony inbox is the BOOTSTRAP inbox — the envelope
           // field carries the honest name (the requester result's wire field
           // is still `inboxId`).
-          bootstrapInboxId: result.inboxId === undefined ? null : result.inboxId,
+          bootstrapInboxId,
         },
       });
       await this._authBootstrapService.addAccount(storeKey, profileName);
@@ -187,7 +198,7 @@ export class AccountAuthService {
       await this._authBootstrapService.setAccountIdHint(storeKey, created.accountId);
       return { storeKey, accountId: created.accountId };
     } catch (err) {
-      await this._cleanupFailedBrowserAccount(storeKey, store, null, registryAdded);
+      await this._cleanupFailedAccount(storeKey, store, null, registryAdded);
       throw err;
     }
   }
@@ -311,7 +322,7 @@ export class AccountAuthService {
     const storeKey = this._resolveStoreKey(accountId);
     const recoveryStore = this._authBootstrapService.getRecoveryStore(storeKey);
     if (!recoveryStore || !(await recoveryStore.hasKeystore())) {
-      throw new Error("This account predates browser recovery. Export it from a primary device before relying on this browser.");
+      throw new Error("This account predates recovery support. Export it from a primary device before relying on this device.");
     }
     const mainStore = this._authBootstrapService.getKeystoreStore(storeKey);
     await unlockKeystoreAccount({
@@ -332,18 +343,19 @@ export class AccountAuthService {
     const name = nonEmptyString(profileName) || "Recovered account";
     if (pwd.length < 8) throw new Error("New password must be at least 8 characters.");
     if (this._authBootstrapService.hasLegacyStore()) {
-      throw new Error("Recovery phrase restore requires browser account storage.");
+      throw new Error("Recovery phrase restore requires account-partitioned storage.");
     }
     const recovery = await deriveBrowserAccountRecovery(mnemonic);
     const accounts = await this._authBootstrapService.listAccounts();
     const existing = accounts.find((entry) => entry && entry.accountIdHint === recovery.identity.getAccountId());
-    if (existing) throw new Error("This account identity already exists in this browser.");
+    if (existing) throw new Error("This account identity already exists on this device.");
     const storeKey = accounts.length === 0
       ? this._authBootstrapService.defaultAccountKey
       : `account-${Date.now()}`;
     const mainStore = this._authBootstrapService.getKeystoreStore(storeKey);
     const recoveryStore = this._authBootstrapService.getRecoveryStore(storeKey);
-    if (!recoveryStore) throw new Error("Browser account recovery storage is unavailable");
+    const recoveryKeystoreStore = this._authBootstrapService.getRecoveryKeystoreStore(storeKey);
+    if (!recoveryStore) throw new Error("Account recovery storage is unavailable");
     if (await mainStore.hasKeystore()) throw new Error("Account storage slot already exists.");
     const recoveryEnvelope = await sealBrowserRecoveryMnemonic({
       mnemonic,
@@ -360,11 +372,19 @@ export class AccountAuthService {
         cryptoProvider: this._cryptoProvider,
         identity: recovery.identity,
       });
+      const createdEnvelope = await mainStore.getKeystoreEnvelope();
+      const recoveryKeystoreEnvelope = await resealKeystoreEnvelope({
+        envelope: createdEnvelope,
+        oldPassword: pwd,
+        newPassword: mnemonic,
+        cryptoProvider: this._cryptoProvider,
+      });
+      await recoveryKeystoreStore.putKeystoreEnvelope(recoveryKeystoreEnvelope);
       await this._authBootstrapService.addAccount(storeKey, name);
       registryAdded = true;
       await this._authBootstrapService.setAccountIdHint(storeKey, recovery.identity.getAccountId());
     } catch (err) {
-      await this._cleanupFailedBrowserAccount(storeKey, mainStore, recoveryStore, registryAdded);
+      await this._cleanupFailedAccount(storeKey, mainStore, recoveryStore, registryAdded, recoveryKeystoreStore);
       throw err;
     }
     const result = await this.unlock({ accountId: storeKey, password: pwd });
@@ -382,7 +402,7 @@ export class AccountAuthService {
     const mainStore = this._authBootstrapService.getKeystoreStore(storeKey);
     const recoveryStore = this._authBootstrapService.getRecoveryStore(storeKey);
     if (!recoveryStore || !(await recoveryStore.hasKeystore())) {
-      throw new Error("This browser account has no recovery envelope and cannot change passwords safely.");
+      throw new Error("This account has no recovery envelope and cannot change passwords safely.");
     }
     const mainEnvelope = await mainStore.getKeystoreEnvelope();
     const recoveryEnvelope = await recoveryStore.getKeystoreEnvelope();
@@ -411,7 +431,7 @@ export class AccountAuthService {
         await recoveryStore.putKeystoreEnvelope(recoveryEnvelope);
       } catch (rollbackErr) {
         if (this._logger && typeof this._logger.error === "function") {
-          this._logger.error("Browser password-change rollback failed", rollbackErr);
+          this._logger.error("Password-change rollback failed", rollbackErr);
         }
       }
       throw err;
@@ -419,6 +439,58 @@ export class AccountAuthService {
     const rootAccountId = this._account && this._account.accountId ? String(this._account.accountId) : "";
     await this.logout();
     return { accountId: rootAccountId };
+  }
+
+  async resetPasswordWithMnemonic({ accountId = null, mnemonic = "", newPassword = "" } = {}) {
+    const newPwd = String(newPassword || "");
+    if (newPwd.length < 8) throw new Error("New password must be at least 8 characters.");
+    const normalizedMnemonic = String(mnemonic || "").normalize("NFKD").trim().toLowerCase().replace(/\s+/g, " ");
+    const recovery = await deriveBrowserAccountRecovery(normalizedMnemonic);
+    const storeKey = this._resolveStoreKey(accountId);
+    const recoveryKeystoreStore = this._authBootstrapService.getRecoveryKeystoreStore(storeKey);
+    if (!recoveryKeystoreStore || !(await recoveryKeystoreStore.hasKeystore())) {
+      throw new Error("This account cannot reset its password without restoring from recovery.");
+    }
+    const recovered = await unlockKeystoreAccount({
+      password: normalizedMnemonic,
+      keystoreStore: recoveryKeystoreStore,
+      cryptoProvider: this._cryptoProvider,
+    });
+    if (recovered.hasAdminRoot === false || recovered.accountId !== recovery.identity.getAccountId()) {
+      throw new Error("Recovery phrase does not match this account.");
+    }
+    const mainStore = this._authBootstrapService.getKeystoreStore(storeKey);
+    const recoveryStore = this._authBootstrapService.getRecoveryStore(storeKey);
+    if (!recoveryStore || !(await recoveryStore.hasKeystore())) {
+      throw new Error("This account has no recovery envelope and cannot reset its password safely.");
+    }
+    const recoveryEnvelope = await recoveryStore.getKeystoreEnvelope();
+    const nextEnvelope = await resealKeystoreEnvelope({
+      envelope: await recoveryKeystoreStore.getKeystoreEnvelope(),
+      oldPassword: normalizedMnemonic,
+      newPassword: newPwd,
+      cryptoProvider: this._cryptoProvider,
+    });
+    const nextRecoveryEnvelope = await sealBrowserRecoveryMnemonic({
+      mnemonic: normalizedMnemonic,
+      password: newPwd,
+      cryptoProvider: this._cryptoProvider,
+    });
+    await recoveryStore.putKeystoreEnvelope(nextRecoveryEnvelope);
+    try {
+      await mainStore.putKeystoreEnvelope(nextEnvelope);
+    } catch (err) {
+      try {
+        await recoveryStore.putKeystoreEnvelope(recoveryEnvelope);
+      } catch (rollbackErr) {
+        if (this._logger && typeof this._logger.error === "function") {
+          this._logger.error("Password-reset rollback failed", rollbackErr);
+        }
+      }
+      throw err;
+    }
+    await this.logout();
+    return { accountId: recovered.accountId };
   }
 
   async purgeAccount({ accountId = null, password = "" } = {}) {
@@ -432,15 +504,11 @@ export class AccountAuthService {
       cryptoProvider: this._cryptoProvider,
     });
     const recoveryStore = this._authBootstrapService.getRecoveryStore(storeKey);
-    if (globalThis.indexedDB && typeof globalThis.indexedDB.open === "function") {
-      const runtimeStorage = new IndexedDbStorageProvider({
-        dbName: browserChatRuntimeDbName(account.accountId),
-        storeName: "runtime",
-      });
-      await runtimeStorage.clear();
-    }
+    const recoveryKeystoreStore = this._authBootstrapService.getRecoveryKeystoreStore(storeKey);
+    if (this._accountDataPurger) await this._accountDataPurger(account.accountId);
     await mainStore.clearKeystore();
     if (recoveryStore) await recoveryStore.clearKeystore();
+    if (recoveryKeystoreStore) await recoveryKeystoreStore.clearKeystore();
     await this._authBootstrapService.deleteAccountMetadata(storeKey);
     await this._authBootstrapService.removeAccount(storeKey);
     this._account = null;
@@ -456,22 +524,15 @@ export class AccountAuthService {
   }
 
   _resolveStoreKey(accountId = null) {
-    const explicit = String(accountId == null ? "" : accountId).trim();
-    const snapshot = this._sessionStore.snapshot();
-    const selected = snapshot && snapshot.selectedAccountId ? String(snapshot.selectedAccountId).trim() : "";
-    const accounts = snapshot && Array.isArray(snapshot.accountList) ? snapshot.accountList : [];
-    const explicitEntry = accounts.find((entry) => entry && (entry.id === explicit || entry.accountIdHint === explicit));
-    if (explicitEntry && explicitEntry.id) return String(explicitEntry.id);
-    if (explicit) return explicit;
-    if (selected) return selected;
-    return this._authBootstrapService.defaultAccountKey;
+    return this._authBootstrapService.resolveAccountKey(accountId);
   }
 
-  async _cleanupFailedBrowserAccount(storeKey, mainStore, recoveryStore, registryAdded) {
+  async _cleanupFailedAccount(storeKey, mainStore, recoveryStore, registryAdded, recoveryKeystoreStore = null) {
     const cleanupTasks = [
       ["main keystore", () => mainStore.clearKeystore()],
     ];
     if (recoveryStore) cleanupTasks.push(["recovery envelope", () => recoveryStore.clearKeystore()]);
+    if (recoveryKeystoreStore) cleanupTasks.push(["recovery keystore", () => recoveryKeystoreStore.clearKeystore()]);
     if (registryAdded) {
       cleanupTasks.push(["account registry", () => this._authBootstrapService.removeAccount(storeKey)]);
     }
@@ -480,7 +541,7 @@ export class AccountAuthService {
         await task[1]();
       } catch (cleanupErr) {
         if (this._logger && typeof this._logger.error === "function") {
-          this._logger.error(`Browser account cleanup failed for ${task[0]}`, cleanupErr);
+          this._logger.error(`Account cleanup failed for ${task[0]}`, cleanupErr);
         }
       }
     }

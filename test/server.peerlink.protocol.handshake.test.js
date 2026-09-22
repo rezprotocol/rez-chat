@@ -163,6 +163,7 @@ test("ServerPeerLinkProtocolService decrypts an inbound x3dh handshake and emits
     envelope: envelope.envelope,
     signatureB64: envelope.signatureB64,
     acceptorAccountId: bobAccountId,
+    acceptorDisplayName: "Bob Phone",
     senderInboxId: bobInboxId,
     sendHandshake: async ({ handshakePacket }) => {
       capturedHandshakePacket = handshakePacket;
@@ -209,6 +210,8 @@ test("ServerPeerLinkProtocolService decrypts an inbound x3dh handshake and emits
   assert.ok(snapshotEmit, "expected peerlink.protocol.snapshot emit");
   assert.equal(snapshotEmit.payload.peerAccountId, bobAccountId);
   assert.equal(snapshotEmit.payload.peerInboxId, bobInboxId);
+  assert.equal(snapshotEmit.payload.remoteDisplayName, "Bob Phone",
+    "the inviter must materialize the phone's signed acceptor name");
 
   // Alice's PeerLinkService now stores the peer-link record.
   const links = await alicePeerLinks.peerLinkStorage.peerLinks.listByOwner(aliceAccountId);

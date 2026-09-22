@@ -215,7 +215,8 @@ export class ServerAuthorityPublicationService extends BaseServerService {
     if (this.#shouldSuspend(outcome)) {
       this.#suspendedReason = outcome.enabled === false ? "disabled" : outcome.stopped;
       this.#cancelTimer();
-      this.logger.info(
+      const log = typeof this.logger.info === "function" ? this.logger.info : this.logger.log;
+      log.call(this.logger,
         "[ServerAuthorityPublicationService] periodic recovery suspended (" + this.#suspendedReason
           + "); polling cannot change this outcome — it will re-arm on the next reconnect",
       );
@@ -315,6 +316,9 @@ export class ServerAuthorityPublicationService extends BaseServerService {
    * (no per-device sessions, or an SDK predating the outbox) drains nothing.
    */
   isEnabled() {
+    // Publication is account-control work. A claimant runtime must not even
+    // acquire the guarded accountOutbox/devices capability getters.
+    if (this.bus.runtime && this.bus.runtime.sessionMode === "claimant") return false;
     const outbox = this.#outbox();
     const devices = this.#devices();
     const peerLinks = this.#peerLinks();

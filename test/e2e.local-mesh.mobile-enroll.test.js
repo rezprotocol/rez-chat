@@ -17,7 +17,7 @@ import { unlockKeystoreAccount } from "@rezprotocol/sdk/client";
 import { SeedKeys } from "@rezprotocol/sdk/crypto/seedDerivation";
 import { Bip39 } from "@rezprotocol/sdk/crypto/bip39";
 import { bootstrapChatServer } from "../src/server/index.js";
-import { enrollDelegatedDevice } from "../src/mobile/enrollDelegatedDevice.js";
+import { enrollDelegatedDevice } from "./helpers/enrollDelegatedDevice.js";
 import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**

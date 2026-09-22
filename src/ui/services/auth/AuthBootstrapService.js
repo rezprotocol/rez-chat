@@ -62,6 +62,11 @@ export class AuthBootstrapService {
     return createKeystoreStoreForAccount(this._storageProvider, "recovery:" + String(accountId || DEFAULT_ACCOUNT_KEY));
   }
 
+  getRecoveryKeystoreStore(accountId) {
+    if (this._keystoreStoreLegacy) return null;
+    return createKeystoreStoreForAccount(this._storageProvider, "recovery-keystore:" + String(accountId || DEFAULT_ACCOUNT_KEY));
+  }
+
   async listAccounts() {
     if (this._keystoreStoreLegacy) {
       const has = await this._keystoreStoreLegacy.hasKeystore();
@@ -81,6 +86,18 @@ export class AuthBootstrapService {
     if (!found) return false;
     this._sessionStore.setSelectedAccountId(id);
     return true;
+  }
+
+  resolveAccountKey(accountId = null) {
+    const explicit = String(accountId == null ? "" : accountId).trim();
+    const snapshot = this._sessionStore.snapshot();
+    const selected = snapshot && snapshot.selectedAccountId ? String(snapshot.selectedAccountId).trim() : "";
+    const accounts = snapshot && Array.isArray(snapshot.accountList) ? snapshot.accountList : [];
+    const explicitEntry = accounts.find((entry) => entry && (entry.id === explicit || entry.accountIdHint === explicit));
+    if (explicitEntry && explicitEntry.id) return String(explicitEntry.id);
+    if (explicit) return explicit;
+    if (selected) return selected;
+    return DEFAULT_ACCOUNT_KEY;
   }
 
   async init() {
@@ -288,7 +305,7 @@ export class AuthBootstrapService {
     } else if (registryAccountIds.length > 0 && discoveredEnvelopeKeys.length === 0) {
       reason = "Account registry exists, but no valid local keystore envelopes were found for those keys.";
     } else if (snap.status === SESSION_STATUS.NO_KEYSTORE) {
-      reason = "No local keystore envelope was discovered for the selected browser storage.";
+      reason = "No local keystore envelope was discovered for the selected account storage.";
     }
     return new AuthBootstrapDiagnosticResult({
       diagnostic: {
@@ -354,7 +371,7 @@ export class AuthBootstrapService {
       return Array.isArray(keys) ? keys : [];
     } catch (err) {
       if (this._logger && typeof this._logger.warn === "function") {
-        this._logger.warn("Failed to list browser account storage keys", err && err.message ? err.message : err);
+        this._logger.warn("Failed to list account storage keys", err && err.message ? err.message : err);
       }
       return [];
     }
@@ -366,6 +383,7 @@ export class AuthBootstrapService {
     if (normalizedKey === REGISTRY_KEY) return true;
     if (normalizedKey.indexOf(KEYSTORE_LOCAL_ONLY_PREF_KEY + ":") === 0) return true;
     if (normalizedKey.indexOf("recovery:") === 0) return true;
+    if (normalizedKey.indexOf("recovery-keystore:") === 0) return true;
     if (normalizedKey.indexOf("avatar:") === 0) return true;
     if (normalizedKey.indexOf("avatarData:") === 0) return true;
     return false;
@@ -382,7 +400,7 @@ export class AuthBootstrapService {
         envelope = await store.getKeystoreEnvelope();
       } catch (err) {
         if (this._logger && typeof this._logger.warn === "function") {
-          this._logger.warn("Failed to inspect browser keystore envelope", {
+          this._logger.warn("Failed to inspect account keystore envelope", {
             key: String(key),
             error: err && err.message ? err.message : err,
           });

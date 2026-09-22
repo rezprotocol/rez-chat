@@ -22,6 +22,7 @@ export class DesktopAccountListEntry extends RRecord {
     // account (no recovery phrase). Defaults true when absent so a missing field
     // never mass-flags valid accounts into the destructive re-create migration.
     this.recoveryEnabled = raw.recoveryEnabled !== false;
+    this.delegated = raw.delegated === true;
     this._seal();
   }
 

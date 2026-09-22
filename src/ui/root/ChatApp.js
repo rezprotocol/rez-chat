@@ -48,6 +48,7 @@ import { LinksService } from "../services/bus/LinksService.js";
 import { SystemNoticesService } from "../services/bus/SystemNoticesService.js";
 import { UpdateAvailableBannerView } from "../views/UpdateAvailableBannerView.js";
 import { AccountBoundaryService } from "../services/AccountBoundaryService.js";
+import { browserChatRuntimeDbName } from "../../client/runtime/browserRuntimeStorage.js";
 
 export class ChatApp {
   constructor({
@@ -136,6 +137,13 @@ export class ChatApp {
         authBootstrapService,
         cryptoProvider: createAuthCryptoProvider(),
         deviceLinkRunner,
+        accountDataPurger: async (accountId) => {
+          const runtimeStorage = new IndexedDbStorageProvider({
+            dbName: browserChatRuntimeDbName(accountId),
+            storeName: "runtime",
+          });
+          await runtimeStorage.clear();
+        },
         logger: this._logger,
       });
     const sdkSessionService = new SdkSessionService({

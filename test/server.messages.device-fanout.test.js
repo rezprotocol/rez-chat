@@ -30,7 +30,7 @@ const OWNER = "rez:acct:owner";
 const PEER = "rez:acct:peer";
 const THREAD_ID = "th_owner_peer_direct";
 
-function makeHarness({ multiDeviceFanout = false, deviceSet = null, storageProvider = makeStorageProvider(), resolveThrows = null, omitFanoutSdk = false } = {}) {
+function makeHarness({ multiDeviceFanout = false, sessionMode = "account-legacy", deviceSet = null, storageProvider = makeStorageProvider(), resolveThrows = null, omitFanoutSdk = false } = {}) {
   const calls = { sealForPeer: [], sealForPeerDevice: [], dispatch: [] };
   const sdk = {
     getIdentity: () => ({ localInboxId: "inbox:owner" }),
@@ -55,7 +55,7 @@ function makeHarness({ multiDeviceFanout = false, deviceSet = null, storageProvi
   const threadIndex = { async upsertFromMessage() { return null; } };
   const groupStore = {};
   const bus = {
-    runtime: { sdk, multiDeviceFanout },
+    runtime: { sdk, multiDeviceFanout, sessionMode },
     services: { threads: { extractPreviewText: () => "preview", emitThreadIndexUpdated() {} } },
     on() { return () => {}; },
     emit() {},
@@ -79,6 +79,25 @@ test("gate CLOSED: a DM send uses the legacy single-device sealForPeer (no per-d
   assert.equal(calls.sealForPeer.length, 1, "legacy path sealed once for the peer");
   assert.equal(calls.sealForPeerDevice.length, 0, "no per-device fan-out when the gate is closed");
   assert.equal(calls.dispatch.length, 1);
+});
+
+test("claimant sender uses the peer's device set even when its provider has no account aggregation", async () => {
+  const deviceSet = { deviceSetRecord: { devices: [
+    { deviceId: "phone", devicePublicKeyB64: "k1", inboxId: "inbox:phone" },
+    { deviceId: "desktop", devicePublicKeyB64: "k2", inboxId: "inbox:desktop" },
+  ] }, established: [] };
+  const { svc, calls, sdk } = makeHarness({ sessionMode: "claimant", multiDeviceFanout: false, deviceSet });
+  Object.defineProperty(sdk, "devices", { get() { throw new Error("Account control accessed from claimant delivery"); } });
+  await svc.sendMessage({ threadId: THREAD_ID, payload: { text: "Both devices" } });
+  assert.deepEqual(calls.sealForPeerDevice.map((call) => call.deliverInboxId).sort(), ["inbox:desktop", "inbox:phone"]);
+  assert.equal(calls.sealForPeer.length, 0);
+});
+
+test("claimant sender never downgrades when the peer device set cannot be verified", async () => {
+  const { svc, calls } = makeHarness({ sessionMode: "claimant", multiDeviceFanout: false, resolveThrows: "verification unavailable" });
+  await assert.rejects(svc.sendMessage({ threadId: THREAD_ID, payload: { text: "Fail closed" } }), /refusing to downgrade/);
+  assert.equal(calls.sealForPeer.length, 0);
+  assert.equal(calls.dispatch.length, 0);
 });
 
 test("gate OPEN + resolvable device set: one sealForPeerDevice per device, to each device's inbox", async () => {

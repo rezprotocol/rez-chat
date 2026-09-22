@@ -23,7 +23,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
-import { bytesToBase64, deriveAccountIdFromPublicKey } from "@rezprotocol/core";
+import { bytesToBase64, deriveAccountIdFromPublicKey, MemoryStorageProvider } from "@rezprotocol/core";
 import { NodeCryptoProvider, startRezNode } from "@rezprotocol/node";
 
 import { createKeyValueBackedPeerLinkStorage } from "@rezprotocol/sdk/peer-link";
@@ -33,36 +33,15 @@ import { startRezChatCore } from "../src/mobile/startRezChatCore.js";
 const CRYPTO = new NodeCryptoProvider();
 const QUIET = { log() {}, warn() {}, info() {}, error() {} };
 
-class TestKVStore {
-  constructor() { this._data = new Map(); }
-  async get(key) { return this._data.has(key) ? this._data.get(key) : null; }
-  async getStrict(key) { return this._data.has(key) ? this._data.get(key) : undefined; }
-  async set(key, value) { this._data.set(key, JSON.parse(JSON.stringify(value))); }
-  async delete(key) { this._data.delete(key); }
-  async keys(prefix) {
-    const out = [];
-    for (const k of this._data.keys()) if (k.startsWith(prefix)) out.push(k);
-    return out;
-  }
-}
-// The host's storage provider — durable across simulated process kills
-// (the same instance handed to a second boot, the way a device's SQLite
-// file survives its process).
-class HostStorageProvider {
+// This fixture proves composition and ownership, not native disk durability.
+// Actual process death belongs to the native-provider acceptance harness.
+class HostStorageProvider extends MemoryStorageProvider {
+  #peerLinks;
   constructor() {
-    this._stores = new Map();
-    // The provider contract the core needs is getKeyValueStore +
-    // getPeerLinkStorage; the sdk supplies the KV-backed peer-link storage
-    // composition, so a host only ever implements a KV store (SQLite on
-    // device, this map here).
-    this._peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: this.getKeyValueStore(null) });
+    super();
+    this.#peerLinks = createKeyValueBackedPeerLinkStorage({ keyValueStore: this.getKeyValueStore(null) });
   }
-  getKeyValueStore(name) {
-    const key = name == null ? "" : String(name);
-    if (!this._stores.has(key)) this._stores.set(key, new TestKVStore());
-    return this._stores.get(key);
-  }
-  getPeerLinkStorage() { return this._peerLinkStorage; }
+  getPeerLinkStorage() { return this.#peerLinks; }
 }
 
 function hostIdentity() {
@@ -175,30 +154,44 @@ test("P1.1: headless boot OFFLINE — services start disconnected; the provider 
   assert.equal(core.chatServer.bus.runtime.accountControl.executeCount, 0);
 });
 
-test("P1.1: process KILL — a second boot over the SAME host storage reconstructs the claim, address, and lease; nothing correctness-bearing lived in host memory", async (t) => {
+test("P1.1: a second live runtime is refused; after shutdown, boot reconstructs the same claim, address and lease", async (t) => {
   const wsPort = await getFreePort();
   await startRemoteProvider(t, wsPort);
   const identity = hostIdentity();
   const storage = new HostStorageProvider();
   const wsUrl = "ws://127.0.0.1:" + wsPort + "/ws";
 
-  // Life 1: boot, bind, converge — then KILL (no stop(); a killed process
-  // says no goodbyes; only the provider-backed storage survives).
+  // Life 1 holds the delivery grant from boot, even before any message arrives.
   const life1 = await bootCore({ identity, storage, wsUrl });
+  t.after(() => life1.chatServer.stop());
   await life1.chatServer.start();
   await life1.adapter.onForeground();
   const inboxId = life1.inboxClaimant.inboxId;
   assert.ok(life1.inboxClaimant.claimStore.leaseState(inboxId));
+
+  await assert.rejects(() => bootCore({ identity, storage, wsUrl }), {
+    code: "DELIVERY_RUNTIME_ALREADY_ACTIVE",
+  });
+  await life1.chatServer.stop();
 
   // Life 2: a fresh core over the same storage. The durable claim (the
   // ADDRESS), the claimant key, and the lease all reconstruct.
   const life2 = await bootCore({ identity, storage, wsUrl });
   t.after(() => life2.chatServer.stop().catch(() => {}));
   await life2.chatServer.start();
-  assert.equal(life2.inboxClaimant.inboxId, inboxId, "the portable address survived the kill");
+  assert.equal(life2.inboxClaimant.inboxId, inboxId, "the portable address survived the restart");
   const report = await life2.adapter.onForeground();
   assert.equal(report.live, true);
   const lease = life2.inboxClaimant.claimStore.leaseState(inboxId);
   assert.equal(lease.retentionClass, "standard");
   assert.equal(life2.chatServer.bus.runtime.accountControl.executeCount, 0);
+});
+
+test("mobile boot rejects a provider without exclusive ownership before any storage or network work", async () => {
+  let touched = false;
+  await assert.rejects(() => startRezChatCore({
+    storageProvider: { getKeyValueStore() { touched = true; throw new Error("unexpected storage access"); } },
+    wsFactory() { touched = true; throw new Error("unexpected network access"); },
+  }), { code: "DELIVERY_RUNTIME_OWNERSHIP_UNSUPPORTED" });
+  assert.equal(touched, false);
 });

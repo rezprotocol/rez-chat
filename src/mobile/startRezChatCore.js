@@ -44,10 +44,11 @@ import { MobileLifecycleAdapter } from "../server/runtime/MobileLifecycleAdapter
  *   ({deviceKeyPair, deviceId}); required for the delegated shape.
  * @param {object} opts.storageProvider — platform storage behind the
  *   provider seam (SqliteStorageProvider on device; any KV provider in
- *   tests). Contract: `getKeyValueStore(name)` + `getPeerLinkStorage()` —
- *   the sdk's `createKeyValueBackedPeerLinkStorage({keyValueStore})`
- *   composes the latter from the former, so a host only ever implements a
- *   KV store. Durable truth lives here and ONLY here.
+ *   tests). Contract: strict durable KV reads/writes, `getPeerLinkStorage()`
+ *   and `acquireRuntimeOwnership({namespace})`. The SDK supplies peer-link
+ *   composition; the host supplies storage mechanics and exclusive ownership
+ *   across processes. A native provider must not emulate that lock with an
+ *   in-process boolean. Durable truth lives here and ONLY here.
  * @param {object} opts.cryptoProvider — platform crypto behind the provider
  *   seam (NativeCryptoProvider on device; BrowserCryptoProvider or the
  *   Node provider in tests).
@@ -87,6 +88,11 @@ export async function startRezChatCore({
   if (typeof wsFactory !== "function") {
     throw new Error("startRezChatCore requires wsFactory (the platform WebSocket implementation)");
   }
+  if (!storageProvider || typeof storageProvider.acquireRuntimeOwnership !== "function") {
+    const err = new Error("startRezChatCore requires exclusive delivery runtime ownership from its storage provider");
+    err.code = "DELIVERY_RUNTIME_OWNERSHIP_UNSUPPORTED";
+    throw err;
+  }
   // P1.3b (frozen R3 phase invariants): a DELEGATED mobile identity boots in
   // the "portable" inbox role — the steady-state runtime inbox comes from the
   // claim store's portable primary ONLY. No portable primary means the
@@ -110,6 +116,19 @@ export async function startRezChatCore({
     clock,
     logger,
   });
+  // Acquire the SDK-owned delivery grant and recover committed work before
+  // presenting a usable mobile runtime. A boot-only success must not conceal
+  // a provider that cannot safely receive its first message.
+  try {
+    await bootstrapped.peerLinkService.listPendingDeliveryWork();
+  } catch (err) {
+    try {
+      await bootstrapped.peerLinkService.close();
+    } catch (closeErr) {
+      logger.error("startRezChatCore failed to release delivery ownership after boot failure", closeErr);
+    }
+    throw err;
+  }
   const bus = bootstrapped.chatServer.bus;
   const adapter = new MobileLifecycleAdapter({
     bus,

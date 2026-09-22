@@ -69,7 +69,11 @@ function formatBytes(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 }
 
-function triggerDownload({ fileName, mimeType, fileDataB64 }) {
+async function triggerDownload({ fileName, mimeType, fileDataB64 }) {
+  const mobile = globalThis.rezMobile;
+  if (mobile && mobile.files && typeof mobile.files.share === "function") {
+    return mobile.files.share({ fileName: fileName || "file", fileDataB64 });
+  }
   const binary = atob(fileDataB64);
   const len = binary.length;
   const bytes = new Uint8Array(len);
@@ -238,7 +242,9 @@ export class MessageBubbleView extends BusComponent {
     };
 
     const renderDocEl = (containerEl, isMine) => {
-      if (!isAttachment || isImage) return;
+      // iOS photos need the same Save/Share action as documents; tapping the
+      // preview still opens the full-size image.
+      if (!isAttachment || (isImage && !globalThis.rezMobile)) return;
       const hashHex = payload.fileHashHex;
       const fileName = payload.fileName || "file";
       const sizeStr = formatBytes(payload.fileSizeBytes);
@@ -253,10 +259,10 @@ export class MessageBubbleView extends BusComponent {
       const downloadBtn = h("button", {
         type: "button",
         className: "shrink-0 w-8 h-8 flex items-center justify-center rounded-md transition-colors " + (isMine ? "hover:bg-on-primary/15 text-on-primary" : "hover:bg-primary/15 text-on-surface-variant hover:text-primary"),
-        title: "Download " + fileName,
-        "aria-label": "Download " + fileName,
+        title: (globalThis.rezMobile ? "Save or share " : "Download ") + fileName,
+        "aria-label": (globalThis.rezMobile ? "Save or share " : "Download ") + fileName,
         "data-testid": "message.attachment.download",
-      }, [materialIcon("download", { size: 20 })]);
+      }, [materialIcon(globalThis.rezMobile ? "ios_share" : "download", { size: 20 })]);
       let downloading = false;
       downloadBtn.addEventListener("click", (evt) => {
         evt.stopPropagation();
@@ -264,22 +270,23 @@ export class MessageBubbleView extends BusComponent {
         downloading = true;
         const iconHolder = downloadBtn.firstChild;
         downloadBtn.replaceChildren(materialIcon("hourglass_empty", { size: 20 }));
-        this.bus.call("file", "get", { fileHashHex: hashHex }).then((result) => {
-          downloading = false;
-          downloadBtn.replaceChildren(iconHolder);
+        this.bus.call("file", "get", { fileHashHex: hashHex }).then(async (result) => {
           if (!result || !result.fileDataB64 || result.fileDataB64.length === 0) {
             stateLabel.textContent = "UNAVAILABLE";
             return;
           }
-          triggerDownload({
+          await triggerDownload({
             fileName,
             mimeType: payload.mimeType || "application/octet-stream",
             fileDataB64: result.fileDataB64,
           });
-        }).catch(() => {
+          stateLabel.textContent = sizeStr || "FILE";
+        }).catch((error) => {
+          stateLabel.textContent = "COULD NOT SAVE — TRY AGAIN";
+          this.bus.emit("app.error", { source: "MessageBubbleView", message: error.message || "Could not save file", severity: "warn" });
+        }).finally(() => {
           downloading = false;
           downloadBtn.replaceChildren(iconHolder);
-          stateLabel.textContent = "UNAVAILABLE";
         });
       });
       const chip = h("div", {

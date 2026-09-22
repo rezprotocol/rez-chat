@@ -232,6 +232,29 @@ test("browser device linking cleans up the delegated keystore when registry admi
   assert.equal(await service.authBootstrapService.getKeystoreStore("default").hasKeystore(), false);
 });
 
+test("device linking refuses to persist a delegation without its bootstrap inbox", async () => {
+  const storage = createMemoryStorage();
+  const linked = deviceLinkResult();
+  delete linked.inboxId;
+  const service = createAuthHarness({
+    storageProvider: storage,
+    accountRegistry: new AccountRegistry({ storageProvider: storage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    deviceLinkRunner: async ({ persistDelegation }) => {
+      await persistDelegation(linked);
+      return linked;
+    },
+    logger: console,
+  });
+  await service.init();
+  await assert.rejects(
+    () => service.linkDevice({ linkCode: "rez:link:v1:test", profileName: "Phone", password: "password-phone" }),
+    /no bootstrap inboxId/,
+  );
+  assert.equal(await service.authBootstrapService.getKeystoreStore("default").hasKeystore(), false);
+});
+
 test("browser device linking removes a persisted keystore when confirmation fails", async () => {
   const storage = createMemoryStorage();
   const service = createAuthHarness({
@@ -541,6 +564,63 @@ test("browser account password change preserves account and device identity", as
   assert.equal((await service.accountAuthService.revealMnemonic({ password: "password-new" })).mnemonic.split(" ").length, 24);
 });
 
+test("shared account recovery resets a forgotten password without replacing device identity", async () => {
+  const storage = createMemoryStorage();
+  const service = createAuthHarness({
+    storageProvider: storage,
+    accountRegistry: new AccountRegistry({ storageProvider: storage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    logger: console,
+  });
+  await service.init();
+  await service.createAccount({ profileName: "Recoverable", password: "password-old" });
+  const before = service.getAccount();
+  const revealed = await service.accountAuthService.revealMnemonic({ password: "password-old" });
+  await service.accountAuthService.resetPasswordWithMnemonic({
+    accountId: before.accountId,
+    mnemonic: revealed.mnemonic,
+    newPassword: "password-new",
+  });
+  await assert.rejects(() => service.unlock({ password: "password-old" }));
+  await service.unlock({ password: "password-new" });
+  const after = service.getAccount();
+  assert.equal(after.accountId, before.accountId);
+  assert.equal(after.deviceId, before.deviceId);
+  assert.deepEqual(after.deviceKeyPair, before.deviceKeyPair);
+});
+
+test("shared password reset restores the recovery envelope when the main keystore write fails", async () => {
+  const storage = createMemoryStorage();
+  const service = createAuthHarness({
+    storageProvider: storage,
+    accountRegistry: new AccountRegistry({ storageProvider: storage }),
+    sdkClientFactory: createSdkFactory({ connects: 0, closes: 0, lastAccount: null }),
+    cryptoProvider: globalThis.crypto,
+    logger: console,
+  });
+  await service.init();
+  await service.createAccount({ profileName: "Recoverable", password: "password-old" });
+  const revealed = await service.accountAuthService.revealMnemonic({ password: "password-old" });
+  const recoveryBefore = await storage.get("recovery:default");
+  const put = storage.put;
+  storage.put = (key, value) => {
+    if (key === "default") throw new Error("main keystore unavailable");
+    return put(key, value);
+  };
+  await assert.rejects(
+    () => service.accountAuthService.resetPasswordWithMnemonic({
+      mnemonic: revealed.mnemonic,
+      newPassword: "password-new",
+    }),
+    /main keystore unavailable/,
+  );
+  assert.deepEqual(await storage.get("recovery:default"), recoveryBefore);
+  storage.put = put;
+  await service.logout();
+  await service.unlock({ password: "password-old" });
+});
+
 test("browser account purge verifies the password and removes vault plus recovery state", async () => {
   const storage = createMemoryStorage();
   const service = createAuthHarness({
@@ -561,6 +641,7 @@ test("browser account purge verifies the password and removes vault plus recover
   assert.equal((await service.listAccounts()).length, 0);
   assert.equal(await storage.get("default"), null);
   assert.equal(await storage.get("recovery:default"), null);
+  assert.equal(await storage.get("recovery-keystore:default"), null);
   assert.equal(service.authStore.snapshot().status, SESSION_STATUS.NO_KEYSTORE);
 });
 

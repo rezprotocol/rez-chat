@@ -1,0 +1,6 @@
+{
+  "accountHomeUplinks": ["wss://enrollment.example.invalid/ws"],
+  "portableUplinks": ["wss://portable.example.invalid/mobile/ws"],
+  "accountHomePin": "",
+  "portablePin": ""
+}

@@ -126,7 +126,9 @@ async function makeAppNode({ network, inboxId, ownAccount, peerAccount, peerInbo
     peerLinks.accountAuthoritySigner = async () => ({
       mode: "direct",
       signerPublicKeyB64: ownAccount.pubB64,
-      senderDeviceId: "",
+      // A real primary signer stamps its device id (PeerLinkService.accountAuthoritySigner).
+      // An empty id here hid the 2026-09-22 B3 receipt-routing regression.
+      senderDeviceId: "dev:" + inboxId,
       certChain: null,
       sign: async (bytes) => CRYPTO.sign({ privateKey: ownAccount.keyPair.privateKey, msg: bytes }),
     });
@@ -202,6 +204,86 @@ async function sendSigned(node, { messageId, text }) {
     messageId,
   });
 }
+
+test("new committed signed facts trigger sibling reconciliation once; replay never echoes another digest", async (t) => {
+  const { network, alice, bob } = await setupPair();
+  t.after(() => teardown(alice, bob));
+  const announced = [];
+  bob.app.bus.services.siblingSync = { async syncThread({ threadId }) {
+    assert.equal((await rowOf(bob, "first-contact-copy")).text, "First message");
+    announced.push(threadId);
+  } };
+  await sendSigned(alice, { messageId: "first-contact-copy", text: "First message" });
+  await network.drain();
+  assert.deepEqual(announced, [THREAD]);
+  const original = network.wireLog.find((frame) => frame.kind === MESSAGE_KIND);
+  network.push({ deliverInboxId: bob.inboxId, fromAccountId: alice.account.accountId,
+    plaintextBodyBytes: new TextEncoder().encode(JSON.stringify(original.json)) });
+  await network.drain();
+  assert.deepEqual(announced, [THREAD]);
+});
+
+test("signed device sender receives its commit proof at its own verified inbox, not the thread's primary inbox", async (t) => {
+  const { network, alice, bob } = await setupPair();
+  t.after(() => teardown(alice, bob));
+  const originalSigner = alice.app.bus.runtime.peerLinks.accountAuthoritySigner;
+  alice.app.bus.runtime.peerLinks.accountAuthoritySigner = async () => ({
+    ...await originalSigner(), senderDeviceId: "alice-phone",
+  });
+  const sdk = bob.app.bus.runtime.sdk;
+  let selected = null;
+  sdk.sealForPeerDevice = async (args) => {
+    selected = args;
+    return sdk.sealForPeer(args);
+  };
+  bob.app.bus.registerFunction({ namespace: "device-set", name: "resolveForPeer", fn: async () => ({
+    deviceSetRecord: { devices: [
+      { deviceId: "alice-primary", inboxId: "inbox:alice" },
+      { deviceId: "alice-phone", inboxId: "inbox:alice-phone" },
+    ] }, established: [],
+  }) });
+  network.register("inbox:alice-phone", alice.app);
+  await sendSigned(alice, { messageId: "phone-receipt", text: "Sent from phone" });
+  await network.drain();
+  assert.equal(selected.peerDeviceId, "alice-phone");
+  assert.equal(selected.deliverInboxId, "inbox:alice-phone");
+  assert.equal((await rowOf(alice, "phone-receipt")).status, "delivered");
+  assert.equal(network.wireLog.some((frame) => frame.kind === MESSAGE_COMMIT_ACK_KIND && frame.toInbox === "inbox:alice"), false);
+});
+
+test("missing verified sender device leaves commit proof pending without routing it to another device", async (t) => {
+  const { network, alice, bob } = await setupPair();
+  t.after(() => teardown(alice, bob));
+  const originalSigner = alice.app.bus.runtime.peerLinks.accountAuthoritySigner;
+  alice.app.bus.runtime.peerLinks.accountAuthoritySigner = async () => ({ ...await originalSigner(), senderDeviceId: "removed-phone" });
+  bob.app.bus.runtime.sdk.sealForPeerDevice = async () => { throw new Error("Unverified device must not seal"); };
+  // A PUBLISHED set that does not name the signed sender device: fail closed.
+  bob.app.bus.registerFunction({ namespace: "device-set", name: "resolveForPeer", fn: async () => ({
+    deviceSetRecord: { devices: [{ deviceId: "alice-primary", inboxId: "inbox:alice" }] }, established: [],
+  }) });
+  await sendSigned(alice, { messageId: "missing-device", text: "Wait for a valid return route" });
+  await network.drain();
+  assert.equal((await rowOf(alice, "missing-device")).status, "sent");
+  assert.equal((await pendingOf(alice)).length, 1);
+  assert.equal(network.wireLog.some((frame) => frame.kind === MESSAGE_COMMIT_ACK_KIND), false);
+});
+
+test("a signed device sender whose account published no device set receives its proof at the thread return inbox", async (t) => {
+  // Audit 2026-09-22 B3: every existing desktop contact is in this state. A
+  // null device set is a single-device peer, not a missing device, so the
+  // receipt takes the legacy return inbox (same rule as send-side fan-out).
+  const { network, alice, bob } = await setupPair();
+  t.after(() => teardown(alice, bob));
+  const originalSigner = alice.app.bus.runtime.peerLinks.accountAuthoritySigner;
+  alice.app.bus.runtime.peerLinks.accountAuthoritySigner = async () => ({ ...await originalSigner(), senderDeviceId: "alice-desktop" });
+  bob.app.bus.runtime.sdk.sealForPeerDevice = async () => { throw new Error("no published set: must not seal per device"); };
+  bob.app.bus.registerFunction({ namespace: "device-set", name: "resolveForPeer", fn: async () => null });
+  await sendSigned(alice, { messageId: "no-set", text: "Single-device peer" });
+  await network.drain();
+  assert.equal((await rowOf(alice, "no-set")).status, "delivered");
+  assert.equal((await pendingOf(alice)).length, 0);
+  assert.equal(network.wireLog.some((frame) => frame.kind === MESSAGE_COMMIT_ACK_KIND && frame.toInbox === "inbox:alice"), true);
+});
 
 // Hand-build a commit ack signed by an account root (the shape any recipient
 // device of that account — original target or anti-entropy sibling — emits).

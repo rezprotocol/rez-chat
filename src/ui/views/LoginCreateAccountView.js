@@ -44,7 +44,7 @@ export class LoginCreateAccountView extends BusComponent {
       id: "rz-signup-name",
       className: "w-full bg-surface-container-low border border-glass-border rounded-lg pl-space-md pr-12 py-3 font-label-technical text-label-technical text-white focus:ring-1 focus:ring-primary/50 focus:border-primary/50 focus:outline-none transition-all placeholder:font-label-technical",
       type: "text",
-      placeholder: "ID_ALPHA_772",
+      placeholder: (globalThis.__REZ_MOBILE__ ? "Your name" : "ID_ALPHA_772"),
       autocomplete: "username",
       "data-role": "signup-name",
     });
@@ -68,19 +68,19 @@ export class LoginCreateAccountView extends BusComponent {
     });
 
     const nameField = this.#renderField({
-      labelText: "USERNAME / NODE ID",
+      labelText: (globalThis.__REZ_MOBILE__ ? "YOUR NAME" : "USERNAME / NODE ID"),
       htmlFor: "rz-signup-name",
       input: nameInput,
       icon: materialIcon("hub", { size: 20, className: "text-outline" }),
     });
     const passwordField = this.#renderField({
-      labelText: "ACCESS KEY",
+      labelText: (globalThis.__REZ_MOBILE__ ? "PASSWORD" : "ACCESS KEY"),
       htmlFor: "rz-signup-password",
       input: createPasswordInput,
       icon: materialIcon("key", { size: 20, className: "text-outline" }),
     });
     const confirmField = this.#renderField({
-      labelText: "CONFIRM ACCESS KEY",
+      labelText: (globalThis.__REZ_MOBILE__ ? "CONFIRM PASSWORD" : "CONFIRM ACCESS KEY"),
       htmlFor: "rz-signup-confirm",
       input: confirmInput,
       icon: materialIcon("lock", { size: 20, className: "text-outline" }),
@@ -92,7 +92,7 @@ export class LoginCreateAccountView extends BusComponent {
       "data-action": "session.create",
     }, [
       materialIcon("bolt", { size: 18, className: "group-hover:animate-pulse" }),
-      h("span", { className: "font-extrabold tracking-[0.2em] uppercase" }, "Register Node"),
+      h("span", { className: "font-extrabold tracking-[0.2em] uppercase" }, (globalThis.__REZ_MOBILE__ ? "Create account" : "Register Node")),
     ]);
 
     const footerLinks = h("div", { className: "flex flex-col items-center gap-space-sm pt-space-md" }, [
@@ -105,7 +105,7 @@ export class LoginCreateAccountView extends BusComponent {
           size: 14,
           className: "group-hover:rotate-180 transition-transform duration-500",
         }),
-        h("span", null, "Already Initialized? Access Terminal"),
+        h("span", null, (globalThis.__REZ_MOBILE__ ? "Back to sign in" : "Already Initialized? Access Terminal")),
       ]) : null,
       h("button", {
         type: "button",
@@ -116,8 +116,8 @@ export class LoginCreateAccountView extends BusComponent {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "session.restoreBackup",
-      }, "Restore From Backup"),
-      h("button", {
+      }, (globalThis.__REZ_MOBILE__ ? "Restore with recovery phrase" : "Restore From Backup")),
+      !globalThis.__REZ_MOBILE__ && h("button", {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "session.inspectBootstrap",
@@ -148,7 +148,7 @@ export class LoginCreateAccountView extends BusComponent {
         }),
         h("p", {
           className: "font-label-technical text-label-technical text-primary/60 mt-space-xs uppercase tracking-[0.2em]",
-        }, "Secure Node Access"),
+        }, (globalThis.__REZ_MOBILE__ ? "Private conversations, wherever you are" : "Secure Node Access")),
       ]),
       error ? h("div", {
         className: "w-full mb-space-md px-space-md py-space-sm rounded-lg border border-error/40 bg-error/10 text-error font-label-technical text-label-technical",
@@ -185,13 +185,16 @@ export class LoginCreateAccountView extends BusComponent {
       type: "text",
       placeholder: "rez:link:v1:…",
       autocomplete: "off",
+      autocapitalize: "off",
+      autocorrect: "off",
+      spellcheck: "false",
       "data-role": "link-code",
     });
     const nameInput = h("input", {
       id: "rz-link-name",
       className: "w-full bg-surface-container-low border border-glass-border rounded-lg pl-space-md pr-12 py-3 font-label-technical text-label-technical text-white focus:ring-1 focus:ring-primary/50 focus:border-primary/50 focus:outline-none transition-all placeholder:font-label-technical",
       type: "text",
-      placeholder: "ID_ALPHA_772",
+      placeholder: (globalThis.__REZ_MOBILE__ ? "Your name" : "ID_ALPHA_772"),
       autocomplete: "username",
       "data-role": "link-name",
     });
@@ -233,9 +236,9 @@ export class LoginCreateAccountView extends BusComponent {
 
     const form = h("form", { className: "w-full space-y-space-md", "data-role": "link-device-form" }, [
       this.#renderField({ labelText: "LINK CODE", htmlFor: "rz-link-code", input: codeInput, icon: materialIcon("qr_code_2", { size: 20, className: "text-outline" }) }),
-      this.#renderField({ labelText: "USERNAME / NODE ID", htmlFor: "rz-link-name", input: nameInput, icon: materialIcon("hub", { size: 20, className: "text-outline" }) }),
-      this.#renderField({ labelText: "ACCESS KEY", htmlFor: "rz-link-password", input: passwordInput, icon: materialIcon("key", { size: 20, className: "text-outline" }) }),
-      this.#renderField({ labelText: "CONFIRM ACCESS KEY", htmlFor: "rz-link-confirm", input: confirmInput, icon: materialIcon("lock", { size: 20, className: "text-outline" }) }),
+      this.#renderField({ labelText: (globalThis.__REZ_MOBILE__ ? "YOUR NAME" : "USERNAME / NODE ID"), htmlFor: "rz-link-name", input: nameInput, icon: materialIcon("hub", { size: 20, className: "text-outline" }) }),
+      this.#renderField({ labelText: (globalThis.__REZ_MOBILE__ ? "PASSWORD" : "ACCESS KEY"), htmlFor: "rz-link-password", input: passwordInput, icon: materialIcon("key", { size: 20, className: "text-outline" }) }),
+      this.#renderField({ labelText: (globalThis.__REZ_MOBILE__ ? "CONFIRM PASSWORD" : "CONFIRM ACCESS KEY"), htmlFor: "rz-link-confirm", input: confirmInput, icon: materialIcon("lock", { size: 20, className: "text-outline" }) }),
       submitButton,
       h("div", { className: "flex flex-col items-center gap-space-sm pt-space-md" }, [backButton]),
     ]);

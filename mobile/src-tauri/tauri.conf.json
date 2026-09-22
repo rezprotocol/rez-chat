@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Rez Chat",
+  "version": "0.6.0-rc.10",
+  "identifier": "io.rezprotocol.chat.mobile",
+  "build": { "frontendDist": "../dist" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [{ "title": "Rez Chat", "width": 390, "height": 844 }],
+    "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost" }
+  },
+  "bundle": { "active": true, "targets": "all", "icon": ["../../build/icon.png"], "resources": { "../dist/mobile-core.js": "mobile-core.js", "../dist/mobile-deployment.json": "mobile-deployment.json" }, "iOS": { "minimumSystemVersion": "17.4" } }
+}

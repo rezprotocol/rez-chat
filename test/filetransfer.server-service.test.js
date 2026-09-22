@@ -5,6 +5,8 @@ import { ServerFileTransferService } from "../src/server/services/ServerFileTran
 import { ChatImagePayloadV1 } from "../src/records/payloads/ChatImagePayloadV1.js";
 import { FileManifestV1, FileChunkV1 } from "@rezprotocol/sdk/filetransfer";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
+import { ServerMessagesService } from "../src/server/services/ServerMessagesService.js";
+import { DeviceFanoutCacheStore } from "../src/server/storage/DeviceFanoutCacheStore.js";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -35,7 +37,7 @@ const OWNER = "rez:acct:test-owner";
 function createBus() {
   const handlers = new Map();
   const events = [];
-  return {
+  const bus = {
     stores: {
       threadStore: {
         getThread: async (threadId) => ({
@@ -59,6 +61,12 @@ function createBus() {
       },
     },
     services: {
+      messages: {
+        dispatchThreadBytes: async (_threadId, plaintextBodyBytes) => {
+          const sealed = await bus.runtime.sdk.sealForPeer({ peerAccountId: "rez:acct:peer-1", plaintextBodyBytes });
+          return bus.runtime.sdk.mesh.dispatch(sealed.object, sealed.address);
+        },
+      },
       threads: {
         emitThreadIndexUpdated: () => {},
       },
@@ -76,6 +84,7 @@ function createBus() {
     _events: events,
     _handlers: handlers,
   };
+  return bus;
 }
 
 test("FileSendParams validates required fields", () => {
@@ -157,6 +166,39 @@ test("ServerFileTransferService.getFile returns empty for unknown hash", async (
 
   const result = await svc.getFile({ fileHashHex: "b".repeat(64) });
   assert.equal(result.fileDataB64, "");
+});
+
+test("attachment chunks use canonical routing and concurrent sends retain their own channel", async () => {
+  const bus = createBus();
+  const routed = [];
+  bus.services.messages.dispatchThreadBytes = async (threadId, bytes, eventTag) => {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const payload = JSON.parse(new TextDecoder().decode(bytes));
+    routed.push({ threadId, eventTag, payload });
+  };
+  const service = new ServerFileTransferService({ bus, storageProvider: new TestStorageProvider(), ownerAccountId: OWNER });
+  await service.start();
+  await Promise.all(["first", "second"].map((id) => service.sendFile({ threadId: id, channelId: id, fileDataB64: "AQID", fileName: id + ".txt", mimeType: "text/plain" })));
+  assert.equal(routed.length, 4);
+  assert.equal(new Set(routed.map((entry) => entry.eventTag)).size, 4);
+  for (const entry of routed) {
+    assert.equal(entry.payload.channelId, entry.threadId);
+    assert.equal(entry.payload.threadId, entry.threadId);
+    assert.match(entry.eventTag, /^file:[a-f0-9]{64}$/);
+  }
+});
+
+test("attachment routing failure rejects the send and does not poison the next transfer", async () => {
+  const bus = createBus();
+  let fail = true;
+  bus.services.messages.dispatchThreadBytes = async () => { if (fail) throw new Error("device roster unavailable"); };
+  const service = new ServerFileTransferService({ bus, storageProvider: new TestStorageProvider(), ownerAccountId: OWNER });
+  await service.start();
+  const params = { threadId: "th_test", fileDataB64: "AQID", fileName: "test.txt", mimeType: "text/plain" };
+  await assert.rejects(service.sendFile(params), /device roster unavailable/);
+  assert(!bus._events.some((event) => event.eventName === "message.status"));
+  fail = false;
+  assert((await service.sendFile(params)).fileHashHex);
 });
 
 test("ServerFileTransferService.handleIncomingPayload returns false before start", async () => {
@@ -340,4 +382,80 @@ test("ServerFileTransferService.sendFile transitions outbound row to sent and em
   const depositedIndex = bus._events.findIndex((e) => e.eventName === "message.deposited");
   const statusIndex = bus._events.findIndex((e) => e.eventName === "message.status");
   assert.ok(depositedIndex < statusIndex, "message.deposited must fire before message.status");
+});
+
+// Audit 2026-09-22 B4: attachment manifests and chunks route through the shared
+// group fan-out, but receivers emit no delivery receipt for them. Recording an
+// expected receipt per member per chunk crossed the peer-link recovery
+// threshold (3 sends + 45 s) on a single photo and re-invited quiet members.
+test("a group attachment is delivered to every member without registering expected receipts", async () => {
+  class Kv {
+    constructor() { this.m = new Map(); }
+    get(k) { return this.m.get(k); }
+    set(k, v) { this.m.set(k, v); }
+    delete(k) { this.m.delete(k); }
+    keys(p) { return [...this.m.keys()].filter((k) => k.startsWith(p || "")); }
+  }
+  const storageProvider = {
+    stores: new Map(),
+    getKeyValueStore(ns) {
+      if (!this.stores.has(ns)) this.stores.set(ns, new Kv());
+      return this.stores.get(ns);
+    },
+  };
+  const expectedReceipts = [];
+  const sealedFor = [];
+  const sdk = {
+    getIdentity: () => ({ localInboxId: "inbox:owner" }),
+    sealForPeer: async (args) => { sealedFor.push(args.peerAccountId); return { object: {}, address: {} }; },
+    sealForPeerDevice: async () => ({ object: {}, address: {} }),
+    mesh: { dispatch: async () => ({ queued: false }) },
+  };
+  const threadStore = {
+    async getThread() { return { threadType: "group", groupId: "g1" }; },
+    async recordOutboundDeposit() {},
+    async setMessageStatus() {},
+  };
+  const groupStore = {
+    async listMembers() {
+      return [
+        { accountId: "rez:acct:owner", state: "active" },
+        { accountId: "rez:acct:m1", state: "active" },
+        { accountId: "rez:acct:m2", state: "active" },
+      ];
+    },
+  };
+  const threadIndex = { async upsertFromMessage() { return null; } };
+  const bus = {
+    runtime: { sdk, sessionMode: "claimant" },
+    stores: { threadStore, groupStore, threadIndex },
+    services: {
+      peerLinkProtocol: { recordOutboundGroupMessage: (args) => expectedReceipts.push(args.peerAccountId) },
+      threads: { emitThreadIndexUpdated() {} },
+    },
+    on() { return () => {}; },
+    emit() {},
+    registerFunction() {},
+    call() { return Promise.resolve(null); },
+  };
+  const quiet = { warn() {}, error() {}, log() {}, info() {} };
+  const messages = new ServerMessagesService({
+    bus, threadStore, threadIndex, groupStore,
+    deviceFanoutStore: new DeviceFanoutCacheStore({ storageProvider }),
+    ownerAccountId: "rez:acct:owner",
+    logger: quiet,
+  });
+  bus.services.messages = messages;
+  const service = new ServerFileTransferService({ bus, storageProvider, ownerAccountId: "rez:acct:owner", logger: quiet });
+  await service.start();
+  const bytes = new Uint8Array(200 * 1024).map((_, i) => i & 255);
+  await service.sendFile({
+    threadId: "th_group",
+    fileDataB64: Buffer.from(bytes).toString("base64"),
+    fileName: "photo.jpg",
+    mimeType: "image/jpeg",
+  });
+  assert.ok(sealedFor.filter((id) => id === "rez:acct:m1").length > 1, "manifest and chunks reach member 1");
+  assert.ok(sealedFor.filter((id) => id === "rez:acct:m2").length > 1, "manifest and chunks reach member 2");
+  assert.deepEqual(expectedReceipts, [], "attachment deposits must not register expected delivery receipts");
 });

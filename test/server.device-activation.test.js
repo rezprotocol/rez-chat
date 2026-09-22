@@ -121,6 +121,27 @@ test("sync: the network's truth WINS — self already in the served set converge
   assert.equal((await svc.status()).state, "ACTIVE");
 });
 
+test("published activation cannot finish without a durable roster; retry completes after the roster is persisted", async () => {
+  const kv = makeKv();
+  const journal = new DeviceActivationJournal({ storageProvider: storageOf(kv) });
+  await journal.hydrate();
+  await journal.ensureBootstrapping({ activationId: "cert-1", nowMs: 1 });
+  await journal.markReady({ baselineOrigin: "o", horizonLamport: 3 });
+  const { svc, bus } = makeActivationHarness({ kv, selfInSet: true });
+  bus.runtime.multiDeviceFanout = true;
+  const call = bus.call.bind(bus);
+  let persisted = false;
+  bus.call = async (namespace, name, payload) => {
+    if (namespace === "device-set" && name === "snapshotRoster") return { snapshotted: persisted };
+    return call(namespace, name, payload);
+  };
+  await assert.rejects(svc.syncWithNetwork(), /durable current sibling roster/);
+  assert.equal((await svc.status()).state, "READY", "publication alone must not end the bounded enrollment phase");
+  persisted = true;
+  await svc.syncWithNetwork();
+  assert.equal((await svc.status()).state, "ACTIVE");
+});
+
 test("sync: READY-but-not-committed (crash between marker and publication) commits EXACTLY ONCE on resume", async () => {
   const kv = makeKv();
   const j = new DeviceActivationJournal({ storageProvider: storageOf(kv) });

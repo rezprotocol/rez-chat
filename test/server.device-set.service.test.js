@@ -161,6 +161,25 @@ function makeBus(runtime) {
   };
 }
 
+test("roster snapshot and device-set publication reject a concurrent authority change", async () => {
+  let epoch = 4;
+  let writes = 0;
+  const bus = makeBus({ sessionMode: "account-legacy", multiDeviceFanout: true,
+    peerLinks: { deviceId: "self", buildDeviceSetRecordForPeer() {} },
+    sdk: { devices: {
+      async getAuthorityState() { return { epoch }; },
+      async getAccountDeviceSet() { epoch += 1; return { devices: [{ deviceId: "revoked-during-read", inboxId: "old-inbox" }] }; },
+    } },
+  });
+  bus.stores.deviceRosterStore = { async replaceFromAggregate() { writes += 1; } };
+  const service = new ServerDeviceSetService({ bus, ownerAccountId: "owner" });
+  await assert.rejects(service.snapshotRoster(), /authority changed/);
+  assert.equal(writes, 0);
+  bus.runtime.sdk.durableRecords = { async put() { writes += 1; } };
+  await assert.rejects(service.publishForPeer({ peerAccountId: "peer" }), /authority changed/);
+  assert.equal(writes, 0, "stale membership must not publish under the new epoch");
+});
+
 function makeService(account, overlay) {
   const bus = makeBus({ peerLinks: account.svc, sdk: { durableRecords: overlay.double() } });
   return new ServerDeviceSetService({ bus, ownerAccountId: account.accountId });

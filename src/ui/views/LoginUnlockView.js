@@ -48,7 +48,7 @@ export class LoginUnlockView extends BusComponent {
     if (!selected || selected.deviceUnlockEnabled !== true) return;
     // Never auto-unlock a pre-BIP39 account — it would succeed at the vault but
     // fail at connect(). The lock screen routes it through re-create instead.
-    if (selected.recoveryEnabled === false) return;
+    if (selected.recoveryEnabled === false && !selected.delegated) return;
     this.#autoPromptAttempted = true;
     this.bus.call("session", "unlockWithDevice", { accountId: selectedAccountId }).catch((err) => {
       const code = err && err.code ? String(err.code) : "";
@@ -72,7 +72,7 @@ export class LoginUnlockView extends BusComponent {
     const deviceUnlockAvailable = sessionStore.deviceUnlockAvailable();
     // Pre-BIP39 account selected: no recovery phrase, no backup, no unlock path
     // that survives connect(). Refuse the unlock form and route to re-create.
-    const selectedIsLegacy = !!(selectedAccount && selectedAccount.recoveryEnabled === false);
+    const selectedIsLegacy = !!(selectedAccount && selectedAccount.recoveryEnabled === false && !selectedAccount.delegated);
     const otherAccounts = sessionStore.otherAccountEntries();
     const busy = status === SESSION_STATUS.UNLOCKING || status === SESSION_STATUS.INITIALIZING;
 
@@ -137,7 +137,7 @@ export class LoginUnlockView extends BusComponent {
       disabled: busy ? "" : null,
     }, [
       materialIcon("lock_open", { size: 18, className: "group-hover:animate-pulse" }),
-      h("span", { className: "font-extrabold tracking-widest" }, busy ? "CONNECTING" : "DECRYPT"),
+      h("span", { className: "font-extrabold tracking-widest" }, busy ? "CONNECTING" : (globalThis.__REZ_MOBILE__ ? "UNLOCK" : "DECRYPT")),
     ]);
 
     const identityPill = selectedAccount ? this.#renderIdentityPill(selectedAccount) : null;
@@ -149,22 +149,22 @@ export class LoginUnlockView extends BusComponent {
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "session.disableDeviceUnlock",
       }, "FORGET_DEVICE_UNLOCK") : null,
-      selectedAccountId && !selectedIsLegacy ? h("button", {
+      selectedAccountId && !selectedIsLegacy && !(selectedAccount && selectedAccount.delegated) ? h("button", {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "session.forgotPassword",
-      }, "FORGOT_PASSWORD") : null,
+      }, (globalThis.__REZ_MOBILE__ ? "Forgot password?" : "FORGOT_PASSWORD")) : null,
       h("button", {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "session.restoreBackup",
-      }, "RESTORE_FROM_BACKUP"),
-      h("button", {
+      }, (globalThis.__REZ_MOBILE__ ? "Restore with recovery phrase" : "RESTORE_FROM_BACKUP")),
+      !globalThis.__REZ_MOBILE__ && h("button", {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all",
         "data-action": "authScreen.showCreate",
       }, "ADD_NEW_NODE"),
-      h("button", {
+      !globalThis.__REZ_MOBILE__ && h("button", {
         type: "button",
         className: "font-label-technical text-label-technical text-outline hover:text-primary transition-all flex items-center gap-1 group",
         "data-action": "session.inspectBootstrap",
@@ -224,7 +224,7 @@ export class LoginUnlockView extends BusComponent {
         }),
         h("p", {
           className: "font-label-technical text-label-technical text-primary/60 mt-space-xs uppercase tracking-[0.2em]",
-        }, "Secure Node Access"),
+        }, (globalThis.__REZ_MOBILE__ ? "Welcome back" : "Secure Node Access")),
       ]),
       error ? h("div", {
         className: "w-full mb-space-md px-space-md py-space-sm rounded-lg border border-error/40 bg-error/10 text-error font-label-technical text-label-technical",
@@ -266,7 +266,7 @@ export class LoginUnlockView extends BusComponent {
       h("div", { className: "flex flex-col min-w-0" }, [
         h("span", {
           className: "font-label-technical text-label-technical text-on-surface-muted leading-tight",
-        }, "NODE_IDENTITY"),
+        }, (globalThis.__REZ_MOBILE__ ? "YOUR ACCOUNT" : "NODE_IDENTITY")),
         h("span", {
           className: "font-label-technical text-primary font-bold truncate",
         }, label),

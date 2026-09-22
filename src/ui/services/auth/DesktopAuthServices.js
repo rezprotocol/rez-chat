@@ -287,6 +287,14 @@ export class DesktopAccountAuthService {
     return this._desktop.vault.revealMnemonic({ accountId, password });
   }
 
+  async restoreWithMnemonic({ mnemonic = "", newPassword = "", profileName = "" } = {}) {
+    if (!this._desktop.vault || typeof this._desktop.vault.restoreWithMnemonic !== "function") throw new Error("Phrase restoration is unavailable on this host");
+    const result = await this._desktop.vault.restoreWithMnemonic({ mnemonic, newPassword, profileName });
+    await this.#completeAuth(result);
+    this._sessionStore.setAccountList(await this._authBootstrapService.listAccounts());
+    return result;
+  }
+
   async resetPasswordWithMnemonic({ accountId = null, mnemonic = "", newPassword = "" } = {}) {
     if (!this._desktop.vault || typeof this._desktop.vault.resetPasswordWithMnemonic !== "function") {
       throw new Error("Recovery unavailable: bridge does not expose vault.resetPasswordWithMnemonic");

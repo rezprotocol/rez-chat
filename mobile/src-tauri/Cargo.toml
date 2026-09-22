@@ -1,0 +1,15 @@
+[package]
+name = "rez-chat-mobile"
+version = "0.6.0-rc.10"
+edition = "2021"
+
+[lib]
+name = "rez_chat_mobile"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-rez-native = { path = "../tauri-plugin-rez-native" }

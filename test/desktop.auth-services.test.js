@@ -7,6 +7,17 @@ import {
   DesktopAuthBootstrapService,
 } from "../src/ui/services/auth/DesktopAuthServices.js";
 
+test("linked-device marker survives account-list projection without implying root recovery", async () => {
+  const sessionStore = new SessionStore();
+  const desktop = createDesktopStub({ status: { hasAccounts: true }, accounts: [{ id: "linked-device", label: "Phone", delegated: true, recoveryEnabled: false }] });
+  const bootstrap = new DesktopAuthBootstrapService({ sessionStore, desktop });
+  await bootstrap.init();
+  const entry = sessionStore.snapshot().accountList[0];
+  assert.equal(entry.delegated, true);
+  assert.equal(entry.recoveryEnabled, false);
+  assert.equal(sessionStore.snapshot().status, SESSION_STATUS.LOCKED);
+});
+
 function createDesktopStub({ status, accounts, active, unlockResult } = {}) {
   const state = {
     active: active || null,
@@ -81,6 +92,29 @@ test("desktop auth keeps decrypted active profile label in UI memory after unloc
   assert.equal(snap.status, SESSION_STATUS.UNLOCKED);
   assert.equal(snap.accountList.length, 1);
   assert.equal(snap.accountList[0].label, "Ada");
+});
+
+test("a native vault uses the same account identity and self-label contract", async () => {
+  const sessionStore = new SessionStore();
+  const unlockResult = {
+    accountId: "rez:acct:phone",
+    deviceId: "rez:dev:phone",
+    profileName: "Mini me",
+    identityPublicKey: "pub-phone",
+  };
+  const desktop = createDesktopStub({
+    status: { hasAccounts: true, locked: true },
+    accounts: [{ id: "rez:acct:phone", label: "Mini me", accountIdHint: "rez:acct:phone" }],
+    unlockResult,
+  });
+  const bootstrap = new DesktopAuthBootstrapService({ sessionStore, desktop });
+  const auth = new DesktopAccountAuthService({ sessionStore, authBootstrapService: bootstrap, desktop });
+
+  await bootstrap.init();
+  await auth.unlock({ accountId: "rez:acct:phone", password: "password123" });
+
+  assert.equal(sessionStore.snapshot().selectedAccountId, "rez:acct:phone");
+  assert.equal(sessionStore.selfLabel(), "Mini me");
 });
 
 test("desktop auth forwards enableDeviceUnlock flag to vault.unlock", async () => {

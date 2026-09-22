@@ -1,0 +1,6 @@
+{
+  "accountHomeUplinks": ["wss://chat.rezprotocol.io/ws"],
+  "portableUplinks": ["wss://chat.rezprotocol.io/mobile/ws"],
+  "accountHomePin": "",
+  "portablePin": ""
+}

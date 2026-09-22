@@ -769,6 +769,15 @@ export class ServerAccountStateSyncService extends BaseServerService {
           : (typeof threads.directThreadIdForPeerLink === "function" ? threads.directThreadIdForPeerLink(peerLinkId, p.accountId) : null);
         if (threadId) {
           await threads.ensureDirectThread({ threadId, peerAccountId: p.accountId, peerInboxId, createdAtMs: now });
+          // A first message may have reached another sibling before this
+          // relationship baseline. Reconcile now that admission can succeed;
+          // an earlier digest/transfer was allowed to defer at the contact gate.
+          const siblingSync = this.bus.services.siblingSync;
+          if (siblingSync && typeof siblingSync.syncThread === "function") {
+            siblingSync.syncThread({ threadId }).catch((error) => {
+              this.logger.warn("[ServerAccountStateSyncService] relationship history reconciliation deferred", error && error.message ? error.message : error);
+            });
+          }
           const threadIndex = this.bus.stores && this.bus.stores.threadIndex ? this.bus.stores.threadIndex : null;
           if (threadIndex && typeof threadIndex.upsertFromMessage === "function") {
             const record = await threadIndex.upsertFromMessage({ threadId, messageId: null, ts: now, preview: "Connected" })

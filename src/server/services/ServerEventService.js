@@ -379,6 +379,7 @@ export class ServerEventService extends BaseServerService {
     // frozen order authenticate → verify → fact append → projection commit →
     // ACK holds by construction).
     let admittedFingerprint = "";
+    let appendedSignedFact = false;
     // AE-1 admission (plan §4): a SIGNED OriginalMessage is verified as a NEW
     // ADMISSION at this one ingest seam — the transport (live session today,
     // sibling transfer in AE-2) is never authority. Fail-closed: a signed
@@ -427,6 +428,7 @@ export class ServerEventService extends BaseServerService {
                 origin: "live",
               },
             });
+            appendedSignedFact = appended.appended === true;
             // Appended OR already held (an idempotent duplicate resend still
             // re-emits the commit ack — plan §5's idempotent-resend case).
             if (decodedPayload.kind === CHAT_MESSAGE_KIND) {
@@ -561,6 +563,18 @@ export class ServerEventService extends BaseServerService {
 
     if (!messagePersisted) return;
 
+    // A newly invited peer may send before our public device set reaches it.
+    // Its first copy can legitimately arrive only at this device. Announce
+    // the committed fact through the existing sibling reconciliation owner
+    // so active siblings converge without requiring a reconnect. Duplicate
+    // fact admission emits no new digest, preventing transfer echo loops.
+    const siblingSync = this.bus.services && this.bus.services.siblingSync;
+    if (appendedSignedFact && threadId && siblingSync && typeof siblingSync.syncThread === "function") {
+      siblingSync.syncThread({ threadId }).catch((error) => {
+        this.logger.warn("[ServerEventService] committed fact sibling reconciliation deferred", error && error.message ? error.message : error);
+      });
+    }
+
     // Delivery ack (DT-004 group-ack split-brain repair). 1:1 threads ack via
     // the thread's own peer identity, unchanged. Group messages are now acked
     // too: the sender registers EVERY group fan-out copy as expecting an E2E
@@ -576,6 +590,19 @@ export class ServerEventService extends BaseServerService {
     // "delivered" on the first of N member acks. Carries the sender's local
     // messageId (payload.messageId, not the relay's eventId).
     if (decodedPayload && decodedPayload.kind === CHAT_MESSAGE_KIND && thread && messageId) {
+      // Only admitted signed semantics may select a device. Resolve its inbox
+      // from the verified public device set; a thread's legacy return inbox
+      // belongs to the account's primary and can strand a linked sender's ACK.
+      // The device route is taken only when the SIGNED sender is the
+      // AUTHENTICATED sender of this deposit: a relayed third-party signed
+      // message must never steer our receipt to another account's devices.
+      const signedSenderAccountId = typeof decodedPayload.senderAccountId === "string"
+        ? decodedPayload.senderAccountId.trim() : "";
+      const ackPeerDeviceId = admittedFingerprint
+        && signedSenderAccountId.length > 0
+        && signedSenderAccountId === senderAccountId
+        && typeof decodedPayload.senderDeviceId === "string"
+        ? decodedPayload.senderDeviceId.trim() : "";
       let ackPeerAccountId = null;
       let ackPeerInboxId = null;
       if (thread.threadType !== "group" && thread.peerAccountId && thread.peerInboxId) {
@@ -602,7 +629,8 @@ export class ServerEventService extends BaseServerService {
           this.logger.warn("[ServerEventService] group delivery ack skipped: no peer-link inbox for " + senderAccountId);
         }
       }
-      if (ackPeerAccountId && ackPeerInboxId) {
+      if (ackPeerDeviceId) ackPeerAccountId = signedSenderAccountId;
+      if (ackPeerAccountId && (ackPeerInboxId || ackPeerDeviceId)) {
         const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
         if (sdk && typeof sdk.sealForPeer === "function" && sdk.mesh) {
           // MessageCommitAck cutover (plan §7 decision 1 — REPLACE, hard
@@ -642,7 +670,48 @@ export class ServerEventService extends BaseServerService {
               });
               ackBytes = ackRecord.toBytes();
             }
-            const sealed = await sdk.sealForPeer({
+            let sealed = null;
+            if (ackPeerDeviceId) {
+              // Same rule as ServerMessagesService.#fanOutToPeerDevices: a peer
+              // that has published NO device set (resolveForPeer → null) is a
+              // single-device peer and takes the legacy return-inbox route. A
+              // PUBLISHED set that does not name the signed sender device fails
+              // closed — never guess another device's inbox.
+              const findDevice = (resolved) => {
+                const devices = resolved && resolved.deviceSetRecord ? resolved.deviceSetRecord.devices : null;
+                return Array.isArray(devices) ? devices.find((entry) => entry.deviceId === ackPeerDeviceId) : null;
+              };
+              let resolved = await this._call("device-set", "resolveForPeer", { peerAccountId: ackPeerAccountId });
+              let device = findDevice(resolved);
+              if (resolved !== null && resolved !== undefined && !device) {
+                // An admitted sender can be newer than the bounded cache.
+                // Refresh through its canonical verifier, never guess an inbox.
+                resolved = await this._call("device-set", "resolveForPeer", { peerAccountId: ackPeerAccountId, forceRefresh: true });
+                device = findDevice(resolved);
+              }
+              if (resolved === null || resolved === undefined) {
+                if (!ackPeerInboxId) {
+                  throw new Error("Delivery receipt sender has no published device set and no return inbox");
+                }
+              } else {
+                if (!device || !device.inboxId) {
+                  throw new Error("Delivery receipt sender is absent from the verified device set");
+                }
+                if (typeof sdk.sealForPeerDevice !== "function") {
+                  throw new Error("Delivery receipt requires per-device sealing for its signed sender");
+                }
+                const established = Array.isArray(resolved.established)
+                  ? resolved.established.find((entry) => entry.peerDeviceId === ackPeerDeviceId) : null;
+                sealed = await sdk.sealForPeerDevice({
+                  peerAccountId: ackPeerAccountId,
+                  peerDeviceId: ackPeerDeviceId,
+                  deliverInboxId: device.inboxId,
+                  plaintextBodyBytes: ackBytes,
+                  deviceHandshakeData: established ? established.handshakeData : null,
+                });
+              }
+            }
+            if (!sealed) sealed = await sdk.sealForPeer({
               peerAccountId: ackPeerAccountId,
               plaintextBodyBytes: ackBytes,
               deliverInboxId: ackPeerInboxId,

@@ -370,13 +370,33 @@ function fetchPinnedUrl(rawUrl, init = {}) {
     }, (incoming) => {
       incoming.once("end", clearDeadline);
       incoming.once("close", clearDeadline);
-      const status = incoming.statusCode || 500;
+      // This callback runs inside an http event emitter: anything thrown here
+      // is an uncaught exception that kills the sidecar. The status and the
+      // Response construction are both remote-controlled, so every failure is
+      // routed to reject() instead. Node accepts statuses 100-999; the Fetch
+      // Response constructor only 200-599 (RangeError otherwise).
+      const status = incoming.statusCode;
+      if (!Number.isInteger(status) || status < 200 || status > 599) {
+        clearDeadline();
+        request.destroy();
+        reject(new Error("unsupported_status:" + String(status)));
+        return;
+      }
       const hasNoBody = status === 204 || status === 205 || status === 304;
-      resolve(new Response(hasNoBody ? null : Readable.toWeb(incoming), {
-        status,
-        statusText: incoming.statusMessage || "",
-        headers: incoming.headers,
-      }));
+      let response;
+      try {
+        response = new Response(hasNoBody ? null : Readable.toWeb(incoming), {
+          status,
+          statusText: incoming.statusMessage || "",
+          headers: incoming.headers,
+        });
+      } catch (err) {
+        clearDeadline();
+        request.destroy();
+        reject(err);
+        return;
+      }
+      resolve(response);
     });
     deadline = setTimeout(() => request.destroy(new Error("fetch_timeout")), FETCH_TIMEOUT_MS);
     request.once("error", (err) => {

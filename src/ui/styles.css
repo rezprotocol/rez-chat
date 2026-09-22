@@ -340,6 +340,26 @@ body::after {
     linear-gradient(135deg, transparent 0%, transparent 30%, rgba(255,255,255,0.22) 30%, rgba(255,255,255,0.22) 40%, transparent 40%, transparent 60%, rgba(255,255,255,0.22) 60%, rgba(255,255,255,0.22) 70%, transparent 70%, transparent 90%, rgba(255,255,255,0.22) 90%);
 }
 
+/* Native phone shell: respect the cutout, home gesture and software keyboard. */
+.rez-mobile body::after { display: none; }
+.rez-mobile .h-screen {
+  position: absolute;
+  top: var(--rez-mobile-top, 0px);
+  left: 0;
+  right: 0;
+  height: var(--rez-mobile-height, 100dvh);
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  box-sizing: border-box;
+}
+.rez-mobile .rez-app.min-h-screen {
+  min-height: var(--rez-mobile-height, 100dvh);
+  padding-top: max(16px, env(safe-area-inset-top));
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+.rez-mobile input, .rez-mobile textarea, .rez-mobile select { font-size: max(16px, 1em); }
+.rez-mobile button, .rez-mobile a { touch-action: manipulation; }
+
 /* Chat tab mobile stack: below the lg breakpoint, show one panel at a
  * time. The list (rz-chat-sidebar) is visible when no thread is selected;
  * the conversation panel (rz-chat-panel) is visible when one is. At lg+

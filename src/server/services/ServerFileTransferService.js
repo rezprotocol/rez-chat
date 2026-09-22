@@ -36,6 +36,7 @@ export class ServerFileTransferService extends BaseServerService {
   #kvStore;
   #fileTransferService;
   #sendContext;
+  #sendTail = Promise.resolve();
   // transferId -> channelId, populated when an inbound manifest arrives.
   // Consumed (and cleared) in #handleFileReceived so the inbound
   // ChatImagePayloadV1 is stamped with the correct channel. The chat
@@ -109,80 +110,18 @@ export class ServerFileTransferService extends BaseServerService {
     this.#fileTransferService = new FileTransferService({
       log: this.logger,
       kvStore: this.#kvStore,
-      onSendDeposit: async ({ peerAccountId, contextId, plaintextBodyBytes }) => {
-        const ctx = this.#sendContext;
-        const deliverInboxId = ctx && typeof ctx.deliverInboxId === "string" && ctx.deliverInboxId
-          ? ctx.deliverInboxId
-          : undefined;
-        const groupTargets = ctx && Array.isArray(ctx.groupTargets) ? ctx.groupTargets : null;
-        const channelId = ctx && typeof ctx.channelId === "string" ? ctx.channelId : "";
-        const localIdentity = typeof sdk.getIdentity === "function" ? sdk.getIdentity() : {};
-        const receiptInboxId = typeof localIdentity.localInboxId === "string"
-          ? localIdentity.localInboxId.trim()
-          : undefined;
-        // Chat-layer wire augmentation. The body bytes arriving here are a
-        // serialized FileManifestV1 or FileChunkV1 — a rez-core protocol
-        // record that intentionally knows nothing about chat (no threadId,
-        // no senderAccountId). The chat layer adds those routing fields to
-        // the outbound wire so the receiver's ServerEventService can route
-        // the deposit to the right thread.
-        //
-        // This is the chat layer wrapping a core payload with chat
-        // metadata, NOT a sin: core's records stay clean of chat concerns;
-        // chat augments at its own boundary. The augmentation is in-place
-        // on the JSON because there is no separate chat-layer envelope
-        // record yet — promoting to one (e.g. ChatFilePayloadEnvelopeV1
-        // around the core body) would be a wire-format change requiring
-        // coordinated sender/receiver updates.
-        let bodyBytes = plaintextBodyBytes;
-        try {
-          const payload = JSON.parse(new TextDecoder().decode(plaintextBodyBytes));
-          if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-            payload.threadId = contextId;
-            payload.senderAccountId = this.ownerAccountId;
-            if (channelId) payload.channelId = channelId;
-            bodyBytes = new TextEncoder().encode(JSON.stringify(payload));
-          }
-        } catch {
-          bodyBytes = plaintextBodyBytes;
+      onSendDeposit: async ({ contextId, plaintextBodyBytes }) => {
+        const channelId = this.#sendContext || "";
+        const payload = JSON.parse(new TextDecoder().decode(plaintextBodyBytes));
+        payload.threadId = contextId;
+        payload.senderAccountId = this.ownerAccountId;
+        if (channelId) payload.channelId = channelId;
+        const bodyBytes = new TextEncoder().encode(JSON.stringify(payload));
+        const messages = this.bus.services && this.bus.services.messages;
+        if (!messages || typeof messages.dispatchThreadBytes !== "function") {
+          throw new Error("Attachment delivery requires the canonical message router");
         }
-        if (groupTargets) {
-          if (groupTargets.length === 0) return;
-          const results = await Promise.allSettled(
-            groupTargets.map((accountId) => sdk.sealForPeer({
-              peerAccountId: accountId,
-              plaintextBodyBytes: bodyBytes,
-              receiptInboxId: receiptInboxId || undefined,
-            }).then((sealed) => sdk.mesh.dispatch(
-              sealed.object,
-              sealed.address,
-            ))),
-          );
-          let failedCount = 0;
-          for (const r of results) {
-            if (r.status === "rejected") {
-              failedCount++;
-              this.logger.error(
-                "[ServerFileTransferService] group fan-out deposit failed",
-                r.reason && r.reason.message ? r.reason.message : r.reason,
-              );
-            }
-          }
-          if (failedCount === groupTargets.length) {
-            throw new Error("ServerFileTransferService: group fan-out failed for all " + groupTargets.length + " targets");
-          }
-          return;
-        }
-        const sealed = await sdk.sealForPeer({
-          peerAccountId,
-          plaintextBodyBytes: bodyBytes,
-          deliverInboxId,
-          receiptInboxId: receiptInboxId || undefined,
-        });
-        await sdk.mesh.dispatch(
-          sealed.object,
-          sealed.address,
-        );
+        await messages.dispatchThreadBytes(contextId, bodyBytes, "file:" + Hash.sha256Hex(bodyBytes));
       },
       onFileReceived: ({ transferId, manifest, fileBytes, senderAccountId, contextId }) => {
         this.#handleFileReceived({ transferId, manifest, fileBytes, senderAccountId, threadId: contextId }).catch((err) => {
@@ -196,58 +135,30 @@ export class ServerFileTransferService extends BaseServerService {
 
   async sendFile(payload = {}) {
     const params = this._coerceParams(payload, FileSendParams);
+    const pending = this.#sendTail.then(() => this.#sendFile(params));
+    // The returned promise still reports failure. This tail only allows the
+    // next transfer to proceed without inheriting the previous rejection.
+    this.#sendTail = pending.then(() => undefined, () => undefined);
+    return pending;
+  }
+
+  async #sendFile(params) {
     const fileBytes = base64ToBytes(params.fileDataB64);
     const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
 
-    const thread = await this.bus.stores.threadStore.getThread(params.threadId).catch(() => null);
+    const thread = await this.bus.stores.threadStore.getThread(params.threadId);
     if (!thread) {
       throw new Error("ServerFileTransferService: thread not found for " + params.threadId);
     }
 
-    const threadType = typeof thread.threadType === "string" ? thread.threadType : "";
-    const threadGroupId = typeof thread.groupId === "string" ? thread.groupId.trim() : "";
-    const peerAccountId = typeof thread.peerAccountId === "string" ? thread.peerAccountId.trim() : "";
-    const deliverInboxId = typeof thread.peerInboxId === "string" ? thread.peerInboxId.trim() : "";
-
-    let sdkPeerAccountId = peerAccountId;
-    let groupTargets = null;
-    let groupDeliverInboxId = "";
-    if (threadType === "group" && threadGroupId) {
-      const groupStore = this.bus.stores ? this.bus.stores.groupStore : null;
-      if (!groupStore || typeof groupStore.listMembers !== "function") {
-        throw new Error("ServerFileTransferService: groupStore unavailable for group thread " + params.threadId);
-      }
-      const members = await groupStore.listMembers({
-        ownerAccountId: this.ownerAccountId,
-        groupId: threadGroupId,
-      });
-      groupTargets = [];
-      for (const member of members) {
-        if (!member || member.state !== "active") continue;
-        if (member.accountId === this.ownerAccountId) continue;
-        groupTargets.push(member.accountId);
-      }
-      // The SDK validates peerAccountId is non-empty but otherwise just
-      // hands it back to onSendDeposit. In group mode that callback fans
-      // out via groupTargets and ignores this value; use ownerAccountId
-      // as an inert sentinel.
-      sdkPeerAccountId = this.ownerAccountId;
-    } else if (!peerAccountId) {
-      throw new Error("ServerFileTransferService: no peer account for thread " + params.threadId);
-    }
-
-    this.#sendContext = {
-      deliverInboxId: groupTargets ? groupDeliverInboxId : deliverInboxId,
-      groupTargets,
-      channelId,
-    };
+    this.#sendContext = channelId;
     let result;
     try {
       result = await this.#fileTransferService.sendFile({
         fileBytes,
         fileName: params.fileName,
         mimeType: params.mimeType,
-        peerAccountId: sdkPeerAccountId,
+        peerAccountId: this.ownerAccountId,
         contextId: params.threadId,
         text: params.text || "",
       });
@@ -313,7 +224,7 @@ export class ServerFileTransferService extends BaseServerService {
       },
     }));
 
-    // sendFile above has already pushed all chunks through the SDK by the
+    // sendFile above has handed all chunks to the SDK's delivery path by the
     // time we get here. Mirror ServerMessagesService.sendMessage: persist
     // the "sent" transition to the DB and notify the renderer via a
     // dedicated message.status event. Without this the bubble is stuck on

@@ -12,11 +12,8 @@
 // module exposes startRezChatCore and NOTHING else — providers in,
 // runtime+adapter out, no mobile-specific domain methods ever.
 //
-// P1.3a extends the SAME walk to the second mobile entry point,
-// `enrollDelegatedDevice` — same bans, plus: the enrollment module may not
-// reach the desktop/browser runner trees (src/client/, src/ui/) — its
-// wsFactory/crypto/keystore come from the host, never from a hosted-runtime
-// runner.
+// Device enrollment has one runtime-neutral owner. Browser and native hosts
+// inject their providers into the same DeviceLinkRunner.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -24,7 +21,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const ENTRY = path.resolve("src/mobile/startRezChatCore.js");
-const ENROLL_ENTRY = path.resolve("src/mobile/enrollDelegatedDevice.js");
+const ENROLL_ENTRY = path.resolve("src/client/runtime/DeviceLinkRunner.js");
 const ACTIVATE_ENTRY = path.resolve("src/mobile/activateDelegatedDevice.js");
 const PREPARE_BOOT_ENTRY = path.resolve("src/mobile/prepareDelegatedCoreBoot.js");
 const SRC = path.resolve("src");
@@ -111,8 +108,8 @@ test("P1.1 boundary: startRezChatCore's transitive graph reaches no node builtin
   assert.deepEqual(violations, [], violations.join("\n"));
 });
 
-test("P1.3a boundary: enrollDelegatedDevice's transitive graph obeys the same bans and never reaches the desktop/browser runners", () => {
-  const violations = collectViolations(ENROLL_ENTRY, { banHostedRunnerTrees: true });
+test("device-link runner's transitive graph obeys the runtime-neutral boundary", () => {
+  const violations = collectViolations(ENROLL_ENTRY);
   assert.deepEqual(violations, [], violations.join("\n"));
 });
 
@@ -163,10 +160,15 @@ test("P1.1 guardrail: the mobile entry module exports startRezChatCore and nothi
     "the entry point accepts providers/configuration; domain operations live behind the runtime directives and the adapter");
 });
 
-test("P1.3a guardrail: the enrollment module exports enrollDelegatedDevice and nothing else — one verb whose name is the ceremony", async () => {
-  const mod = await import("../src/mobile/enrollDelegatedDevice.js");
-  assert.deepEqual(Object.keys(mod).sort(), ["enrollDelegatedDevice"],
-    "providers in, sealed-envelope identity facts out; no domain methods beyond the ceremony");
+test("device-link guardrail exposes only the shared runner and its dependency binder", async () => {
+  const mod = await import("../src/client/runtime/DeviceLinkRunner.js");
+  assert.deepEqual(Object.keys(mod).sort(), ["createDeviceLinkRunner", "runDeviceLinkRequester"]);
+});
+
+test("desktop device linking binds platform primitives to the shared requester", async () => {
+  const source = fs.readFileSync(new URL("../src/desktop/runtime/DesktopDeviceLinkRunner.js", import.meta.url), "utf8");
+  assert.match(source, /client\/runtime\/DeviceLinkRunner\.js/);
+  assert.doesNotMatch(source, /createRezClient|runSdkRequester|sdk\.connect|sdk\.durableRecords/);
 });
 
 test("P1.3b guardrail: the activation module exports activateDelegatedDevice and nothing else — one verb whose name is the transaction", async () => {
