@@ -67,6 +67,12 @@ export class ChatServerApp {
     // publication path resolves the bundle's inboxId through this establisher
     // (the portable per-device inbox), never the session's claimed inbox.
     portableInboxEstablisher = null,
+    // True when the claimant DATA plane is a SHARED provider (the mobile
+    // portable provider) rather than this device's own node. Configuration,
+    // never discovery: on a shared provider no frame may carry the account
+    // identity (F9; P1.3d frame purity), so account-keyed reads such as the
+    // own authority-state lookup are refused there.
+    sharedDataPlane = false,
     appVersion = "",
     logger = console,
   } = {}) {
@@ -97,6 +103,7 @@ export class ChatServerApp {
     // AccountControlChannel — the data-plane client cannot express account
     // authority by surface. In legacy mode this stays null: the account-
     // authenticated sdk IS the (explicitly labeled) legacy pipe.
+    this.bus.runtime.sharedDataPlane = sharedDataPlane === true;
     this.bus.runtime.accountControl = sessionMode === "claimant"
       ? new AccountControlChannel({
         identity,

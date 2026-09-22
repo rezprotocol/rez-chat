@@ -112,6 +112,9 @@ export async function startRezChatCore({
     wsFactory,
     sessionMode,
     retentionClass,
+    // The mobile data plane is the SHARED portable provider: account-keyed
+    // lookups must never ride it (F9; P1.3d frame purity).
+    sharedDataPlane: true,
     inboxRole: delegated ? "portable" : "legacy",
     clock,
     logger,

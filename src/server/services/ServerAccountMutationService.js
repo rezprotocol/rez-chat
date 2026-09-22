@@ -90,6 +90,12 @@ export class ServerAccountMutationService extends BaseServerService {
    * claimant session + local verification against the account PUBLIC key. No
    * account authority is expressed anywhere on this path.
    *
+   * Except on a SHARED data plane (runtime.sharedDataPlane — the mobile
+   * portable provider): the fetch is keyed by the account identity public key,
+   * so issuing it there links the claimant to its account (F9; P1.3d frame
+   * purity; audit 2026-09-22). The state is then unavailable and callers defer,
+   * exactly as for a failed fetch. A device's own node (desktop) is unaffected.
+   *
    * Established-vs-unavailable follows the AE-2 philosophy exactly:
    *   - record fetched + verified          → { established: true, revocationState, epoch }
    *   - NO record published (never any
@@ -107,6 +113,10 @@ export class ServerAccountMutationService extends BaseServerService {
     }
     if (!durableRecords) {
       return { established: false, reason: "sdk.durableRecords unavailable" };
+    }
+    if (this.bus.runtime && this.bus.runtime.sharedDataPlane === true) {
+      // Configuration, not a failure: never logged per call.
+      return { established: false, reason: "own authority is never read on a shared data plane" };
     }
     const existing = this.#ownAuthorityCache;
     if (!forceRefresh && existing && (this.#clock() - existing.fetchedAtMs) < AUTHORITY_STATE_CACHE_TTL_MS) {

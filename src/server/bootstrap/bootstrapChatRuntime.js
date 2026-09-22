@@ -103,6 +103,8 @@ export async function bootstrapChatRuntime({
   deviceLinkServiceFactory = null,
   sessionMode = "account-legacy",
   retentionClass = "transient",
+  // See ChatServerApp: true when the claimant data plane is a shared provider.
+  sharedDataPlane = false,
   // P1.3b: which inbox-resolution phase this runtime boots in. "legacy" is
   // the shipped behavior (desktop/browser: the delegated ceremony inbox IS
   // the runtime primary; primaries fresh-mint). "enrollment" is the bounded
@@ -240,6 +242,7 @@ export async function bootstrapChatRuntime({
     sessionMode,
     retentionClass,
     portableInboxEstablisher,
+    sharedDataPlane,
     clock,
     logger,
   });

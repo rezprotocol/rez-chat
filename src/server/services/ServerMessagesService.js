@@ -82,6 +82,10 @@ export class ServerMessagesService extends BaseServerService {
   // embeddings) that emits legacy unsigned payloads.
   #originalSignerPromise = null;
   #epochCache = null;
+  // Last epoch read successfully; stamped when the own authority state is
+  // unavailable (receivers validate only integer >= 0). null = never read.
+  #lastKnownAuthorityEpoch = null;
+  #authorityEpochFallbackReason = "";
   // DURABLE per-(messageId, peerDeviceId) sealed-ciphertext cache (injected
   // DeviceFanoutCacheStore) for gated per-device fan-out. Re-encrypting a device
   // on a send retry advances that device's ratchet AGAIN — duplicating to
@@ -237,13 +241,30 @@ export class ServerMessagesService extends BaseServerService {
     let epoch = 0;
     const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
     if (this.bus.runtime && this.bus.runtime.sessionMode === "claimant") {
+      // ServerAccountMutationService refuses the account-keyed read on a shared
+      // data plane (mobile portable provider). Unavailable → the last epoch
+      // read, else 0.
       const authority = this.bus.services && this.bus.services.accountMutation;
+      let reason = "";
       try {
         const state = authority && typeof authority.getOwnAuthorityState === "function" ? await authority.getOwnAuthorityState() : null;
-        if (state && state.established && Number.isInteger(state.epoch)) epoch = state.epoch;
-        else this.logger.warn("[ServerMessagesService] claimant authority epoch unavailable; stamping 0");
+        if (state && state.established && Number.isInteger(state.epoch)) {
+          epoch = state.epoch;
+          this.#lastKnownAuthorityEpoch = epoch;
+          this.#authorityEpochFallbackReason = "";
+        } else {
+          reason = state && typeof state.reason === "string" && state.reason ? state.reason : "own authority state unavailable";
+        }
       } catch (err) {
-        this.logger.warn("[ServerMessagesService] claimant authority epoch unavailable; stamping 0", err && err.message ? err.message : err);
+        reason = err && err.message ? err.message : String(err);
+      }
+      if (reason) {
+        epoch = this.#lastKnownAuthorityEpoch === null ? 0 : this.#lastKnownAuthorityEpoch;
+        if (reason !== this.#authorityEpochFallbackReason) {
+          this.#authorityEpochFallbackReason = reason;
+          this.logger.warn("[ServerMessagesService] claimant authority epoch unavailable (" + reason
+            + "); stamping " + (this.#lastKnownAuthorityEpoch === null ? "0" : "last known epoch " + epoch));
+        }
       }
     } else if (sdk && sdk.devices && typeof sdk.devices.getAuthorityState === "function") {
       try {

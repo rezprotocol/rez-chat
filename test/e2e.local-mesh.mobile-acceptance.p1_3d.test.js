@@ -350,6 +350,9 @@ test("P1.3d: the full split-transport handoff under kills — ceremony death, BO
       () => enrollDelegatedDevice({
         linkCode: abandoned.linkCode,
         password: "phone-unlock-secret",
+        // linkDevice now requires a device name up front; without one this
+        // negative case would fail validation before reaching the ceremony.
+        profileName: "Phone",
         cryptoProvider: CRYPTO,
         wsFactory: (url) => new WebSocket(url),
         uplinks: [home1WsUrl],

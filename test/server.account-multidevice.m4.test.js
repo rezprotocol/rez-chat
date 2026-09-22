@@ -340,3 +340,26 @@ test("M4 roster store: replaceFromAggregate maps wire rows (inboxId from the sig
     /deviceId \+ inboxId/,
   );
 });
+
+// Audit 2026-09-22 (F9; P1.3d frame purity): on a SHARED data plane — the
+// mobile portable provider — the own authority lookup is keyed by the account
+// identity public key, so issuing it would link the claimant to its account.
+// It must be refused there without opening an account session, and sibling
+// work must defer exactly as for an unestablishable state.
+test("M4 on a SHARED data plane: the own authority read is never issued, no account session opens, sibling sync defers", async () => {
+  const h = makeHarness({ rosterDevices: TWO_DEVICE_ROSTER, rosterEpoch: 0 });
+  await h.seed();
+  h.bus.runtime.sharedDataPlane = true;
+  h.authorityRecordRef.record = { epoch: 3, revokedCertIds: [] };
+  let dataPlaneReads = 0;
+  const sdk = h.bus.runtime.sdk;
+  const realGet = sdk.durableRecords.get;
+  sdk.durableRecords.get = async (coords) => { dataPlaneReads += 1; return realGet(coords); };
+  const state = await h.mutation.getOwnAuthorityState({ forceRefresh: true });
+  assert.equal(state.established, false);
+  assert.match(state.reason, /shared data plane/);
+  const targets = await h.sync.siblingTargets();
+  assert.equal(targets.deferred, true, "sibling sync defers rather than acting on unverified authority");
+  assert.equal(dataPlaneReads, 0, "no account-keyed lookup ever reaches the shared provider");
+  assert.equal(h.control.executeCount, 0, "and no account session is opened in its place");
+});
