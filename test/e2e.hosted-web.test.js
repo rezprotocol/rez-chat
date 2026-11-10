@@ -69,7 +69,27 @@ async function observePage(page, label) {
   });
 }
 
-test("hosted web app: PWA + two-browser invite + offline durable catch-up", { timeout: 180_000 }, async (t) => {
+async function makeLargeImage(page) {
+  // Use the browser's PNG encoder so this checks real rendering as well as
+  // byte recovery. Noise keeps a 700x700 image above one transport frame.
+  const b64 = await page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 700;
+    canvas.height = 700;
+    const context = canvas.getContext("2d");
+    const image = context.createImageData(700, 700);
+    for (let offset = 0; offset < image.data.length; offset += 65536) {
+      crypto.getRandomValues(image.data.subarray(offset, offset + 65536));
+    }
+    for (let offset = 3; offset < image.data.length; offset += 4) image.data[offset] = 255;
+    context.putImageData(image, 0, 0);
+    return canvas.toDataURL("image/png").split(",")[1];
+  });
+  assert.ok(Buffer.from(b64, "base64").length > 1_000_000);
+  return b64;
+}
+
+test("hosted web app: PWA + invite + offline text/image catch-up + reply", { timeout: 180_000 }, async (t) => {
   const browser = await chromium.launch({ executablePath: chromePath, headless: true });
   t.after(() => browser.close());
   const aliceContext = await browser.newContext();
@@ -86,6 +106,8 @@ test("hosted web app: PWA + two-browser invite + offline durable catch-up", { ti
   const alicePassword = "hosted-alice-" + suffix;
   const bobPassword = "hosted-bob-" + suffix;
   const offlineText = "HOSTED WEB OFFLINE " + suffix;
+  const replyText = "HOSTED WEB REPLY " + suffix;
+  const imageText = "HOSTED WEB IMAGE " + suffix;
 
   await Promise.all([
     createAccount(alice, "Hosted Alice " + suffix, alicePassword),
@@ -119,11 +141,36 @@ test("hosted web app: PWA + two-browser invite + offline durable catch-up", { ti
   await alice.getByTestId("message.text").filter({ hasText: offlineText })
     .waitFor({ state: "visible", timeout: 30_000 });
 
+  const imageB64 = await makeLargeImage(alice);
+  const fileName = "hosted-acceptance.png";
+  const chooserPromise = alice.waitForEvent("filechooser");
+  await alice.getByRole("button", { name: "Attach file", exact: true }).click();
+  await (await chooserPromise).setFiles({ name: fileName, mimeType: "image/png", buffer: Buffer.from(imageB64, "base64") });
+  await alice.getByText(fileName, { exact: true }).waitFor({ state: "visible" });
+  await alice.getByTestId("composer.input").fill(imageText);
+  await alice.getByTestId("composer.send").click();
+  await alice.getByTestId("message.text").filter({ hasText: imageText })
+    .waitFor({ state: "visible", timeout: 60_000 });
+
   bob = await bobContext.newPage();
   await observePage(bob, "bob-reopened");
   await unlockAccount(bob, bobPassword);
   await bob.getByTestId("thread.row").waitFor({ state: "visible", timeout: 45_000 });
   await bob.getByTestId("thread.row").click();
   await bob.getByTestId("message.text").filter({ hasText: offlineText })
+    .waitFor({ state: "visible", timeout: 60_000 });
+  const receivedImage = bob.getByRole("img", { name: fileName, exact: true });
+  await receivedImage.waitFor({ state: "visible", timeout: 60_000 });
+  assert.equal(await receivedImage.getAttribute("src"), "data:image/png;base64," + imageB64,
+    "offline image bytes must survive mailbox paging exactly");
+  await bob.waitForFunction((name) => {
+    const images = [...document.querySelectorAll("img")];
+    const image = images.find((element) => element.alt === name);
+    return image && image.complete && image.naturalWidth === 700 && image.naturalHeight === 700;
+  }, fileName, { timeout: 30_000 });
+
+  await bob.getByTestId("composer.input").fill(replyText);
+  await bob.getByTestId("composer.send").click();
+  await alice.getByTestId("message.text").filter({ hasText: replyText })
     .waitFor({ state: "visible", timeout: 60_000 });
 });

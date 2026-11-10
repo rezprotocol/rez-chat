@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { DesktopSupervisor } from "../electron/runtime/DesktopSupervisor.mjs";
 import { ChatBridge } from "../src/server/transport/ChatBridge.js";
+import { ServerSessionService } from "../src/server/services/ServerSessionService.js";
 
 class FakeVault {
   constructor() {
@@ -183,6 +184,38 @@ test("supervisor #runtimeSummary surfaces localInboxId from session service", as
   assert.equal(summary.ownerAccountId, "acct-supervisor");
   await supervisor.stop();
 });
+
+for (const authMode of ["claimant", "account"]) {
+  test("supervisor connects through the real session service without account capabilities: " + authMode, async (t) => {
+    const vault = new FakeVault();
+    const chatApp = createFakeChatApp();
+    const bus = chatApp.chatServer.bus;
+    const deviceId = authMode === "account" ? "rez:dev:session-device" : "";
+    bus.runtime = {
+      sdk: {
+        get identity() { throw new Error("account identity capability must not be read for session metadata"); },
+        getSessionInfo() { return { capabilities: { localInboxId: "inbox-supervisor" } }; },
+        getIdentity() { return { deviceId }; },
+      },
+    };
+    const session = new ServerSessionService({
+      bus,
+      storageProvider: { getKeyValueStore() { throw new Error("session metadata must not read storage"); } },
+      ownerAccountId: chatApp.chatServer.ownerAccountId,
+    });
+    bus.services.session = session;
+    const supervisor = new DesktopSupervisor({ vault, chatApp, logger: { warn() {} } });
+    t.after(() => supervisor.stop());
+    await supervisor.start();
+    await supervisor.unlock({});
+    const summary = await supervisor.connect();
+    assert.equal(summary.connected, true);
+    assert.equal(summary.accountId, "acct-supervisor");
+    assert.equal(summary.ownerAccountId, "acct-chat-server");
+    assert.equal(summary.localInboxId, "inbox-supervisor");
+    assert.equal(session.getSessionInfo().deviceId, deviceId || "server");
+  });
+}
 
 test("supervisor #runtimeSummary reports chat-server accountId as ownerAccountId, not the vault accountId", async () => {
   // The chat-server bootstraps its own identity (ensureChatServerIdentity)
