@@ -213,6 +213,20 @@ export class ChatServerApp {
     for (const service of this.#services) {
       if (service === this.bus.services.runtime) continue;
       if (service && typeof service.start === "function") {
+        if (service === this.bus.services.inboxCatchup) {
+          // Authentication/claim/bind and all consumers are ready. Expose
+          // cached views now; keep inbox.caughtup as the honest sync signal.
+          // Static wiring errors still throw before startup is announced.
+          service.startBackground().catch((err) => {
+            if (!this.#started) {
+              this.bus.logger.warn("[ChatServerApp] initial inbox sync ended during shutdown");
+              return;
+            }
+            this.bus.logger.error("[ChatServerApp] initial inbox sync failed", err && err.message ? err.message : err);
+            this.bus.emit("app.error", { source: "ChatServerApp", message: "Inbox sync failed; cached chat remains available and sync will retry", severity: "error", err });
+          });
+          continue;
+        }
         await service.start();
       }
     }

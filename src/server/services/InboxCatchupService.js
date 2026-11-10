@@ -65,6 +65,7 @@ const DECRYPT_BACKOFF_AFTER_ATTEMPTS = 3;
  * still guards the one non-idempotent step (re-decrypt) against double delivery.
  */
 export class InboxCatchupService extends BaseServerService {
+  #generation = 0;
   #inboxClaimant;
   #pageLimit;
   #maxDecryptAttempts;
@@ -116,10 +117,23 @@ export class InboxCatchupService extends BaseServerService {
   }
 
   async start() {
+    this.#activate();
+    await this.#initialDrain();
+  }
+
+  // The app may expose its local UI while this runs. Activation validates
+  // wiring synchronously; inbox.caughtup remains the separate sync gate.
+  startBackground() {
+    this.#activate();
+    return this.#initialDrain();
+  }
+
+  #activate() {
     const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
     if (!sdk || !sdk.connectivity || typeof sdk.connectivity.onReconnected !== "function") {
       throw new Error("InboxCatchupService requires sdk.connectivity.onReconnected");
     }
+    this.#validateMailbox(sdk);
     this.#offReconnect = sdk.connectivity.onReconnected(() => {
       this.requestDrain().catch((err) => {
         this.logger.error("[InboxCatchupService] reconnect drain failed: " + (err && err.message ? err.message : err));
@@ -139,6 +153,9 @@ export class InboxCatchupService extends BaseServerService {
       }, this.#periodicDrainMs);
       if (this.#periodicTimer && typeof this.#periodicTimer.unref === "function") this.#periodicTimer.unref();
     }
+  }
+
+  async #initialDrain() {
     // M1 (offline-tolerant boot): a retryable failure here means the runtime
     // has no usable session yet (the pool reported NOT_READY/UNREACHABLE
     // during an offline boot). The drain is not lost — the reconnect hook
@@ -155,7 +172,19 @@ export class InboxCatchupService extends BaseServerService {
     }
   }
 
+  #validateMailbox(sdk) {
+    if (!sdk || !sdk.mailbox) throw new Error("InboxCatchupService requires sdk.mailbox");
+    if (nodeAdvertisesDurableInbox(sdk)) {
+      if (typeof sdk.mailbox.list !== "function" || typeof sdk.mailbox.cursorAck !== "function") {
+        throw new Error("InboxCatchupService (durable) requires sdk.mailbox.list/cursorAck");
+      }
+    } else if (typeof sdk.mailbox.list !== "function" || typeof sdk.mailbox.fetch !== "function" || typeof sdk.mailbox.ack !== "function") {
+      throw new Error("InboxCatchupService requires sdk.mailbox.list/fetch/ack");
+    }
+  }
+
   async stop() {
+    this.#generation += 1;
     if (this.#periodicTimer) {
       clearInterval(this.#periodicTimer);
       this.#periodicTimer = null;
@@ -178,6 +207,7 @@ export class InboxCatchupService extends BaseServerService {
    * fan-out-listing in parallel.
    */
   async requestDrain() {
+    const generation = this.#generation;
     if (this.#draining) {
       this.#pending = true;
       return;
@@ -196,14 +226,14 @@ export class InboxCatchupService extends BaseServerService {
     // for a bounded retry. Emitted under the bare bridge spec key so the transport
     // forwards it to the UI as `runtime.event.inbox.caughtup`; the UI gates "show
     // real state" on it so login never asserts the stale pre-catch-up snapshot.
-    this._emit("inbox.caughtup", { mailboxId: this.#inboxClaimant.inboxId });
+    if (generation === this.#generation) {
+      this._emit("inbox.caughtup", { mailboxId: this.#inboxClaimant.inboxId });
+    }
   }
 
   async #drainOnce() {
     const sdk = this.bus.runtime && this.bus.runtime.sdk ? this.bus.runtime.sdk : null;
-    if (!sdk || !sdk.mailbox) {
-      throw new Error("InboxCatchupService requires sdk.mailbox");
-    }
+    this.#validateMailbox(sdk);
     const mailboxId = this.#inboxClaimant.inboxId;
     if (typeof mailboxId !== "string" || mailboxId.length === 0) {
       throw new Error("InboxCatchupService: inboxClaimant.inboxId is not set");
@@ -226,10 +256,6 @@ export class InboxCatchupService extends BaseServerService {
     if (nodeAdvertisesDurableInbox(sdk)) {
       await this.#drainDurable(sdk, mailboxId);
       return;
-    }
-
-    if (typeof sdk.mailbox.list !== "function" || typeof sdk.mailbox.fetch !== "function" || typeof sdk.mailbox.ack !== "function") {
-      throw new Error("InboxCatchupService requires sdk.mailbox.list/fetch/ack");
     }
 
     // In-memory page cursor for THIS pass only — never persisted. It walks the
@@ -310,9 +336,6 @@ export class InboxCatchupService extends BaseServerService {
   // poison seq is quarantined by cursor-skipping past it — never silently (it emits
   // a user-visible "couldn't be delivered" notice first).
   async #drainDurable(sdk, mailboxId) {
-    if (typeof sdk.mailbox.list !== "function" || typeof sdk.mailbox.cursorAck !== "function") {
-      throw new Error("InboxCatchupService (durable) requires sdk.mailbox.list/cursorAck");
-    }
     // (The apply-outbox retry runs once per drain in #drainOnce, before this
     // mode branch — so both the durable and legacy paths get it.)
     while (true) {

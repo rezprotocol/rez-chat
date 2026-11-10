@@ -89,7 +89,54 @@ async function makeLargeImage(page) {
   return b64;
 }
 
-test("hosted web app: PWA + invite + offline text/image catch-up + reply", { timeout: 180_000 }, async (t) => {
+async function pauseAfterFirstChunk(page) {
+  // Observe commit completion without reading any account keys or file bytes.
+  await page.addInitScript(() => {
+    globalThis.__hostedChunkCommits = 0;
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function(value, key) {
+      const request = put.call(this, value, key);
+      if (String(key).includes("/xfer-chunk:")) {
+        this.transaction.addEventListener("complete", () => { globalThis.__hostedChunkCommits += 1; });
+      }
+      return request;
+    };
+  });
+  let firstPage = null;
+  let acknowledged = false;
+  let heldPages = 0;
+  await page.routeWebSocket("**", (socket) => {
+    const server = socket.connectToServer();
+    server.onMessage((message) => {
+      let frame;
+      try { frame = JSON.parse(String(message)); } catch { socket.send(message); return; }
+      const body = frame.body;
+      if (frame.t === "mailbox.list.res" && body && Array.isArray(body.items)) {
+        if (firstPage && body.mailboxId === firstPage.mailboxId) {
+          heldPages += 1;
+          return;
+        }
+        const chunks = body.items.filter((item) => typeof item.ciphertextB64 === "string" && item.ciphertextB64.length > 100_000);
+        if (chunks.length) firstPage = { mailboxId: body.mailboxId, throughSeq: Math.max(...chunks.map((item) => item.seq)) };
+      }
+      if (frame.t === "mailbox.cursorAck.res" && firstPage && body
+        && body.mailboxId === firstPage.mailboxId && body.lastSeq >= firstPage.throughSeq) acknowledged = true;
+      socket.send(message);
+    });
+  });
+  return {
+    async waitForDurablePage() {
+      await page.waitForFunction(() => globalThis.__hostedChunkCommits > 0, null, { timeout: 20_000 });
+      const deadline = Date.now() + 10_000;
+      while ((!acknowledged || heldPages === 0) && Date.now() < deadline) await page.waitForTimeout(50);
+      assert.ok(acknowledged, "server must acknowledge the consumed first chunk page before interruption");
+      assert.ok(heldPages > 0, "later mailbox pages must remain blocked during the responsiveness check");
+      return firstPage;
+    },
+  };
+}
+
+test("hosted web app: responsive catch-up + interrupted image recovery + reply", { timeout: 180_000 }, async (t) => {
   const browser = await chromium.launch({ executablePath: chromePath, headless: true });
   t.after(() => browser.close());
   const aliceContext = await browser.newContext();
@@ -108,6 +155,7 @@ test("hosted web app: PWA + invite + offline text/image catch-up + reply", { tim
   const offlineText = "HOSTED WEB OFFLINE " + suffix;
   const replyText = "HOSTED WEB REPLY " + suffix;
   const imageText = "HOSTED WEB IMAGE " + suffix;
+  const duringSyncText = "HOSTED WEB DURING SYNC " + suffix;
 
   await Promise.all([
     createAccount(alice, "Hosted Alice " + suffix, alicePassword),
@@ -154,6 +202,35 @@ test("hosted web app: PWA + invite + offline text/image catch-up + reply", { tim
 
   bob = await bobContext.newPage();
   await observePage(bob, "bob-reopened");
+  const paused = await pauseAfterFirstChunk(bob);
+  const unlockStarted = Date.now();
+  await unlockAccount(bob, bobPassword);
+  console.log("[recovery-proof] unlock to usable chat ms=" + (Date.now() - unlockStarted));
+  await bob.getByTestId("thread.row").waitFor({ state: "visible", timeout: 45_000 });
+  await bob.getByTestId("thread.row").click();
+  const consumedPage = await paused.waitForDurablePage();
+  assert.equal(await bob.getByRole("img", { name: fileName, exact: true }).count(), 0,
+    "the image must still be incomplete when chat becomes usable");
+  await bob.getByTestId("composer.input").fill(duringSyncText);
+  await bob.getByTestId("composer.send").click();
+  await alice.getByTestId("message.text").filter({ hasText: duringSyncText })
+    .waitFor({ state: "visible", timeout: 10_000 });
+  console.log("[recovery-proof] message sent while later image pages remain blocked");
+  await bob.close();
+
+  // Keep the same context/IndexedDB, but discard every in-memory transfer.
+  // The consumed first page must NOT be redelivered to make recovery work.
+  bob = await bobContext.newPage();
+  await observePage(bob, "bob-interrupted");
+  let replayedConsumedChunk = false;
+  bob.on("websocket", (socket) => socket.on("framereceived", (event) => {
+    let frame;
+    try { frame = JSON.parse(String(event.payload)); } catch { return; }
+    if (frame.t === "mailbox.list.res" && frame.body && frame.body.mailboxId === consumedPage.mailboxId) {
+      replayedConsumedChunk = replayedConsumedChunk || frame.body.items.some((item) => item.seq <= consumedPage.throughSeq
+        && typeof item.ciphertextB64 === "string" && item.ciphertextB64.length > 100_000);
+    }
+  }));
   await unlockAccount(bob, bobPassword);
   await bob.getByTestId("thread.row").waitFor({ state: "visible", timeout: 45_000 });
   await bob.getByTestId("thread.row").click();
@@ -168,6 +245,8 @@ test("hosted web app: PWA + invite + offline text/image catch-up + reply", { tim
     const image = images.find((element) => element.alt === name);
     return image && image.complete && image.naturalWidth === 700 && image.naturalHeight === 700;
   }, fileName, { timeout: 30_000 });
+  assert.equal(replayedConsumedChunk, false, "reassembly must use committed local chunks, not replay of the consumed page");
+  console.log("[recovery-proof] exact image bytes and decoded dimensions recovered after interruption");
 
   await bob.getByTestId("composer.input").fill(replyText);
   await bob.getByTestId("composer.send").click();

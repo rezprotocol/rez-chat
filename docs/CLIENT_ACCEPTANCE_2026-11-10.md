@@ -189,3 +189,46 @@ SSOT, duplicate logic, boundary, god-class or dead-code finding in this test
 and its direct UI/service dependencies. Existing iPhone/Swift/Chat work retains
 its original binary diff hash recorded above. New tester invitations remain
 held for the open latency, media-status and desktop-release issues.
+
+## Background startup and interrupted-image acceptance
+
+The subsequent network lookup and ACK fixes are deployed. See Node
+`NETWORK_LOOKUP_LATENCY_2026-11-10.md` and SDK
+`HANDSHAKE_ACK_RECOVERY_2026-11-10.md` for the source, timings and honest
+passing/failed soak record. The old client's already-lost partial image bytes
+cannot be recreated by ACK replay; affected images may need a sender resend.
+
+The new web-background candidate separates local startup from initial catch-up
+and durably persists image chunks/context before application acknowledgement.
+The permanent hosted-web regression deliberately holds later mailbox pages
+after at least one chunk commits locally and its consumed cursor is confirmed
+by the server. While the image is still incomplete, the UI becomes usable and
+sends a message to the other account. Closing/reopening the page with the same
+saved site data then recovers the exact PNG and 700×700 decoded dimensions;
+the consumed first page is not redelivered. A reverse reply also succeeds.
+
+This complete workflow passed in **Chrome (41.9 s)** and **Firefox (40.1 s)**,
+zero failures/skips. Unlock-to-usable measured **1.832 s in Chrome / 1.856 s
+in Firefox** with later image pages blocked. These are synthetic acceptance
+observations, not a guaranteed startup time. Tests retain browser storage.
+
+Clean-source full suites: Core **582 pass**, SDK **549 pass**, Chat **1,118
+pass / zero fail / three gated native/live integrations not run**, isolated
+SDK portability **2 pass**, extra background/order cases **5 pass**. The
+production web build/integrity injection passes. Full changed-file/spec/
+ownership/SSOT audit, removed paths and remaining risks are recorded in SDK
+`docs/CLIENT_SYNC_RECOVERY_2026-11-10.md`.
+
+Files changed in this slice: `ChatServerApp.js`, `InboxCatchupService.js`,
+`ServerFileTransferService.js`, `ConnectionService.js`; file-transfer,
+background-startup, sync-order and hosted-web tests; section 13 of
+`CHAT_APP_SPEC.md`; and this receipt. Unrelated tracked Chat changes still
+hash to the original `495890ca3878a4cb52434a963d5ff75b54d158e1b8ae344477a360e401e283b9`.
+iPhone/Swift work remains untouched.
+
+This does not implement true on-demand media fetching, worker-based
+reassembly, sender image delivery receipts or a new desktop package. Keep
+the published native release on hold. The earlier “Firefox not checked” row
+describes the initial acceptance only; Firefox web recovery is now checked
+as described here. New invitations remain held for the open client/release
+limitations, rather than treating “online” as proof of complete history.

@@ -20,7 +20,7 @@ export class ConnectionService extends BaseBusService {
     this._register("mesh", "getStatus", () => this.getStatus());
     this._listen("runtime.connecting", (record) => {
       const next = record && typeof record === "object" ? record : { status: "connecting" };
-      this._connectionStore.setConnection(next);
+      this._connectionStore.setConnection({ ...next, inboxSynced: false });
     });
     this._listen("runtime.mesh.updated", (record) => {
       const mesh = record && record.mesh && typeof record.mesh === "object" ? record.mesh : null;
@@ -38,9 +38,9 @@ export class ConnectionService extends BaseBusService {
       });
     });
     this._listen("runtime.connected", () => {
-      // A fresh connection means catch-up will run again — mark unsynced until
-      // the server signals it has drained + applied the missed backlog.
-      this._connectionStore.setConnection({ status: "connected", inboxSynced: false });
+      // Catch-up can finish before connect() returns. Its completion must
+      // survive this notification; connecting/disconnected reset the gate.
+      this._connectionStore.setConnection({ status: "connected" });
     });
     this._listen("runtime.disconnected", () => {
       this._connectionStore.setConnection({ status: "disconnected", inboxSynced: false });
@@ -48,11 +48,13 @@ export class ConnectionService extends BaseBusService {
     this._listen("runtime.event.connection.state", (record) => {
       const status = record && record.status ? String(record.status).trim() : "";
       if (!status) return;
-      this._connectionStore.setConnection({
+      const patch = {
         status,
         activeNode: record && record.activeUplink ? String(record.activeUplink) : "",
         lastError: record && record.reason ? String(record.reason) : null,
-      });
+      };
+      if (status !== "connected") patch.inboxSynced = false;
+      this._connectionStore.setConnection(patch);
     });
     // Inbox catch-up finished draining + applying every missed deposit. Now the
     // displayed state (rosters, messages) is authoritative — let views stop

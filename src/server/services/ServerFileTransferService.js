@@ -37,13 +37,6 @@ export class ServerFileTransferService extends BaseServerService {
   #fileTransferService;
   #sendContext;
   #sendTail = Promise.resolve();
-  // transferId -> channelId, populated when an inbound manifest arrives.
-  // Consumed (and cleared) in #handleFileReceived so the inbound
-  // ChatImagePayloadV1 is stamped with the correct channel. The chat
-  // layer carries channelId via a JSON augmentation on the manifest
-  // (the rez-core FileManifestV1 record itself stays chat-agnostic), so
-  // we capture it at the chat boundary before construction loses it.
-  #transferChannels;
 
   constructor({ bus, storageProvider, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
@@ -55,7 +48,6 @@ export class ServerFileTransferService extends BaseServerService {
     this.#kvStore = storageProvider.getKeyValueStore("app:filetransfer");
     this.#fileTransferService = null;
     this.#sendContext = null;
-    this.#transferChannels = new Map();
     this._register("file", "send", (payload) => this.sendFile(payload));
     this._register("file", "get", (payload) => this.getFile(payload));
   }
@@ -124,9 +116,10 @@ export class ServerFileTransferService extends BaseServerService {
         await messages.dispatchThreadBytes(contextId, bodyBytes, "file:" + Hash.sha256Hex(bodyBytes));
       },
       onFileReceived: ({ transferId, manifest, fileBytes, senderAccountId, contextId }) => {
-        this.#handleFileReceived({ transferId, manifest, fileBytes, senderAccountId, threadId: contextId }).catch((err) => {
+        return this.#handleFileReceived({ transferId, manifest, fileBytes, senderAccountId, threadId: contextId }).catch((err) => {
           this.logger.error("[ServerFileTransferService] onFileReceived failed", err && err.message ? err.message : err);
           this._emit("app.error", { source: "ServerFileTransferService", message: "onFileReceived failed", severity: "error", err });
+          throw err;
         });
       },
       onProgress: null,
@@ -274,13 +267,26 @@ export class ServerFileTransferService extends BaseServerService {
 
   async handleIncomingPayload(payload, { senderAccountId, threadId, channelId } = {}) {
     if (!this.#fileTransferService) return false;
-    // Manifests carry the chat-layer channelId augmentation. Stash it
-    // keyed by transferId so #handleFileReceived can stamp the
-    // resulting ChatImagePayloadV1 with the right channel — the
-    // FileManifestV1 record itself is chat-agnostic and drops the field.
+    // Chat owns channel identity. Persist it before acknowledging the
+    // manifest's application, and require it before applying any chunk.
+    // SDK owns the independently authenticated sender/thread binding.
     if (payload instanceof FileManifestV1 && typeof payload.transferId === "string" && payload.transferId) {
       const ch = typeof channelId === "string" ? channelId : "";
-      this.#transferChannels.set(payload.transferId, ch);
+      const key = "chat-channel:" + payload.transferId;
+      const prior = await this.#kvStore.get(key);
+      if (prior !== undefined && prior !== null && prior !== ch) throw new Error("File transfer channel mismatch");
+      const consumed = await this.#fileTransferService.handleIncomingPayload(payload, { senderAccountId, contextId: threadId });
+      if (consumed && (prior === undefined || prior === null)) await this.#kvStore.set(key, ch);
+      return consumed;
+    }
+    const transferId = payload && typeof payload.transferId === "string" ? payload.transferId : "";
+    if (transferId) {
+      const savedChannel = await this.#kvStore.get("chat-channel:" + transferId);
+      if (savedChannel === undefined || savedChannel === null) {
+        const err = new Error("Attachment metadata is not ready; leave this chunk queued for retry");
+        err.code = "FILE_TRANSFER_MANIFEST_PENDING";
+        throw err;
+      }
     }
     return this.#fileTransferService.handleIncomingPayload(payload, { senderAccountId, contextId: threadId });
   }
@@ -291,7 +297,7 @@ export class ServerFileTransferService extends BaseServerService {
 
     if (!resolvedThreadId) {
       this.logger.error("[ServerFileTransferService] no thread context for completed transfer " + transferId);
-      return;
+      throw new Error("Completed file requires durable thread context");
     }
 
     const now = this.#clock();
@@ -305,8 +311,9 @@ export class ServerFileTransferService extends BaseServerService {
       transferId,
     });
     const captionText = typeof manifest.text === "string" ? manifest.text : "";
-    const channelId = this.#transferChannels.get(transferId) || "";
-    this.#transferChannels.delete(transferId);
+    const savedChannel = await this.#kvStore.get("chat-channel:" + transferId);
+    if (typeof savedChannel !== "string") throw new Error("File transfer channel context is not durable");
+    const channelId = savedChannel;
     const imagePayload = new ChatImagePayloadV1({
       fileName: manifest.fileName,
       mimeType: manifest.mimeType,
@@ -332,22 +339,25 @@ export class ServerFileTransferService extends BaseServerService {
     } catch (err) {
       this.logger.error("[ServerFileTransferService] inbound image persist failed", err && err.message ? err.message : err);
       this._emit("app.error", { source: "ServerFileTransferService", message: "inbound image persist failed", severity: "error", err });
-      return;
+      throw err;
     }
 
-    // A duplicate completion has already converged in the message store. Do
-    // not re-emit it or perturb the thread index as if it were new work.
-    if (!persistResult || persistResult.inserted === false) return;
+    if (!persistResult) throw new Error("File message projection did not return a durable result");
+    // A retry may find the message row committed but its index/event still
+    // unapplied. Finish under the original message timestamp.
+    const storedMessage = persistResult.message;
+    const acceptedAtMs = storedMessage && Number.isFinite(storedMessage.acceptedAtMs) ? storedMessage.acceptedAtMs : now;
 
     const previewText = captionText || defaultAttachmentPreview(manifest.mimeType, manifest.fileName);
     const indexRecord = await this.bus.stores.threadIndex.upsertFromMessage({
       threadId: resolvedThreadId,
       messageId: messageId,
-      ts: now,
+      ts: acceptedAtMs,
       preview: previewText,
     }).catch((err) => {
       this.logger.error("[ServerFileTransferService] inbound index upsert failed", err && err.message ? err.message : err);
       this._emit("app.error", { source: "ServerFileTransferService", message: "inbound index upsert failed", severity: "warn", err });
+      throw err;
     });
     if (indexRecord && this.bus.services && this.bus.services.threads) {
       this.bus.services.threads.emitThreadIndexUpdated(indexRecord);
@@ -362,8 +372,8 @@ export class ServerFileTransferService extends BaseServerService {
         text: captionText,
         payload: imagePayload,
         status: "delivered",
-        createdAtMs: now,
-        acceptedAtMs: now,
+        createdAtMs: acceptedAtMs,
+        acceptedAtMs,
         packetB64: JSON.stringify(imagePayload.toJSON()),
       },
     }));
@@ -376,8 +386,8 @@ export class ServerFileTransferService extends BaseServerService {
         text: captionText,
         payload: imagePayload,
         status: "delivered",
-        createdAtMs: now,
-        acceptedAtMs: now,
+        createdAtMs: acceptedAtMs,
+        acceptedAtMs,
         packetB64: JSON.stringify(imagePayload.toJSON()),
       },
     }));

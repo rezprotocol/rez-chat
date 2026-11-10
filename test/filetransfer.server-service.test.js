@@ -7,6 +7,7 @@ import { FileManifestV1, FileChunkV1 } from "@rezprotocol/sdk/filetransfer";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 import { ServerMessagesService } from "../src/server/services/ServerMessagesService.js";
 import { DeviceFanoutCacheStore } from "../src/server/storage/DeviceFanoutCacheStore.js";
+import { Hash } from "@rezprotocol/sdk/hash";
 
 class TestKVStore {
   constructor() { this._data = new Map(); }
@@ -33,6 +34,45 @@ class TestStorageProvider {
 }
 
 const OWNER = "rez:acct:test-owner";
+
+test("attachment projection retries its index after restart without changing channel or message time", async () => {
+  const storage = new TestStorageProvider();
+  let row = null; let indexAttempts = 0; const indexTimes = [];
+  const makeReceiver = async (clock) => {
+    const bus = createBus();
+    bus.stores.threadStore.upsertDepositedMessage = async (args) => {
+      const inserted = row === null;
+      if (inserted) row = args;
+      return { inserted, message: row };
+    };
+    bus.stores.threadIndex.upsertFromMessage = async (args) => {
+      indexTimes.push(args.ts);
+      if (++indexAttempts === 1) throw new Error("index unavailable");
+      return { threadId: args.threadId, updatedAtMs: args.ts };
+    };
+    const service = new ServerFileTransferService({ bus, storageProvider: storage, ownerAccountId: OWNER, clock });
+    await service.start();
+    return { service, bus };
+  };
+  const hashHex = Hash.sha256Hex(new Uint8Array([1, 2, 3]));
+  const manifest = new FileManifestV1({ transferId: "projection-retry", fileName: "retry.bin", mimeType: "application/octet-stream", fileSizeBytes: 3, chunkSizeBytes: 1024, chunkCount: 1, fileHashHex: hashHex, chunkHashesHex: [hashHex], text: "retry" });
+  const chunk = new FileChunkV1({ transferId: manifest.transferId, chunkIndex: 0, dataB64: "AQID", hashHex });
+  const context = { senderAccountId: "rez:acct:peer", threadId: "th_retry", channelId: "channel_one" };
+  const first = await makeReceiver(() => 1000);
+  await first.service.handleIncomingPayload(manifest, context);
+  await assert.rejects(first.service.handleIncomingPayload(chunk, context), /index unavailable/);
+  assert.equal(first.bus._events.filter((event) => event.eventName === "runtime.event.message.deposited").length, 0);
+  const restarted = await makeReceiver(() => 9000);
+  await restarted.service.handleIncomingPayload(chunk, context);
+  assert.deepEqual(indexTimes, [1000, 1000]);
+  assert.equal(row.payload.channelId, "channel_one");
+  const deposited = restarted.bus._events.filter((event) => event.eventName === "runtime.event.message.deposited");
+  assert.equal(deposited.length, 1);
+  assert.equal(deposited[0].payload.message.acceptedAtMs, 1000);
+  await restarted.service.handleIncomingPayload(manifest, context);
+  await restarted.service.handleIncomingPayload(chunk, context);
+  assert.equal(indexAttempts, 2, "completed replay does not repeat the projection");
+});
 
 function createBus() {
   const handlers = new Map();
@@ -316,9 +356,7 @@ test("ServerFileTransferService receive path persists ChatImagePayloadV1 and emi
   }
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(upsertCalls.length, 2, "replay should reach the idempotent message upsert");
-  assert.equal(upsertCalls[1].messageId, upsertCalls[0].messageId,
-    "same sender/thread/transfer lineage must derive the same message id");
+  assert.equal(upsertCalls.length, 1, "durably completed transfer replay must not repeat its message projection");
   assert.equal(
     receiverBus._events.filter((e) => e.eventName === "runtime.event.message.deposited").length,
     1,

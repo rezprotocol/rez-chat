@@ -190,6 +190,29 @@ Underlying rez-node WS message families consumed for paid services: `settlement.
 - If unlock fails, state returns to `LOCKED` and any partial connection attempt is torn down.
 - If auth state transitions to `LOCKING`/`LOCKED`, active polling and transport activity are stopped immediately.
 
+Local availability and inbox catch-up are separate readiness states. Startup
+still awaits the runtime's authenticated claim/device-bind path (including
+its existing explicitly retryable offline result), then activates all inbound
+consumers before launching initial catch-up in the background. `server.ready`
+permits cached views and local interaction; it does not certify complete
+history or roster state. `inbox.caughtup` remains the catch-up notification.
+New connections/disconnections invalidate that UI sync state; a later
+`runtime.connected` notification must not erase an already completed drain.
+Static wiring and terminal authentication failures remain startup failures;
+asynchronous catch-up failures are visible and retry through the existing
+periodic/reconnect drain. A stopped drain cannot announce readiness.
+
+Incoming attachment application is recoverable across process/page restarts.
+The SDK durably stores authenticated sender/thread binding and verified chunk
+records before recording byte receipts. Chat durably stores channel context
+before acknowledging the manifest. Completion awaits the idempotent chat
+message/index projection before marking the transfer applied and removing
+temporary chunks. Browser mutation promises resolve at transaction commit,
+not individual request success. Legacy transfers that already lost volatile
+chunks require a resend; startup must never require deleting saved site data.
+This is background catch-up with resumable eager transfers, not on-demand
+network media fetching or image delivery receipts.
+
 ## 14. Navigation Actions
 
 Required navigation actions in v0:
