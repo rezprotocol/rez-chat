@@ -115,7 +115,7 @@ function makePeerLinkService({ accountId, inboxId, getInviteAuthority, clock = (
 // Drive a full bidirectional establishment between two freshly-provisioned
 // services. Returns the captured per-step results so tests can assert each
 // path's snapshot/event independently.
-async function establishPair({ inviter, inviterId, invitee, inviteeId, inviterInbox, inviteeInbox }) {
+async function establishPair({ inviter, inviterId, invitee, inviteeId, inviterInbox, inviteeInbox, confirmAck = true }) {
   const created = await inviter.createInvite({ ownerAccountId: inviterId, maxUses: 1, expiresAtMs: Date.now() + 60_000 });
   const envelope = await inviter.getStoredInviteEnvelope(inviterId, created.inviteId);
 
@@ -141,13 +141,70 @@ async function establishPair({ inviter, inviterId, invitee, inviteeId, inviterIn
     ownerInboxId: inviterInbox,
     ackNonce: received.ackNonce,
   });
-  const acked = await invitee.handleIncomingHandshakeAck({
+  const acked = confirmAck ? await invitee.handleIncomingHandshakeAck({
     ownerAccountId: inviteeId,
     ackPacketBytes: ackBytes,
-  });
+  }) : null;
 
-  return { accept, received, acked };
+  return { accept, received, acked, ackBytes };
 }
+
+test("authenticated handshake acknowledgement replay survives restart without changing the established session", async () => {
+  const alice = createSessionIdentity();
+  const bob = createSessionIdentity();
+  const getInviteAuthority = makeAuthorityProvider([alice.accountId, bob.accountId]);
+  const inviter = makePeerLinkService({ accountId: alice.accountId, inboxId: "inbox:alice", getInviteAuthority });
+  const invitee = makePeerLinkService({ accountId: bob.accountId, inboxId: "inbox:bob", getInviteAuthority });
+  await provisionPeerLinkBinding({ peerLinks: inviter, identity: alice });
+  await provisionPeerLinkBinding({ peerLinks: invitee, identity: bob });
+  const { ackBytes } = await establishPair({
+    inviter, inviterId: alice.accountId, invitee, inviteeId: bob.accountId,
+    inviterInbox: "inbox:alice", inviteeInbox: "inbox:bob",
+    confirmAck: false,
+  });
+  const pendingLink = await invitee.peerLinkStorage.peerLinks.getByPair(bob.accountId, alice.accountId);
+  const nonceKey = "peer-link:ack-nonce:" + bob.accountId + ":" + pendingLink.peerLinkId;
+  const expectedNonce = await invitee.kv.get(nonceKey);
+  assert.ok(expectedNonce);
+  await invitee.kv.delete(nonceKey);
+  assert.equal(await invitee.handleIncomingHandshakeAck({ ownerAccountId: bob.accountId, ackPacketBytes: ackBytes }), null, "an unconfirmed link requires its stored nonce");
+  assert.deepEqual(await invitee.peerLinkStorage.peerLinks.getByPair(bob.accountId, alice.accountId), pendingLink);
+  await invitee.kv.set(nonceKey, expectedNonce);
+  const sessions = invitee.peerLinkStorage.sessions;
+  const readSession = sessions.getByPeerLinkId;
+  sessions.getByPeerLinkId = async () => { throw new Error("injected session read failure"); };
+  try {
+    await assert.rejects(invitee.handleIncomingHandshakeAck({ ownerAccountId: bob.accountId, ackPacketBytes: ackBytes }), /injected session read failure/);
+    assert.equal(await invitee.kv.get(nonceKey), expectedNonce, "failed confirmation retains the nonce so retry remains authenticated");
+  } finally {
+    sessions.getByPeerLinkId = readSession;
+  }
+  assert.ok(await invitee.handleIncomingHandshakeAck({ ownerAccountId: bob.accountId, ackPacketBytes: ackBytes }));
+  const link = await invitee.peerLinkStorage.peerLinks.getByPair(bob.accountId, alice.accountId);
+  const before = JSON.stringify(await invitee.peerLinkStorage.sessions.getByPeerLinkId(bob.accountId, link.peerLinkId));
+  const restarted = new PeerLinkService({
+    storageProvider: invitee.storageProvider,
+    ownerAccountId: bob.accountId,
+    getInviteAuthority,
+    inviteBinding: { mailboxId: "inbox:bob", capabilityId: "inbox:bob" },
+    cryptoProvider: new NodeCryptoProvider(),
+  });
+  const replay = await restarted.handleIncomingHandshakeAck({ ownerAccountId: bob.accountId, ackPacketBytes: ackBytes });
+  assert.ok(replay, "a previously applied signed ack must remain consumable during catch-up");
+  assert.equal(replay.event, null, "replay creates no lifecycle event");
+  assert.equal(JSON.stringify(await restarted.peerLinkStorage.sessions.getByPeerLinkId(bob.accountId, link.peerLinkId)), before, "replay must not reset or advance the ratchet");
+  assert.deepEqual(await restarted.peerLinkStorage.peerLinks.getByPair(bob.accountId, alice.accountId), link);
+
+  const forged = JSON.parse(new TextDecoder().decode(ackBytes));
+  forged.ack.senderDisplayName = "forged replay";
+  assert.equal(await restarted.handleIncomingHandshakeAck({
+    ownerAccountId: bob.accountId,
+    ackPacketBytes: new TextEncoder().encode(JSON.stringify(forged)),
+  }), null, "an established link must still verify the ack signature");
+  await restarted.kv.set(nonceKey, "different-pending-nonce");
+  assert.equal(await restarted.handleIncomingHandshakeAck({ ownerAccountId: bob.accountId, ackPacketBytes: ackBytes }), null, "an outstanding nonce still binds an ack to its attempt");
+  assert.equal(await restarted.kv.get(nonceKey), "different-pending-nonce");
+});
 
 test("every establishment path converges on session_established via #commitSession", async () => {
   const alice = createSessionIdentity();
