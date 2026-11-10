@@ -226,6 +226,14 @@ background-startup, sync-order and hosted-web tests; section 13 of
 hash to the original `495890ca3878a4cb52434a963d5ff75b54d158e1b8ae344477a360e401e283b9`.
 iPhone/Swift work remains untouched.
 
+The tested background web build is publicly live as of **23:51:23 UTC**,
+entry script `assets/index-BYcczCDv.js`, entry SHA-256
+`d8a175580df0635cdbf8f04903dbfdc1a72de4cd00d8972f2b9f16d661394c89`.
+Post-promotion public Firefox login/invite/text/offline-reopen/reply passes
+in **12.3 s**; existing-contact unlock **1.759 s**, first-message receive
+**342 ms**. Server readiness is healthy and the public entry matches the
+verified artifact. Normal refresh is sufficient; retain all saved site data.
+
 This does not implement true on-demand media fetching, worker-based
 reassembly, sender image delivery receipts or a new desktop package. Keep
 the published native release on hold. The earlier “Firefox not checked” row
