@@ -51,7 +51,7 @@ export class BrowserUpdateBannerView {
     }, [
       h("div", { className: "flex-1 min-w-0" }, [
         h("p", { className: "font-medium text-on-surface" }, "New version available"),
-        h("p", { className: "text-body-sm text-on-surface-variant" }, "Refresh to use the latest Rez Chat."),
+        h("p", { className: "text-body-sm text-on-surface-variant" }, "Refresh to get the latest version of Rez Chat."),
       ]),
       refresh,
       later,
