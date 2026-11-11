@@ -1,9 +1,9 @@
 # One message lifecycle for images — 2026-11-10
 
 Latest: the November 11 browser update notice is committed, pushed on
-`feat/hosted-cluster`, and deployed, following the file-drop and first-member
-group-delivery update. See the final release records below; earlier local-status
-notes are historical.
+`feat/hosted-cluster`, deployed, and verified with a live browser tab left open
+across a subsequent deployment. See the final release records below; earlier
+local-status notes are historical.
 
 Status: committed, pushed and publicly deployed **November 10, 2026 at
 6:20 p.m. America/Chicago** (2026-11-11 00:20:09 UTC). Implementation, focused
@@ -452,3 +452,56 @@ live-mesh certification. The three existing gated tests remain unrun.
 Evidence: `/tmp/rez-browser-update-20261111-mcqyRh/`, including `full.log`,
 `focused.log`, `build-final.log`, `public-verification.json`, `release.json`,
 source-preservation hashes and `update-notice.jpg`.
+
+## Live open-tab deployment acceptance — November 11
+
+Status: **PASS**, tested against `https://chat.rezprotocol.io/` with an actual
+deployment and the original browser tab left open throughout. No test hook,
+manual focus event, simulated release, pre-notice refresh or service-worker
+replacement was used to trigger detection.
+
+- At **22:10:29Z**, the tab was visible, running `/assets/index-CaYN3rs-.js`,
+  with no update notice.
+- At **22:10:37Z**, release `web-update-live-test-20261111T221006Z` was promoted.
+- At **22:10:44Z**, the same tab automatically displayed “New version available”
+  and the original wording, while still running `/assets/index-CaYN3rs-.js`.
+- Clicking that notice's Refresh button loaded `/assets/index-DL7e7qZ2.js` by
+  **22:10:51Z**. The notice disappeared, the saved account selection screen
+  returned, and no browser warning or error was reported.
+
+The deployment used a wording-only change in
+`src/ui/views/BrowserUpdateBannerView.js`: “Refresh to get the latest version of
+Rez Chat.” Source commit `594ddcaa74f01ad1b18efe41e383830ae61335e2` was committed
+and pushed on `feat/hosted-cluster`; `master` was untouched. This report is the
+only other repository file changed for this acceptance run.
+
+Verification: all **13/13** focused PWA checks passed, production build and
+integrity injection passed, and all nine feature source files in the clean
+candidate matched the source commit. The previous full-suite result above was
+reused; it was not rerun for a one-line wording change. No tests were added or
+modified for this acceptance run. Public HTML, entry script and worker bytes
+matched the candidate; readiness passed before/after promotion, with storage
+and Redis healthy and no degradation. Eighty-two unrelated modified/deleted
+files were hash-checked and preserved. Backend services and account data were
+not changed.
+
+Focused audit against the section 13 browser-notice contract and direct
+monitor/view dependencies found no spec drift, duplicate/split-brain logic,
+boundary/SSOT violation, new mixed responsibility or god-class finding. Chat
+still owns the feature, the service owns monitoring, and the view owns notice
+DOM/refresh. No dead code was removed. No dependency, configuration, protocol,
+storage or ownership change was introduced. Native releases and the previously
+gated tests were not re-certified. The earlier one-time-refresh limitation for
+clients predating the detector remains.
+
+Release directory:
+`/opt/rez/releases/web-update-live-test-20261111T221006Z/`.
+Entry SHA-256:
+`446edbf125fc9c45645a3010bcd85e589aa3a0c2093c456591c6a9fc33265dfc`.
+Worker remained unchanged at
+`9e9e06af207c46b2614f6fd27ace848f1bac99e1e92e7879c4b7f140c24d1867`.
+The release preserves the previous entry/worker and existing hashed assets
+for rollback. Evidence: `/tmp/rez-browser-update-live-20261111/`, including
+`before-deployment.jpg`, `notice-after-deployment.jpg`, `after-refresh.jpg`,
+`public-and-browser-verification.json`, `release.json`, `focused.log` and
+`build.log`.
