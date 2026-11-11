@@ -1,8 +1,9 @@
 # One message lifecycle for images — 2026-11-10
 
-Latest: the November 11 file-drop and first-member group-delivery update is
-committed, pushed on `feat/hosted-cluster`, and deployed. See the final release
-record below; earlier local-status notes are historical.
+Latest: the November 11 browser update notice is committed, pushed on
+`feat/hosted-cluster`, and deployed, following the file-drop and first-member
+group-delivery update. See the final release records below; earlier local-status
+notes are historical.
 
 Status: committed, pushed and publicly deployed **November 10, 2026 at
 6:20 p.m. America/Chicago** (2026-11-11 00:20:09 UTC). Implementation, focused
@@ -351,3 +352,103 @@ No account data, mailbox state, node service, preview service or desktop/mobile
 package was reset or redeployed. Existing tabs need a normal refresh; saved
 legacy duplicate rows are retained, and Delivered means at least one member,
 not every member or a read receipt.
+
+## November 11 browser update notification — deployed
+
+Implementation commit: `db1c752bec32860d0553bc9c323e4666b337101e`, pushed on
+`feat/hosted-cluster`. Public promotion completed **November 11, 2026 at
+4:02:17 p.m. America/Chicago** (`2026-11-11T22:02:17Z`). No merge into or push
+to `master` occurred.
+
+Browser clients compare their loaded immutable entry URL with the currently
+published root page at startup, every minute while visible, and on focus,
+reconnection or return to visibility. A changed entry displays an accessible
+“New version available” notice with Refresh and Later. Refresh is always
+explicit; unsent text or a staged attachment requires confirmation. Later
+suppresses that release for the current app lifetime, and another release can
+notify again. Offline, invalid and failed responses do not imply an update.
+Probes have a timeout, coalesce, and stop with the app lifecycle. Their unique
+query bypasses older workers' cached root pages; the updated worker also bypasses
+its cache for explicit no-store/update probes. Native and development clients
+retain their existing behavior.
+
+Files changed:
+
+- `src/ui/services/BrowserUpdateService.js`: browser entry comparison, network
+  checks, retry and visibility/lifecycle ownership; passes only scalar URLs.
+- `src/ui/views/BrowserUpdateBannerView.js`: notice DOM, Later and explicit
+  refresh with actual composer draft/attachment protection.
+- `src/ui/root/ChatApp.js`: browser-only service/view lifecycle wiring.
+- `src/ui/views/ComposerView.js`: marks the existing staged attachment preview
+  for draft detection.
+- `public/sw.js`: bypasses cache interception for update/no-store probes.
+- `test/pwa.assets.test.js`: monitor, cache, lifecycle, banner and draft checks.
+- `scripts/qa-browser-update.mjs` and
+  `test/support/browserUpdateUiFixture.js`: local controlled release simulation
+  using the real monitor, banner and composer.
+- `docs/CHAT_APP_SPEC.md`: browser notice behavior in section 13.
+- This report: deployment receipt, verification and focused audit.
+
+Verification status: **PASS**. The clean-source normal suite passed **1,128
+tests**, with zero failures and three pre-existing gated tests unrun; **2/2 SDK
+portability tests** passed. After adding two more draft/attachment cancellation
+checks, the complete focused PWA file passed **13/13**. Earlier focused native
+update and architecture checks also passed. Production build, integrity
+injection and whitespace checks passed. Existing bundle-size warnings remain.
+The working checkout's deleted branding/font assets still prevent its direct
+build; the release used clean HEAD snapshots plus precisely the nine selected
+feature files, byte-compared with the commit. Core/SDK/Node were frozen to the
+previous verified clean candidate. Existing dependencies were reused without
+installs, new dependencies or tooling configuration changes. Unrelated storage,
+identity, test and deleted-asset work was excluded and preserved.
+
+Browser validation used the real UI in a controlled host: publication displayed
+the notice; Later retained an unsent draft and suppressed the same release after
+reconnection; a subsequent release displayed a new notice without losing the
+draft. Refresh loaded that new entry and retained the saved-state marker. Draft
+and attachment confirmation cancellation were verified by unit tests, not by
+an observed browser cancellation. The live public root loaded
+`/assets/index-CaYN3rs-.js`, reached the account unlock screen, and produced no
+console warnings/errors or false update notice.
+
+Release: `/opt/rez/releases/web-update-notice-20261111T215853Z/`. Nineteen
+artifact files were verified before staging. Public entry SHA-256:
+`15ab75bfb174b2a688414f0e8a0d94987627fd50cc927e10505aeee01da8ce5e`.
+Worker SHA-256:
+`9e9e06af207c46b2614f6fd27ace848f1bac99e1e92e7879c4b7f140c24d1867`.
+Public HTML, worker and entry JavaScript matched the tested artifact bytes.
+Three public readiness samples from 22:02:56Z through 22:03:16Z reported
+`ok=true`, `degraded=false`, with storage and Redis healthy. Promotion checked
+the previous page/worker for drift, preserved both rollback copies, and replaced
+both atomically by file rename with rollback on failed verification. Old hashed
+assets remain available. The temporary candidate HTML was removed after checking
+its bytes. No backend service, account, mailbox, stored message or native package
+was reset or redeployed.
+
+Focused audit: checked the updated Chat spec section 13 and direct dependencies
+(root lifecycle, composer draft DOM, existing native update banner and service
+worker caching). Also checked the documented browser behavior for
+[request cache modes](https://developer.mozilla.org/en-US/docs/Web/API/Request/cache),
+[worker fetch interception](https://developer.mozilla.org/en-US/docs/Web/API/ServiceWorkerGlobalScope/fetch_event)
+and [visibility changes](https://developer.mozilla.org/en-US/docs/Web/API/Document/visibilitychange_event).
+Canonical owners are Chat for app release monitoring/presentation, the service
+for network checks, the view for DOM/refresh actions, ComposerView for draft DOM,
+ChatApp for lifecycle and the worker for cache interception. Core/SDK/Node and
+reusable UI framework ownership remain unchanged. No new wire payload/record,
+cross-layer import or transport directive was introduced. No remaining spec
+drift, duplicate/split-brain logic, boundary/SSOT violation, hidden transform,
+new mixed responsibility or god-class finding was found in touched code and
+direct dependencies. Native update ownership remains separate and unchanged.
+No dead code was removed in this additive feature. Existing large root/composer
+classes were not comprehensively refactored or audited.
+
+Remaining limits: people already running older code need **one normal refresh**
+to load the detector. An old client cannot show a notice implemented only in
+new code. Later intentionally defers that release until a later app session or
+another release. Checks resume when connectivity/visibility returns; no forced
+refresh occurs. This is a browser release, not new native packaging or full
+live-mesh certification. The three existing gated tests remain unrun.
+
+Evidence: `/tmp/rez-browser-update-20261111-mcqyRh/`, including `full.log`,
+`focused.log`, `build-final.log`, `public-verification.json`, `release.json`,
+source-preservation hashes and `update-notice.jpg`.
