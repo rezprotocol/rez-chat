@@ -1,6 +1,6 @@
 services:
   web-previews:
-    image: ${REZ_NETWORK_IMAGE:-ghcr.io/rezprotocol/node:0.6.0-rc.12}
+    image: ${REZ_NETWORK_IMAGE:-ghcr.io/rezprotocol/node:0.6.0-rc.13}
     container_name: rez-web-previews
     restart: unless-stopped
     entrypoint: ["node", "/app/rez-chat/scripts/serve-web-previews.mjs"]
