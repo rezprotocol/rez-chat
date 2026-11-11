@@ -1,7 +1,19 @@
 # One message lifecycle for images — 2026-11-10
 
-Status: implementation, focused recovery/security checks, full clean suite
-and live Chrome/Firefox candidate checks pass. Public promotion pending.
+Status: committed, pushed and publicly deployed **November 10, 2026 at
+6:20 p.m. America/Chicago** (2026-11-11 00:20:09 UTC). Implementation, focused
+recovery/security checks, full clean suite and live Chrome/Firefox checks pass.
+
+Implementation commit: `48c362e` on `feat/hosted-cluster`. Release:
+`/opt/rez/releases/web-images-20261110/`; entry script
+`assets/index-Cck_MLEC.js`; entry SHA-256
+`138e0d149d410170d3c11e022b61c33eec38c91dc59c21421fe5f4ce6c9145cb`.
+Staged implementation/test files were byte-compared to the clean candidate.
+The server verified artifact hashes, preserved the previous entry/old hashed
+assets for rollback, promoted the entry atomically, fetched the public page
+and compared it to the verified artifact. `/ready` reports storage/Redis
+healthy with no degradation. The temporary public test HTML was removed.
+No Node/relay deployment or storage reset was needed.
 
 ## Problem and resulting ownership
 
@@ -87,6 +99,14 @@ sender refresh preserves Delivered. Recipient unlock-to-usable measured
 not guaranteed timings. No passwords, keys or browser data are cleared.
 Firefox logs one socket-closed drain during the deliberate final navigation;
 the required status/history/refresh assertions still pass.
+
+Complete candidate workflow: Chrome **45.4 s**, Firefox **44.7 s**, one test
+each with zero failures/skips. Post-promotion public Firefox repeats the entire
+Delivered/refresh/interrupted-image proof in **43.9 s**, zero failures/skips;
+recipient unlock-to-usable **1.875 s**. These checks overlap rather than adding
+distinct coverage counts. Core/SDK/Node original working-diff hashes match the
+pre-task snapshots; Chat's unrelated diff and original edits in both mixed
+source/test files are preserved. No iPhone/Swift source was edited or staged.
 
 Evidence:
 `/tmp/rez-image-receipts-20261110/` and the isolated existing clean candidate

@@ -240,3 +240,32 @@ the published native release on hold. The earlier “Firefox not checked” row
 describes the initial acceptance only; Firefox web recovery is now checked
 as described here. New invitations remain held for the open client/release
 limitations, rather than treating “online” as proof of complete history.
+
+## Image message lifecycle correction
+
+The image delivery-status limitation above is resolved for new images in the
+updated web client. Commit `48c362e` removes the transfer-owned message
+projection/status path: `file.send` now belongs to the message service, which
+uploads bytes then calls normal `sendMessage`; images use its IDs, persistence,
+routing, queue handling, inbound apply and encrypted post-commit receipt.
+The transfer service handles bytes only. Older-format transfers enter that
+same apply core through a compatibility adapter. See
+`IMAGE_MESSAGE_PIPELINE_2026-11-10.md` for the changed files, required audit,
+tests and limits.
+
+The build is public as of **November 10, 6:20 p.m. America/Chicago**:
+`assets/index-Cck_MLEC.js`, entry SHA-256
+`138e0d149d410170d3c11e022b61c33eec38c91dc59c21421fe5f4ce6c9145cb`.
+Chrome and Firefox prove a 1.7 MB image remains Sent offline, recovers after
+receiver interruption and sender refresh, changes the original sender bubble
+to Delivered, and retains Delivered after another refresh. The complete proof
+also passes after promotion at the public URL in Firefox (43.9 s).
+Full clean Chat checks: **1,107 pass / zero fail / three opt-in native/live
+integrations not run**, portability **2 pass**, with separate focused recovery
+and security suites passing. Native release gates remain open.
+
+Both participants must refresh normally and retain saved data before testing
+a new image. Historical Sent rows have no completion receipt and are not
+backfilled. Old receiver binaries retain their old behavior until updated;
+no new native/phone build is certified. iPhone/Swift and unrelated WIP remain
+untouched.
