@@ -89,6 +89,11 @@ async function makeLargeImage(page) {
   return b64;
 }
 
+function imageStatus(page, caption, status) {
+  const bubble = page.getByTestId("message.bubble").filter({ has: page.getByTestId("message.text").filter({ hasText: caption }) });
+  return bubble.locator("..").locator("[data-testid='message.status'][data-message-status='" + status + "']");
+}
+
 async function pauseAfterFirstChunk(page) {
   // Observe commit completion without reading any account keys or file bytes.
   await page.addInitScript(() => {
@@ -199,6 +204,13 @@ test("hosted web app: responsive catch-up + interrupted image recovery + reply",
   await alice.getByTestId("composer.send").click();
   await alice.getByTestId("message.text").filter({ hasText: imageText })
     .waitFor({ state: "visible", timeout: 60_000 });
+  await imageStatus(alice, imageText, "sent").waitFor({ state: "visible", timeout: 10_000 });
+  // Discard the sender's in-memory acknowledgement map before delivery.
+  await unlockAccount(alice, alicePassword);
+  await alice.getByTestId("nav.chat").click();
+  await alice.getByTestId("thread.row").click();
+  await imageStatus(alice, imageText, "sent").waitFor({ state: "visible", timeout: 10_000 });
+  console.log("[receipt-proof] offline image remains Sent across sender refresh");
 
   bob = await bobContext.newPage();
   await observePage(bob, "bob-reopened");
@@ -247,9 +259,17 @@ test("hosted web app: responsive catch-up + interrupted image recovery + reply",
   }, fileName, { timeout: 30_000 });
   assert.equal(replayedConsumedChunk, false, "reassembly must use committed local chunks, not replay of the consumed page");
   console.log("[recovery-proof] exact image bytes and decoded dimensions recovered after interruption");
+  await imageStatus(alice, imageText, "delivered").waitFor({ state: "visible", timeout: 30_000 });
+  assert.equal(await bob.getByRole("img", { name: fileName, exact: true }).count(), 1);
+  console.log("[receipt-proof] original sender image changes to Delivered after receiver recovery");
 
   await bob.getByTestId("composer.input").fill(replyText);
   await bob.getByTestId("composer.send").click();
   await alice.getByTestId("message.text").filter({ hasText: replyText })
     .waitFor({ state: "visible", timeout: 60_000 });
+  await unlockAccount(alice, alicePassword);
+  await alice.getByTestId("nav.chat").click();
+  await alice.getByTestId("thread.row").click();
+  await imageStatus(alice, imageText, "delivered").waitFor({ state: "visible", timeout: 10_000 });
+  console.log("[receipt-proof] Delivered survives another sender refresh");
 });

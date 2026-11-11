@@ -1,499 +1,68 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createDefaultStorageProvider } from "@rezprotocol/sdk/client";
+import { FileManifestV1, FileChunkV1 } from "@rezprotocol/sdk/filetransfer";
 import { FileSendParams, FileGetParams } from "../src/records/index.js";
 import { ServerFileTransferService } from "../src/server/services/ServerFileTransferService.js";
-import { ChatImagePayloadV1 } from "../src/records/payloads/ChatImagePayloadV1.js";
-import { FileManifestV1, FileChunkV1 } from "@rezprotocol/sdk/filetransfer";
+import { ChatFileManifestV1, ChatFileChunkV1 } from "../src/records/payloads/ChatFilePayloadsV1.js";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
-import { ServerMessagesService } from "../src/server/services/ServerMessagesService.js";
-import { DeviceFanoutCacheStore } from "../src/server/storage/DeviceFanoutCacheStore.js";
-import { Hash } from "@rezprotocol/sdk/hash";
 
-class TestKVStore {
-  constructor() { this._data = new Map(); }
-  get(key) { return this._data.get(key); }
-  set(key, value) { this._data.set(key, value); }
-  delete(key) { this._data.delete(key); }
-  keys(prefix) {
-    const out = [];
-    for (const k of this._data.keys()) {
-      if (k.startsWith(prefix)) out.push(k);
-    }
-    return out;
-  }
-}
-
-class TestStorageProvider {
-  constructor() { this._stores = new Map(); }
-  getKeyValueStore(name) {
-    if (!this._stores.has(name)) this._stores.set(name, new TestKVStore());
-    return this._stores.get(name);
-  }
-  getObjectStore() { return { deposit: async () => ({}), list: async () => [] }; }
-  getMailboxStore() { return { deposit: async () => ({}), poll: async () => [] }; }
-}
-
-const OWNER = "rez:acct:test-owner";
-
-test("attachment projection retries its index after restart without changing channel or message time", async () => {
-  const storage = new TestStorageProvider();
-  let row = null; let indexAttempts = 0; const indexTimes = [];
-  const makeReceiver = async (clock) => {
-    const bus = createBus();
-    bus.stores.threadStore.upsertDepositedMessage = async (args) => {
-      const inserted = row === null;
-      if (inserted) row = args;
-      return { inserted, message: row };
-    };
-    bus.stores.threadIndex.upsertFromMessage = async (args) => {
-      indexTimes.push(args.ts);
-      if (++indexAttempts === 1) throw new Error("index unavailable");
-      return { threadId: args.threadId, updatedAtMs: args.ts };
-    };
-    const service = new ServerFileTransferService({ bus, storageProvider: storage, ownerAccountId: OWNER, clock });
-    await service.start();
-    return { service, bus };
+function fixture(storageProvider = createDefaultStorageProvider()) {
+  const sent = []; const completed = []; const handlers = [];
+  const bus = { runtime: { sdk: makeSealDispatch() },
+    services: { messages: {
+      dispatchThreadBytes: async (threadId, bytes) => sent.push(JSON.parse(new TextDecoder().decode(bytes))),
+      handleFileBytesReceived: async (manifest, sender, thread) => completed.push([manifest.transferId, sender, thread]),
+    } },
+    registerFunction: (handler) => handlers.push(handler.namespace + "." + handler.name),
+    emit: () => { throw new Error("Byte service must never emit message/status events"); },
   };
-  const hashHex = Hash.sha256Hex(new Uint8Array([1, 2, 3]));
-  const manifest = new FileManifestV1({ transferId: "projection-retry", fileName: "retry.bin", mimeType: "application/octet-stream", fileSizeBytes: 3, chunkSizeBytes: 1024, chunkCount: 1, fileHashHex: hashHex, chunkHashesHex: [hashHex], text: "retry" });
-  const chunk = new FileChunkV1({ transferId: manifest.transferId, chunkIndex: 0, dataB64: "AQID", hashHex });
-  const context = { senderAccountId: "rez:acct:peer", threadId: "th_retry", channelId: "channel_one" };
-  const first = await makeReceiver(() => 1000);
-  await first.service.handleIncomingPayload(manifest, context);
-  await assert.rejects(first.service.handleIncomingPayload(chunk, context), /index unavailable/);
-  assert.equal(first.bus._events.filter((event) => event.eventName === "runtime.event.message.deposited").length, 0);
-  const restarted = await makeReceiver(() => 9000);
-  await restarted.service.handleIncomingPayload(chunk, context);
-  assert.deepEqual(indexTimes, [1000, 1000]);
-  assert.equal(row.payload.channelId, "channel_one");
-  const deposited = restarted.bus._events.filter((event) => event.eventName === "runtime.event.message.deposited");
-  assert.equal(deposited.length, 1);
-  assert.equal(deposited[0].payload.message.acceptedAtMs, 1000);
-  await restarted.service.handleIncomingPayload(manifest, context);
-  await restarted.service.handleIncomingPayload(chunk, context);
-  assert.equal(indexAttempts, 2, "completed replay does not repeat the projection");
-});
-
-function createBus() {
-  const handlers = new Map();
-  const events = [];
-  const bus = {
-    stores: {
-      threadStore: {
-        getThread: async (threadId) => ({
-          threadId,
-          peerAccountId: "rez:acct:peer-1",
-          peerInboxId: "inbox:peer-1",
-          threadType: "direct",
-        }),
-        recordOutboundDeposit: async () => {},
-        upsertDepositedMessage: async (args) => ({ inserted: true, message: args }),
-        setMessageStatus: async () => {},
-      },
-      threadIndex: {
-        upsertFromMessage: async () => ({ threadId: "th_test", updatedAtMs: 1000 }),
-      },
-    },
-    runtime: {
-      sdk: {
-        ...makeSealDispatch(),
-        getIdentity: () => ({ localInboxId: "inbox:test-owner" }),
-      },
-    },
-    services: {
-      messages: {
-        dispatchThreadBytes: async (_threadId, plaintextBodyBytes) => {
-          const sealed = await bus.runtime.sdk.sealForPeer({ peerAccountId: "rez:acct:peer-1", plaintextBodyBytes });
-          return bus.runtime.sdk.mesh.dispatch(sealed.object, sealed.address);
-        },
-      },
-      threads: {
-        emitThreadIndexUpdated: () => {},
-      },
-    },
-    registerFunction: ({ namespace, name, fn }) => {
-      handlers.set(namespace + "." + name, fn);
-    },
-    call: (namespace, name, payload) => {
-      const fn = handlers.get(namespace + "." + name);
-      if (fn) return fn(payload);
-      throw new Error("No handler for " + namespace + "." + name);
-    },
-    on: () => () => {},
-    emit: (eventName, payload) => { events.push({ eventName, payload }); },
-    _events: events,
-    _handlers: handlers,
-  };
-  return bus;
+  const service = new ServerFileTransferService({ bus, storageProvider, ownerAccountId: "alice" });
+  return { service, sent, completed, handlers, bus };
 }
+const params = (threadId = "th_test") => new FileSendParams({ threadId, channelId: "photos", fileName: "test.png", mimeType: "image/png", fileDataB64: "AQIDBA==", text: "caption belongs to the message" });
 
-test("FileSendParams validates required fields", () => {
-  assert.throws(() => new FileSendParams({ threadId: "", fileDataB64: "abc", fileName: "a.png", mimeType: "image/png" }),
-    (err) => { assert.ok(err.message.includes("threadId")); return true; });
-  assert.throws(() => new FileSendParams({ threadId: "th_1", fileDataB64: "", fileName: "a.png", mimeType: "image/png" }),
-    (err) => { assert.ok(err.message.includes("fileDataB64")); return true; });
-  assert.throws(() => new FileSendParams({ threadId: "th_1", fileDataB64: "abc", fileName: "", mimeType: "image/png" }),
-    (err) => { assert.ok(err.message.includes("fileName")); return true; });
-  assert.throws(() => new FileSendParams({ threadId: "th_1", fileDataB64: "abc", fileName: "a.png", mimeType: "" }),
-    (err) => { assert.ok(err.message.includes("mimeType")); return true; });
+test("byte service exposes local get, never owns file.send or a message lifecycle", async () => {
+  const f = fixture(); await f.service.start();
+  assert.deepEqual(f.handlers, ["file.get"]);
+  const result = await f.service.sendFileBytes(params());
+  assert.equal(result.messageId, ""); assert.equal(result.fileSizeBytes, 4);
+  assert.equal(f.sent.length, 2);
+  assert.equal(f.sent[0].messageEnvelope, true);
+  assert.equal(f.sent[0].text || "", "", "caption is carried only by the normal image message");
+  assert.equal((await f.service.getFile(new FileGetParams({ fileHashHex: result.fileHashHex }))).fileDataB64, "AQIDBA==");
 });
 
-test("FileSendParams rejects oversized data", () => {
-  const bigData = "A".repeat(14_000_001);
-  assert.throws(() => new FileSendParams({ threadId: "th_1", fileDataB64: bigData, fileName: "a.png", mimeType: "image/png" }),
-    (err) => { assert.ok(err.message.includes("exceeds")); return true; });
-});
-
-test("FileGetParams validates 64-char hex", () => {
-  assert.throws(() => new FileGetParams({ fileHashHex: "short" }),
-    (err) => { assert.ok(err.message.includes("64-char hex")); return true; });
-  const valid = new FileGetParams({ fileHashHex: "a".repeat(64) });
-  assert.equal(valid.fileHashHex, "a".repeat(64));
-});
-
-test("ServerFileTransferService registers file.send and file.get on bus", () => {
-  const bus = createBus();
-  const storage = new TestStorageProvider();
-  new ServerFileTransferService({ bus, storageProvider: storage, ownerAccountId: OWNER });
-  assert.ok(bus._handlers.has("file.send"));
-  assert.ok(bus._handlers.has("file.get"));
-});
-
-test("ServerFileTransferService.start() throws without sdk", async () => {
-  const bus = createBus();
-  bus.runtime = { sdk: null };
-  const storage = new TestStorageProvider();
-  const svc = new ServerFileTransferService({ bus, storageProvider: storage, ownerAccountId: OWNER });
-  await assert.rejects(() => svc.start(), (err) => {
-    assert.ok(err.message.includes("sdk"));
-    return true;
-  });
-});
-
-test("ServerFileTransferService.sendFile validates params and sends", async () => {
-  const bus = createBus();
-  const storage = new TestStorageProvider();
-  const deposits = [];
-  Object.assign(bus.runtime.sdk, makeSealDispatch({ onSend: (opts) => deposits.push(opts) }));
-  const svc = new ServerFileTransferService({ bus, storageProvider: storage, ownerAccountId: OWNER, clock: () => 1000 });
-  await svc.start();
-
-  // Small 4-byte PNG-like payload
-  const fileDataB64 = "AQIDBA=="; // [1,2,3,4]
-  const result = await svc.sendFile({
-    threadId: "th_test",
-    fileDataB64,
-    fileName: "test.png",
-    mimeType: "image/png",
-  });
-
-  assert.equal(result.threadId, "th_test");
-  assert.ok(result.transferId.length > 0);
-  assert.ok(result.fileHashHex.length > 0);
-  assert.ok(result.messageId.length > 0);
-  assert.ok(deposits.length > 0, "should have sent deposits");
-
-  // Verify event was emitted
-  const depositedEvents = bus._events.filter((e) => e.eventName === "message.deposited");
-  assert.ok(depositedEvents.length > 0, "should emit message.deposited");
-});
-
-test("ServerFileTransferService.getFile returns empty for unknown hash", async () => {
-  const bus = createBus();
-  const storage = new TestStorageProvider();
-  const svc = new ServerFileTransferService({ bus, storageProvider: storage, ownerAccountId: OWNER });
-  await svc.start();
-
-  const result = await svc.getFile({ fileHashHex: "b".repeat(64) });
-  assert.equal(result.fileDataB64, "");
-});
-
-test("attachment chunks use canonical routing and concurrent sends retain their own channel", async () => {
-  const bus = createBus();
-  const routed = [];
-  bus.services.messages.dispatchThreadBytes = async (threadId, bytes, eventTag) => {
-    await new Promise((resolve) => setTimeout(resolve, 2));
-    const payload = JSON.parse(new TextDecoder().decode(bytes));
-    routed.push({ threadId, eventTag, payload });
-  };
-  const service = new ServerFileTransferService({ bus, storageProvider: new TestStorageProvider(), ownerAccountId: OWNER });
-  await service.start();
-  await Promise.all(["first", "second"].map((id) => service.sendFile({ threadId: id, channelId: id, fileDataB64: "AQID", fileName: id + ".txt", mimeType: "text/plain" })));
-  assert.equal(routed.length, 4);
-  assert.equal(new Set(routed.map((entry) => entry.eventTag)).size, 4);
-  for (const entry of routed) {
-    assert.equal(entry.payload.channelId, entry.threadId);
-    assert.equal(entry.payload.threadId, entry.threadId);
-    assert.match(entry.eventTag, /^file:[a-f0-9]{64}$/);
-  }
-});
-
-test("attachment routing failure rejects the send and does not poison the next transfer", async () => {
-  const bus = createBus();
+test("byte context stays isolated across concurrent sends and a failed send can retry", async () => {
+  const f = fixture(); await f.service.start();
   let fail = true;
-  bus.services.messages.dispatchThreadBytes = async () => { if (fail) throw new Error("device roster unavailable"); };
-  const service = new ServerFileTransferService({ bus, storageProvider: new TestStorageProvider(), ownerAccountId: OWNER });
-  await service.start();
-  const params = { threadId: "th_test", fileDataB64: "AQID", fileName: "test.txt", mimeType: "text/plain" };
-  await assert.rejects(service.sendFile(params), /device roster unavailable/);
-  assert(!bus._events.some((event) => event.eventName === "message.status"));
+  const route = f.bus.services.messages.dispatchThreadBytes;
+  f.bus.services.messages.dispatchThreadBytes = async (...args) => { if (fail) throw new Error("route down"); return route(...args); };
+  await assert.rejects(f.service.sendFileBytes(params()), /route down/);
   fail = false;
-  assert((await service.sendFile(params)).fileHashHex);
+  await Promise.all([f.service.sendFileBytes(params("th_first")), f.service.sendFileBytes(params("th_second"))]);
+  assert.deepEqual(f.sent.map((body) => body.threadId), ["th_first", "th_first", "th_second", "th_second"]);
 });
 
-test("ServerFileTransferService.handleIncomingPayload returns false before start", async () => {
-  const bus = createBus();
-  const storage = new TestStorageProvider();
-  const svc = new ServerFileTransferService({ bus, storageProvider: storage, ownerAccountId: OWNER });
-
-  const consumed = await svc.handleIncomingPayload({ kind: "rez.file.manifest.v1" }, {});
-  assert.equal(consumed, false);
+test("committed partial bytes resume across receiver restart without projecting any message", async () => {
+  const sender = fixture(); await sender.service.start();
+  await sender.service.sendFileBytes(params());
+  const storage = createDefaultStorageProvider();
+  const first = fixture(storage); await first.service.start();
+  const context = { senderAccountId: "alice", threadId: "th_receiver" };
+  await first.service.handleIncomingPayload(new ChatFileManifestV1(sender.sent[0]), context);
+  const restarted = fixture(storage); await restarted.service.start();
+  await restarted.service.handleIncomingPayload(new ChatFileChunkV1(sender.sent[1]), context);
+  assert.deepEqual(restarted.completed, [[sender.sent[0].transferId, "alice", "th_receiver"]]);
+  await restarted.service.handleIncomingPayload(new ChatFileChunkV1(sender.sent[1]), context);
+  assert.equal(restarted.completed.length, 1);
+  assert.ok(new ChatFileManifestV1(sender.sent[0]).manifest instanceof FileManifestV1);
+  assert.ok(new ChatFileChunkV1(sender.sent[1]).chunk instanceof FileChunkV1);
 });
 
-test("ServerFileTransferService.handleIncomingPayload delegates to FileTransferService", async () => {
-  const bus = createBus();
-  const storage = new TestStorageProvider();
-  const svc = new ServerFileTransferService({ bus, storageProvider: storage, ownerAccountId: OWNER });
-  await svc.start();
-
-  // Non-file payload should not be consumed
-  const consumed = await svc.handleIncomingPayload({ kind: "text", text: "hello" }, {});
-  assert.equal(consumed, false);
-});
-
-// Regression: receive path used to build a plain-object payload and then call
-// `.toJSON()` on it, which threw before any persist or event emission. Drive
-// the full sender -> receiver round-trip and verify a real ChatImagePayloadV1
-// is what reaches the store and the runtime event.
-test("ServerFileTransferService receive path persists ChatImagePayloadV1 and emits runtime event", async () => {
-  // Sender side
-  const senderBus = createBus();
-  const senderStorage = new TestStorageProvider();
-  const sentDeposits = [];
-  Object.assign(senderBus.runtime.sdk, makeSealDispatch({ onSend: (opts) => sentDeposits.push(opts) }));
-  const sender = new ServerFileTransferService({
-    bus: senderBus, storageProvider: senderStorage, ownerAccountId: OWNER, clock: () => 1000,
-  });
-  await sender.start();
-
-  // Receiver side — capture upserts and emitted events
-  const receiverBus = createBus();
-  const receiverStorage = new TestStorageProvider();
-  const upsertCalls = [];
-  const persistedMessageIds = new Set();
-  receiverBus.stores.threadStore.upsertDepositedMessage = async (args) => {
-    upsertCalls.push(args);
-    const inserted = !persistedMessageIds.has(args.messageId);
-    persistedMessageIds.add(args.messageId);
-    return { inserted, message: args };
-  };
-  const receiver = new ServerFileTransferService({
-    bus: receiverBus, storageProvider: receiverStorage, ownerAccountId: "rez:acct:test-receiver", clock: () => 2000,
-  });
-  await receiver.start();
-
-  // Send a small file from sender, capturing both manifest + chunk deposits
-  await sender.sendFile({
-    threadId: "th_test",
-    fileDataB64: "AQIDBA==",
-    fileName: "pic.png",
-    mimeType: "image/png",
-    text: "look at this",
-  });
-  assert.ok(sentDeposits.length >= 2, "should produce at least manifest + 1 chunk");
-
-  // Route each augmented deposit body into the receiver via handleIncomingPayload.
-  // The chat-layer augmentation in onSendDeposit added threadId + senderAccountId
-  // alongside the core record fields; lift those out at this boundary the way
-  // ServerEventService would.
-  for (const deposit of sentDeposits) {
-    const body = JSON.parse(new TextDecoder().decode(deposit.plaintextBodyBytes));
-    const threadId = typeof body.threadId === "string" ? body.threadId : "";
-    const senderAccountId = typeof body.senderAccountId === "string" ? body.senderAccountId : "";
-    let record = null;
-    if (body.kind === "rez.file.manifest.v1") record = FileManifestV1.fromJSON(body);
-    else if (body.kind === "rez.file.chunk.v1") record = FileChunkV1.fromJSON(body);
-    else throw new Error("unexpected deposit kind: " + body.kind);
-    await receiver.handleIncomingPayload(record, { senderAccountId, threadId });
-  }
-
-  // Receiver should have persisted exactly one image message with a real
-  // ChatImagePayloadV1 record (not a plain object).
-  assert.equal(upsertCalls.length, 1, "expected one upsertDepositedMessage call");
-  const persisted = upsertCalls[0];
-  assert.ok(persisted.payload instanceof ChatImagePayloadV1,
-    "persisted payload must be a ChatImagePayloadV1 instance");
-  assert.equal(persisted.payload.fileName, "pic.png");
-  assert.equal(persisted.payload.mimeType, "image/png");
-  assert.equal(persisted.payload.text, "look at this");
-  // The sender side stamped its own ownerAccountId (OWNER) into the augmented
-  // wire body; the receiver lifts that out as the message's senderAccountId.
-  assert.equal(persisted.senderAccountId, OWNER);
-  assert.equal(persisted.threadId, "th_test");
-
-  // runtime.event.message.deposited must be emitted with the same record.
-  const runtimeEvents = receiverBus._events.filter((e) => e.eventName === "runtime.event.message.deposited");
-  assert.equal(runtimeEvents.length, 1, "expected one runtime.event.message.deposited emission");
-  assert.ok(runtimeEvents[0].payload.message.payload instanceof ChatImagePayloadV1,
-    "emitted message payload must be a ChatImagePayloadV1 instance");
-
-  // No app.error must have been emitted from the receive path.
-  const errors = receiverBus._events.filter((e) => e.eventName === "app.error");
-  assert.equal(errors.length, 0, "no app.error should be emitted on the receive path");
-
-  // Replay the exact authenticated transfer. The transfer layer may complete
-  // it again, but the chat projection must converge on the same message id and
-  // must not emit a second deposited event.
-  for (const deposit of sentDeposits) {
-    const body = JSON.parse(new TextDecoder().decode(deposit.plaintextBodyBytes));
-    const threadId = typeof body.threadId === "string" ? body.threadId : "";
-    const senderAccountId = typeof body.senderAccountId === "string" ? body.senderAccountId : "";
-    let record = null;
-    if (body.kind === "rez.file.manifest.v1") record = FileManifestV1.fromJSON(body);
-    else if (body.kind === "rez.file.chunk.v1") record = FileChunkV1.fromJSON(body);
-    else throw new Error("unexpected deposit kind: " + body.kind);
-    await receiver.handleIncomingPayload(record, { senderAccountId, threadId });
-  }
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(upsertCalls.length, 1, "durably completed transfer replay must not repeat its message projection");
-  assert.equal(
-    receiverBus._events.filter((e) => e.eventName === "runtime.event.message.deposited").length,
-    1,
-    "replay must not emit a duplicate runtime message",
-  );
-});
-
-// Regression: sendFile used to emit message.deposited with status="sent" but
-// never persist the "sent" transition to the DB and never fire a
-// message.status event. The renderer's _handleStatus is what flips bubbles
-// off "SENDING"; without it the sender's own bubble was stuck on "SENDING"
-// forever even though the receiver had the image. Mirror the text-message
-// flow: deposit "pending", then setMessageStatus + message.status "sent".
-test("ServerFileTransferService.sendFile transitions outbound row to sent and emits message.status", async () => {
-  const bus = createBus();
-  const storage = new TestStorageProvider();
-  const statusCalls = [];
-  bus.stores.threadStore.setMessageStatus = async (args) => {
-    statusCalls.push(args);
-  };
-  Object.assign(bus.runtime.sdk, makeSealDispatch());
-  const svc = new ServerFileTransferService({
-    bus, storageProvider: storage, ownerAccountId: OWNER, clock: () => 1000,
-  });
-  await svc.start();
-
-  const result = await svc.sendFile({
-    threadId: "th_test",
-    fileDataB64: "AQIDBA==",
-    fileName: "test.png",
-    mimeType: "image/png",
-  });
-
-  const depositedEvents = bus._events.filter((e) => e.eventName === "message.deposited");
-  assert.equal(depositedEvents.length, 1, "expected exactly one message.deposited");
-  assert.equal(
-    depositedEvents[0].payload.message.status,
-    "pending",
-    "initial deposit must be persisted/announced as pending so DB and event agree",
-  );
-  assert.equal(depositedEvents[0].payload.message.messageId, result.messageId);
-  assert.equal(
-    depositedEvents[0].payload.message.senderAccountId,
-    OWNER,
-    "outbound deposit must credit the owner as sender so the renderer renders it on the mine side",
-  );
-
-  const statusEvents = bus._events.filter((e) => e.eventName === "message.status");
-  assert.equal(statusEvents.length, 1, "expected exactly one message.status emission");
-  assert.equal(statusEvents[0].payload.messageId, result.messageId);
-  assert.equal(statusEvents[0].payload.status, "sent");
-  assert.equal(statusEvents[0].payload.sentAtMs, 1000);
-
-  assert.equal(statusCalls.length, 1, "setMessageStatus must be invoked for the DB to mirror the event");
-  assert.equal(statusCalls[0].messageId, result.messageId);
-  assert.equal(statusCalls[0].status, "sent");
-  assert.equal(statusCalls[0].sentAtMs, 1000);
-
-  // Ordering: deposit must precede status, so the renderer's _handleStatus
-  // finds the row before flipping it.
-  const depositedIndex = bus._events.findIndex((e) => e.eventName === "message.deposited");
-  const statusIndex = bus._events.findIndex((e) => e.eventName === "message.status");
-  assert.ok(depositedIndex < statusIndex, "message.deposited must fire before message.status");
-});
-
-// Audit 2026-09-22 B4: attachment manifests and chunks route through the shared
-// group fan-out, but receivers emit no delivery receipt for them. Recording an
-// expected receipt per member per chunk crossed the peer-link recovery
-// threshold (3 sends + 45 s) on a single photo and re-invited quiet members.
-test("a group attachment is delivered to every member without registering expected receipts", async () => {
-  class Kv {
-    constructor() { this.m = new Map(); }
-    get(k) { return this.m.get(k); }
-    set(k, v) { this.m.set(k, v); }
-    delete(k) { this.m.delete(k); }
-    keys(p) { return [...this.m.keys()].filter((k) => k.startsWith(p || "")); }
-  }
-  const storageProvider = {
-    stores: new Map(),
-    getKeyValueStore(ns) {
-      if (!this.stores.has(ns)) this.stores.set(ns, new Kv());
-      return this.stores.get(ns);
-    },
-  };
-  const expectedReceipts = [];
-  const sealedFor = [];
-  const sdk = {
-    getIdentity: () => ({ localInboxId: "inbox:owner" }),
-    sealForPeer: async (args) => { sealedFor.push(args.peerAccountId); return { object: {}, address: {} }; },
-    sealForPeerDevice: async () => ({ object: {}, address: {} }),
-    mesh: { dispatch: async () => ({ queued: false }) },
-  };
-  const threadStore = {
-    async getThread() { return { threadType: "group", groupId: "g1" }; },
-    async recordOutboundDeposit() {},
-    async setMessageStatus() {},
-  };
-  const groupStore = {
-    async listMembers() {
-      return [
-        { accountId: "rez:acct:owner", state: "active" },
-        { accountId: "rez:acct:m1", state: "active" },
-        { accountId: "rez:acct:m2", state: "active" },
-      ];
-    },
-  };
-  const threadIndex = { async upsertFromMessage() { return null; } };
-  const bus = {
-    runtime: { sdk, sessionMode: "claimant" },
-    stores: { threadStore, groupStore, threadIndex },
-    services: {
-      peerLinkProtocol: { recordOutboundGroupMessage: (args) => expectedReceipts.push(args.peerAccountId) },
-      threads: { emitThreadIndexUpdated() {} },
-    },
-    on() { return () => {}; },
-    emit() {},
-    registerFunction() {},
-    call() { return Promise.resolve(null); },
-  };
-  const quiet = { warn() {}, error() {}, log() {}, info() {} };
-  const messages = new ServerMessagesService({
-    bus, threadStore, threadIndex, groupStore,
-    deviceFanoutStore: new DeviceFanoutCacheStore({ storageProvider }),
-    ownerAccountId: "rez:acct:owner",
-    logger: quiet,
-  });
-  bus.services.messages = messages;
-  const service = new ServerFileTransferService({ bus, storageProvider, ownerAccountId: "rez:acct:owner", logger: quiet });
-  await service.start();
-  const bytes = new Uint8Array(200 * 1024).map((_, i) => i & 255);
-  await service.sendFile({
-    threadId: "th_group",
-    fileDataB64: Buffer.from(bytes).toString("base64"),
-    fileName: "photo.jpg",
-    mimeType: "image/jpeg",
-  });
-  assert.ok(sealedFor.filter((id) => id === "rez:acct:m1").length > 1, "manifest and chunks reach member 1");
-  assert.ok(sealedFor.filter((id) => id === "rez:acct:m2").length > 1, "manifest and chunks reach member 2");
-  assert.deepEqual(expectedReceipts, [], "attachment deposits must not register expected delivery receipts");
+test("attachment context validates channel and typed byte records", () => {
+  assert.throws(() => new ChatFileChunkV1({}), /FileChunk/);
+  const f = fixture();
+  assert.throws(() => new FileSendParams({ threadId: "", fileDataB64: "AQID", fileName: "x", mimeType: "image/png" }), /threadId/);
+  assert.equal(typeof f.service.sendFile, "undefined", "superseded image send path is removed");
 });

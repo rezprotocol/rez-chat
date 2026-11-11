@@ -36,6 +36,7 @@ import { AccountStateEventPayloadV1, ACCOUNT_STATE_EVENT_KIND } from "./AccountS
 import { SiblingSyncPayloadV1, SIBLING_SYNC_KIND } from "./SiblingSyncPayloadV1.js";
 import { MessageCommitAckV1, MESSAGE_COMMIT_ACK_KIND } from "./MessageCommitAckV1.js";
 import { FileManifestV1, FileChunkV1 } from "@rezprotocol/sdk/filetransfer";
+import { ChatFileManifestV1, ChatFileChunkV1 } from "./ChatFilePayloadsV1.js";
 import { ProfilePayloadV1 } from "@rezprotocol/sdk/profile";
 
 export const FILE_MANIFEST_KIND = "rez.file.manifest.v1";
@@ -85,6 +86,11 @@ function extractPayloadSender(record, ctx) {
 }
 
 const ENTRIES = [
+  {
+    kind: IMAGE_KIND,
+    recordClass: ChatImagePayloadV1,
+    async dispatch() { return false; },
+  },
   {
     kind: MESSAGE_KIND,
     recordClass: ChatMessagePayloadV1,
@@ -233,10 +239,11 @@ const ENTRIES = [
   },
   {
     kind: FILE_MANIFEST_KIND,
-    recordClass: FileManifestV1,
+    recordClass: ChatFileManifestV1,
     async dispatch(record, ctx, services) {
       const ft = services && services.fileTransfer;
       if (!ft || typeof ft.handleIncomingPayload !== "function") return false;
+      await services.messages.rememberAttachmentManifest(record, extractPayloadSender(record, ctx), ctx.threadId);
       const consumed = await ft.handleIncomingPayload(record, {
         senderAccountId: extractPayloadSender(record, ctx),
         threadId: ctx && ctx.threadId,
@@ -247,7 +254,7 @@ const ENTRIES = [
   },
   {
     kind: FILE_CHUNK_KIND,
-    recordClass: FileChunkV1,
+    recordClass: ChatFileChunkV1,
     async dispatch(record, ctx, services) {
       const ft = services && services.fileTransfer;
       if (!ft || typeof ft.handleIncomingPayload !== "function") return false;

@@ -6,6 +6,7 @@ export class FileSendResult extends SchemaRecord {
     threadId: { type: "string", trim: true },
     messageId: { type: "string", trim: true },
     fileHashHex: { type: "string", trim: true },
+    fileSizeBytes: { type: "int" },
     transferId: { type: "string", trim: true },
   };
 }

@@ -19,6 +19,8 @@ import {
   ThreadMessagesListParams,
   ThreadMessagesListResult,
   ChatMessage,
+  FileSendParams,
+  FileSendResult,
 } from "../../records/index.js";
 import {
   ChatMessagePayloadV1,
@@ -29,7 +31,11 @@ import {
   MESSAGE_EDIT_KIND,
   MESSAGE_TOMBSTONE_KIND,
   REACTION_KIND,
+  ChatImagePayloadV1,
+  IMAGE_KIND,
 } from "../../records/payloads/index.js";
+import { ChatFileManifestV1 } from "../../records/payloads/ChatFilePayloadsV1.js";
+import { Hash } from "@rezprotocol/sdk/hash";
 import {
   signableOriginalMessageBytes,
   messageFingerprint,
@@ -63,9 +69,8 @@ export class ServerMessagesService extends BaseServerService {
   // E2eeDeliveryAckV1 carries only messageIds (no threadId — that's a
   // chat-layer concept), so we need this side table to resolve the
   // ack's target thread when it arrives. Populated on outbound send,
-  // cleared on ack consume. In-memory only: if the sender restarts
-  // before the ack arrives, the row stays at "sent" forever, which is
-  // an acceptable degradation (ack delivery is best-effort already).
+  // cleared on ack consume. This is a cache of the durable thread-store
+  // route, so refresh cannot strand a late text/image receipt.
   #ackPending = new Map();
   // Outbound queue tracking. The node owns the authoritative 72h queue
   // and signals state transitions via EVT_OUTBOUND_STATUS frames. We
@@ -130,6 +135,7 @@ export class ServerMessagesService extends BaseServerService {
     this.#queuedMessages = [];
     this._register("thread.messages", "list", (payload) => this.listMessages(payload));
     this._register("message", "send", (payload) => this.sendMessage(payload));
+    this._register("file", "send", (payload) => this.sendFile(payload));
     this._register("message", "edit", (payload) => this.editMessage(payload));
     this._register("message", "tombstone", (payload) => this.tombstoneMessage(payload));
     this._register("message", "deleteLocal", (payload) => this.deleteLocalMessage(payload));
@@ -367,6 +373,42 @@ export class ServerMessagesService extends BaseServerService {
     });
   }
 
+  async sendFile(payload = {}) {
+    const params = this._coerceParams(payload, FileSendParams);
+    if (!await this.#threadStore.getThread(params.threadId)) throw new Error("Attachment thread not found");
+    const bytes = await this.bus.services.fileTransfer.sendFileBytes(params);
+    const image = new ChatImagePayloadV1({ fileName: params.fileName, mimeType: params.mimeType,
+      fileSizeBytes: bytes.fileSizeBytes,
+      fileHashHex: bytes.fileHashHex, text: params.text, channelId: params.channelId });
+    const sent = await this.sendMessage(new MessageSendParams({ threadId: params.threadId,
+      channelId: params.channelId, payload: image.toJSON() }));
+    return new FileSendResult({ ...bytes.toJSON(), messageId: sent.messageId });
+  }
+
+  async rememberAttachmentManifest(record, senderAccountId, threadId) {
+    if (!(record instanceof ChatFileManifestV1)) throw new Error("Attachment manifest record required");
+    await this.#threadStore.rememberAttachmentManifest(new ChatFileManifestV1({ ...record.toJSON(), senderAccountId, threadId }));
+  }
+
+  async handleFileBytesReceived(manifest, senderAccountId, threadId) {
+    const saved = await this.#threadStore.attachmentManifest(manifest.transferId);
+    if (saved) {
+      if (saved.context.senderAccountId !== senderAccountId || saved.context.threadId !== threadId) throw new Error("Completed attachment context mismatch");
+      if (saved.context.messageEnvelope) return; // The normal message follows separately.
+    }
+    // Compatibility ingress only: old senders had no image envelope. Translate
+    // once into the same message apply core, preserving historical row identity.
+    let channelId = saved ? saved.context.channelId : "";
+    if (!saved) {
+      const legacy = this.bus.stores.storageProvider.getKeyValueStore("app:filetransfer");
+      channelId = await legacy.get("chat-channel:" + manifest.transferId);
+      if (typeof channelId !== "string") throw new Error("Legacy attachment context is unavailable; sender must resend");
+    }
+    const messageId = "img_recv_" + Hash.sha256Hex(JSON.stringify(["rez:chat:received-file-message:v1", senderAccountId, threadId, manifest.transferId]));
+    await this.bus.services.events.applyUserMessage(new ChatImagePayloadV1({ ...manifest.toJSON(),
+      threadId, messageId, senderAccountId, channelId }));
+  }
+
   async sendMessage(payload = {}) {
     const params = this._coerceParams(payload, MessageSendParams);
     const threadId = params.threadId;
@@ -411,7 +453,7 @@ export class ServerMessagesService extends BaseServerService {
       if (inReplyToMessageId) base.inReplyToMessageId = inReplyToMessageId;
       // Top-level channelId wins over any value already on params.payload.
       if (channelId) base.channelId = channelId;
-      wirePayload = base;
+      wirePayload = objectKind === IMAGE_KIND ? new ChatImagePayloadV1(base).toJSON() : base;
     } else {
       // The primary chat message (the UI sends it as {kind, text, ...}).
       // AE-1 hard cutover: a runtime with the account-authority signer emits
@@ -490,10 +532,16 @@ export class ServerMessagesService extends BaseServerService {
 
     const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
     const plaintextBodyBytes = new TextEncoder().encode(packetB64);
+    // The outbound row and receipt route exist before dispatch can synchronously
+    // return a receiver acknowledgement. The durable route also survives restart.
+    const receiptThread = await this.#threadStore.getThread(threadId);
+    if (receiptThread && receiptThread.threadType !== "group") {
+      if (!signedFingerprint) await this.#threadStore.rememberDeliveryThread(threadId, messageId);
+      this.#ackPending.set(messageId, threadId);
+    }
     let eventId = "";
     let messageQueued = false;
     let queuedInboxIds = [];
-    let sentToGroup = false;
     let pendingCommitOpened = false;
     // Linearization point for a signed 1:1 send: the authored fact and its
     // durable retry intent exist BEFORE any external dispatch can synchronously
@@ -518,22 +566,12 @@ export class ServerMessagesService extends BaseServerService {
       eventId = routed.eventId;
       messageQueued = routed.queued;
       queuedInboxIds = Array.isArray(routed.queuedInboxIds) ? routed.queuedInboxIds : [];
-      sentToGroup = routed.isGroup === true;
     }
 
     if (threadId) {
       let nextStatus = "failed";
       if (eventId) {
         nextStatus = "sent";
-        // Track in-flight so handleDeliveryAck can resolve the threadId
-        // from the bare messageId on the ack wire. DT-004: group messageIds
-        // are deliberately NOT registered — group members now ack (so the
-        // sender-side recovery evidence in ServerPeerLinkProtocolService is
-        // truthful), but a group row's status must not flip to "delivered"
-        // on the first of N member acks; group acks feed recovery only.
-        if (!sentToGroup) {
-          this.#ackPending.set(messageId, threadId);
-        }
       } else if (messageQueued) {
         nextStatus = "queued";
         this.#queuedMessages.push({ threadId, messageId, queuedAtMs: now });
@@ -543,14 +581,16 @@ export class ServerMessagesService extends BaseServerService {
         const pending = await this.#threadStore.getPendingCommit({ messageId });
         if (!pending) nextStatus = "delivered";
       }
-      await this.#threadStore.setMessageStatus({
+      const storedStatus = await this.#threadStore.setMessageStatus({
         threadId,
         messageId,
         status: nextStatus,
         sentAtMs: eventId ? now : null,
       }).catch((err) => {
         this.logger.error("[ServerMessagesService] message status persist failed", err && err.message ? err.message : err);
+        throw err;
       });
+      if (storedStatus) nextStatus = storedStatus.status;
       this._emit("message.status", new MessageStatusEvent({
         threadId,
         messageId,
@@ -1179,7 +1219,8 @@ export class ServerMessagesService extends BaseServerService {
       const pendingThreadId = this.#ackPending.get(messageId);
       const resolvedThreadId = id
         || (queuedEntry && typeof queuedEntry.threadId === "string" ? queuedEntry.threadId : "")
-        || (typeof pendingThreadId === "string" ? pendingThreadId : "");
+        || (typeof pendingThreadId === "string" ? pendingThreadId : "")
+        || await this.#threadStore.deliveryThreadId(messageId);
       if (!resolvedThreadId) continue;
       const thread = await this.#threadStore.getThread(resolvedThreadId);
       const expectedSender = thread && thread.threadType !== "group"
@@ -1209,6 +1250,7 @@ export class ServerMessagesService extends BaseServerService {
       });
       this.#queuedMessages = this.#queuedMessages.filter((entry) => !(entry.threadId === resolvedThreadId && entry.messageId === messageId));
       this.#ackPending.delete(messageId);
+      await this.#threadStore.forgetDeliveryThread(messageId);
       this.#discardQueueTracking(messageId);
       this._emit("message.status", new MessageStatusEvent({
         threadId: resolvedThreadId,

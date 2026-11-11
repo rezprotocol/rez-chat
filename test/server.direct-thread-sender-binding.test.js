@@ -8,6 +8,7 @@
 // peer. ServerEventService now drops a direct message whose thread peer != the
 // cryptographically-authenticated envelope sender.
 
+import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -50,6 +51,7 @@ async function setupServer() {
     uplinks: ["ws://localhost:9999"],
     storageProvider: new TestStorageProvider(),
     ownerAccountId: OWNER,
+    sdk: makeSealDispatch(),
     clock: () => Date.now(),
   });
   // Alice <-> Bob direct thread (the target the attacker will try to inject into).

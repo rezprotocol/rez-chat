@@ -262,7 +262,7 @@ test("missing verified sender device leaves commit proof pending without routing
     deviceSetRecord: { devices: [{ deviceId: "alice-primary", inboxId: "inbox:alice" }] }, established: [],
   }) });
   await sendSigned(alice, { messageId: "missing-device", text: "Wait for a valid return route" });
-  await network.drain();
+  await assert.rejects(network.drain(), /absent from the verified device set/);
   assert.equal((await rowOf(alice, "missing-device")).status, "sent");
   assert.equal((await pendingOf(alice)).length, 1);
   assert.equal(network.wireLog.some((frame) => frame.kind === MESSAGE_COMMIT_ACK_KIND), false);

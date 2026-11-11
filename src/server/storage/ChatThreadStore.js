@@ -5,6 +5,7 @@ import { ChatMessage, MESSAGE_STATUSES, coerceReactions } from "../../records/do
 import { ChatThread, THREAD_TYPES, coerceThreadType } from "../../records/domain/ChatThread.js";
 import { PENDING_MUTATION_KINDS, PendingMutation } from "../../records/domain/PendingMutation.js";
 import { MESSAGE_KIND } from "../../records/payloads/ChatMessagePayloadV1.js";
+import { ChatFileManifestV1 } from "../../records/payloads/ChatFilePayloadsV1.js";
 
 // Re-export THREAD_TYPES for legacy importers (server services, tests).
 // New code should import directly from records/domain/ChatThread.js.
@@ -418,6 +419,32 @@ export class ThreadStoreService {
       .sort((a, b) => a.localeCompare(b));
   }
 
+  async rememberDeliveryThread(threadId, messageId) {
+    if (!nonEmpty(threadId) || !nonEmpty(messageId)) throw new Error("Delivery route requires thread/message identity");
+    await this.kv.set(this._ownerPrefix("app:delivery-route/") + messageId, threadId);
+  }
+
+  async deliveryThreadId(messageId) {
+    return nonEmpty(await this.kv.get(this._ownerPrefix("app:delivery-route/") + messageId));
+  }
+
+  async forgetDeliveryThread(messageId) {
+    await this.kv.delete(this._ownerPrefix("app:delivery-route/") + messageId);
+  }
+
+  async rememberAttachmentManifest(record) {
+    if (!(record instanceof ChatFileManifestV1)) throw new Error("Attachment metadata requires ChatFileManifestV1");
+    const key = this._ownerPrefix("app:attachment-manifest/") + record.manifest.transferId;
+    const prior = await this.kv.get(key);
+    if (prior && JSON.stringify(prior) !== JSON.stringify(record.toJSON())) throw new Error("Attachment metadata/context changed");
+    await this.kv.set(key, record.toJSON());
+  }
+
+  async attachmentManifest(transferId) {
+    const raw = await this.kv.get(this._ownerPrefix("app:attachment-manifest/") + transferId);
+    return raw ? new ChatFileManifestV1(raw) : null;
+  }
+
   async getMessageByIdempotency({ threadId, senderKey, messageId } = {}) {
     const id = nonEmpty(threadId);
     const sender = nonEmpty(senderKey);
@@ -590,6 +617,8 @@ export class ThreadStoreService {
       const at = messages.findIndex((row) => row.messageId === mid);
       if (at < 0) return null;
       const current = messages[at];
+      // A receipt can commit before the sender's dispatch promise returns.
+      if (current.status === "delivered" && nextStatus === "sent") return current;
       if (!canTransitionStatus(current.status, nextStatus)) {
         throw new Error(
           `ThreadStoreService.setMessageStatus invalid transition ${current.status} -> ${nextStatus}`,

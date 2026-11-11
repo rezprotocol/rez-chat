@@ -204,14 +204,34 @@ periodic/reconnect drain. A stopped drain cannot announce readiness.
 
 Incoming attachment application is recoverable across process/page restarts.
 The SDK durably stores authenticated sender/thread binding and verified chunk
-records before recording byte receipts. Chat durably stores channel context
-before acknowledging the manifest. Completion awaits the idempotent chat
-message/index projection before marking the transfer applied and removing
-temporary chunks. Browser mutation promises resolve at transaction commit,
+records before recording byte receipts. The message service owns `file.send`:
+it transfers/cache-verifies the bytes, then calls the normal `sendMessage`
+with `ChatImagePayloadV1`. Image and text share message IDs, outbound rows,
+routing, queue status, inbound projection, encrypted receipts and UI events.
+The file-transfer service owns only byte transfer/cache and completion
+notification; it never creates a chat row, index, message ID or status.
+
+Chat-owned file context records distinguish new transfers (a separate normal
+image message follows) from legacy transfers. A compatibility ingress converts
+legacy completion into that same message apply core, preserving its historical
+projection ID. It is not a second projection writer. App metadata remains in
+Chat; Core/SDK file records remain generic. Incoming image messages wait in
+the durable apply-outbox until their hash/size-verified bytes are locally
+complete. Message/index commit precedes receipt dispatch. Failed receipt or
+projection work remains retryable, with the original message timestamp.
+Unsigned message receipt routes are durable before dispatch; sender refresh
+cannot lose the target thread, and a late sent write cannot downgrade a
+committed delivered status. Group status follows the existing text policy:
+the first member receipt does not certify delivery to every member. Byte
+chunks never count as expected chat receipts.
+
+Browser mutation promises resolve at transaction commit,
 not individual request success. Legacy transfers that already lost volatile
 chunks require a resend; startup must never require deleting saved site data.
 This is background catch-up with resumable eager transfers, not on-demand
-network media fetching or image delivery receipts.
+network media fetching. Image completion uses the existing authenticated
+encrypted delivery acknowledgement; signed OriginalMessage commit-proof
+semantics remain governed by `plans/MESSAGE_COMMIT_ACK_PLAN.md`.
 
 ## 14. Navigation Actions
 

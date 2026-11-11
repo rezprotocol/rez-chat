@@ -20,6 +20,9 @@ const HEX_HASH_RE = /^[0-9a-f]{64}$/;
 export class ChatImagePayloadV1 extends WirePayloadRecord {
   static KIND = IMAGE_KIND;
   static schema = {
+    threadId: { type: "string", trim: true },
+    senderAccountId: { type: "string", trim: true },
+    messageId: { type: "string", trim: true },
     fileName: { type: "string", required: true, trim: true, maxLength: MAX_NAME_LENGTH },
     mimeType: { type: "string", default: "application/octet-stream", trim: true, maxLength: MAX_MIME_LENGTH },
     fileSizeBytes: { type: "int", required: true },

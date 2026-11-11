@@ -48,6 +48,9 @@ function makeHarness({ multiDeviceFanout = false, sessionMode = "account-legacy"
   };
   if (omitFanoutSdk) delete sdk.sealForPeerDevice;
   const threadStore = {
+    async rememberDeliveryThread() {},
+    async deliveryThreadId() { return ""; },
+    async forgetDeliveryThread() {},
     async recordOutboundDeposit() {},
     async setMessageStatus() {},
     async getThread() { return { threadType: "direct", peerAccountId: PEER, peerInboxId: "inbox:peer" }; },

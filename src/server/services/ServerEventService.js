@@ -4,6 +4,7 @@ import {
   MessageUpdatedEvent,
   PeerLinkUpdatedEvent,
 } from "../../records/index.js";
+import { ChatImagePayloadV1, IMAGE_KIND, FILE_MANIFEST_KIND, FILE_CHUNK_KIND } from "../../records/payloads/index.js";
 import { getPayloadEntry } from "../../records/payloads/index.js";
 import { MESSAGE_KIND as CHAT_MESSAGE_KIND } from "../../records/payloads/ChatMessagePayloadV1.js";
 import {
@@ -11,7 +12,7 @@ import {
   originalMessageAuthPresence,
   verifyOriginalMessageForAdmission,
 } from "../../records/payloads/originalMessageShapes.js";
-import { E2eeDeliveryAckV1, base64ToBytes } from "@rezprotocol/sdk/client";
+import { E2eeDeliveryAckV1, base64ToBytes, bytesToBase64 } from "@rezprotocol/sdk/client";
 import { BaseServerService } from "../base/BaseServerService.js";
 import { ServerDeferredMessageBuffer } from "./ServerDeferredMessageBuffer.js";
 import { ServerGroupAuthzGate } from "./ServerGroupAuthzGate.js";
@@ -79,6 +80,13 @@ export class ServerEventService extends BaseServerService {
    * directive — feeds the same apply core as a plaintext deposit.
    */
   async applyUserMessage(data) {
+    // A legacy transfer has no message envelope. Its compatibility adapter
+    // supplies the existing image record to this same authenticated apply core.
+    if (data instanceof ChatImagePayloadV1) {
+      return this.#handlePeerlinkUserMessage({ mailboxId: "attachment:" + data.fileHashHex,
+        eventId: data.messageId, plaintextB64: bytesToBase64(new TextEncoder().encode(JSON.stringify(data.toJSON()))),
+        senderAccountId: data.senderAccountId });
+    }
     return this.#handlePeerlinkUserMessage(data);
   }
 
@@ -463,6 +471,17 @@ export class ServerEventService extends BaseServerService {
       }
     }
 
+    // A message is delivered only when its referenced bytes are durably local.
+    // Missing/out-of-order bytes leave this normal message in the apply-outbox.
+    if (decodedPayload && decodedPayload.kind === IMAGE_KIND) {
+      const image = new ChatImagePayloadV1(decodedPayload);
+      if (!await this.bus.services.fileTransfer.hasFile(image.fileHashHex, image.fileSizeBytes)) {
+        const error = new Error("Image bytes are not complete; message application will retry");
+        error.code = "FILE_BYTES_PENDING";
+        throw error;
+      }
+    }
+
     // Registry-driven dispatch: look up the kind in PAYLOAD_KIND_REGISTRY
     // and let the entry's handler consume it. The default rez.chat.message.v1
     // entry returns `false` so the deposit flows through to the message-
@@ -491,6 +510,8 @@ export class ServerEventService extends BaseServerService {
         const consumed = await entry.dispatch(payloadForDispatch, dispatchCtx, this.bus.services).catch((err) => {
           this.logger.warn("[ServerEventService] payload dispatch failed for " + decodedPayload.kind,
             err && err.message ? err.message : err);
+          // Byte/control failures must never become ordinary chat bubbles.
+          if (decodedPayload.kind === FILE_MANIFEST_KIND || decodedPayload.kind === FILE_CHUNK_KIND) throw err;
           return false;
         });
         if (consumed) return;
@@ -509,7 +530,7 @@ export class ServerEventService extends BaseServerService {
       : "";
     const canonicalMessageId = messageId || eventId;
 
-    const now = this.#clock();
+    let now = this.#clock();
     let messagePersisted = false;
     let persistedMutated = null;
     if (threadId && canonicalMessageId) {
@@ -537,6 +558,7 @@ export class ServerEventService extends BaseServerService {
       }
       if (persistResult) {
         messagePersisted = true;
+        if (persistResult.message && Number.isFinite(persistResult.message.acceptedAtMs)) now = persistResult.message.acceptedAtMs;
         // Out-of-order mutations (edit/reaction/tombstone delivered before their
         // target) were buffered and folded in on deposit. The message.deposited
         // event below carries the BASE message, so capture the mutated row and
@@ -555,6 +577,7 @@ export class ServerEventService extends BaseServerService {
       }).catch((err) => {
         this.logger.error("[ServerEventService] inbound index upsert failed", err && err.message ? err.message : err);
         this._emit("app.error", { source: "ServerEventService", message: "inbound index upsert failed", severity: "warn", err });
+        throw err;
       });
       if (indexRecord) {
         this.bus.services.threads.emitThreadIndexUpdated(indexRecord);
@@ -589,7 +612,7 @@ export class ServerEventService extends BaseServerService {
     // a group ack clears recovery evidence without flipping the row to
     // "delivered" on the first of N member acks. Carries the sender's local
     // messageId (payload.messageId, not the relay's eventId).
-    if (decodedPayload && decodedPayload.kind === CHAT_MESSAGE_KIND && thread && messageId) {
+    if (decodedPayload && (decodedPayload.kind === CHAT_MESSAGE_KIND || decodedPayload.kind === IMAGE_KIND) && thread && messageId) {
       // Only admitted signed semantics may select a device. Resolve its inbox
       // from the verified public device set; a thread's legacy return inbox
       // belongs to the account's primary and can strand a linked sender's ACK.
@@ -718,9 +741,7 @@ export class ServerEventService extends BaseServerService {
             });
             await sdk.mesh.dispatch(sealed.object, sealed.address);
           };
-          dispatchAck().catch((ackErr) => {
-            this.logger.error("[ServerEventService] delivery ack send failed", ackErr && ackErr.message ? ackErr.message : ackErr);
-          });
+          await dispatchAck();
         }
       }
     }

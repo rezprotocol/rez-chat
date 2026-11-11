@@ -1,54 +1,23 @@
-import { FileTransferService, FileManifestV1 } from "@rezprotocol/sdk/filetransfer";
+import { FileTransferService } from "@rezprotocol/sdk/filetransfer";
 import { base64ToBytes, bytesToBase64 } from "@rezprotocol/sdk/client";
 import { Hash } from "@rezprotocol/sdk/hash";
-
-function defaultAttachmentPreview(mimeType, fileName) {
-  if (typeof mimeType === "string" && mimeType.toLowerCase().startsWith("image/")) {
-    return "Photo";
-  }
-  if (typeof fileName === "string" && fileName.trim()) return fileName.trim();
-  return "File";
-}
-
-function receivedFileMessageId({ senderAccountId, threadId, transferId }) {
-  const material = JSON.stringify([
-    "rez:chat:received-file-message:v1",
-    senderAccountId,
-    threadId,
-    transferId,
-  ]);
-  return "img_recv_" + Hash.sha256Hex(material);
-}
-import {
-  FileSendParams,
-  FileSendResult,
-  FileGetParams,
-  FileGetResult,
-  MessageDepositedEvent,
-  MessageStatusEvent,
-} from "../../records/index.js";
-import { ChatImagePayloadV1 } from "../../records/payloads/ChatImagePayloadV1.js";
+import { FileSendParams, FileSendResult, FileGetParams, FileGetResult } from "../../records/index.js";
+import { ChatFileManifestV1, ChatFileChunkV1 } from "../../records/payloads/ChatFilePayloadsV1.js";
+import { FILE_MANIFEST_KIND } from "../../records/payloads/index.js";
 import { BaseServerService } from "../base/BaseServerService.js";
 
+// Byte transfer/cache only. Message creation, projection, status and receipts
+// belong to ServerMessagesService and ServerEventService for every media kind.
 export class ServerFileTransferService extends BaseServerService {
-  #storageProvider;
-  #clock;
   #kvStore;
-  #fileTransferService;
-  #sendContext;
+  #fileTransferService = null;
+  #sendContext = null;
   #sendTail = Promise.resolve();
 
-  constructor({ bus, storageProvider, ownerAccountId, clock = () => Date.now(), logger = console } = {}) {
+  constructor({ bus, storageProvider, ownerAccountId, logger = console } = {}) {
     super({ bus, ownerAccountId, logger });
-    if (!storageProvider || typeof storageProvider.getKeyValueStore !== "function") {
-      throw new Error("ServerFileTransferService requires storageProvider");
-    }
-    this.#storageProvider = storageProvider;
-    this.#clock = clock;
+    if (!storageProvider || typeof storageProvider.getKeyValueStore !== "function") throw new Error("ServerFileTransferService requires storageProvider");
     this.#kvStore = storageProvider.getKeyValueStore("app:filetransfer");
-    this.#fileTransferService = null;
-    this.#sendContext = null;
-    this._register("file", "send", (payload) => this.sendFile(payload));
     this._register("file", "get", (payload) => this.getFile(payload));
   }
 
@@ -95,155 +64,42 @@ export class ServerFileTransferService extends BaseServerService {
 
   async start() {
     const sdk = this.bus.runtime ? this.bus.runtime.sdk : null;
-    if (!sdk || typeof sdk.sealForPeer !== "function" || !sdk.mesh) {
-      throw new Error("ServerFileTransferService requires sdk with sealForPeer + mesh");
-    }
-
+    if (!sdk || typeof sdk.sealForPeer !== "function" || !sdk.mesh) throw new Error("ServerFileTransferService requires sdk with sealForPeer + mesh");
     this.#fileTransferService = new FileTransferService({
-      log: this.logger,
-      kvStore: this.#kvStore,
+      log: this.logger, kvStore: this.#kvStore,
       onSendDeposit: async ({ contextId, plaintextBodyBytes }) => {
-        const channelId = this.#sendContext || "";
-        const payload = JSON.parse(new TextDecoder().decode(plaintextBodyBytes));
-        payload.threadId = contextId;
-        payload.senderAccountId = this.ownerAccountId;
-        if (channelId) payload.channelId = channelId;
-        const bodyBytes = new TextEncoder().encode(JSON.stringify(payload));
-        const messages = this.bus.services && this.bus.services.messages;
-        if (!messages || typeof messages.dispatchThreadBytes !== "function") {
-          throw new Error("Attachment delivery requires the canonical message router");
-        }
-        await messages.dispatchThreadBytes(contextId, bodyBytes, "file:" + Hash.sha256Hex(bodyBytes));
+        const raw = JSON.parse(new TextDecoder().decode(plaintextBodyBytes));
+        const input = { ...raw, threadId: contextId, senderAccountId: this.ownerAccountId,
+          channelId: this.#sendContext.channelId, messageEnvelope: true };
+        const payload = raw.kind === FILE_MANIFEST_KIND ? new ChatFileManifestV1(input) : new ChatFileChunkV1(input);
+        const bytes = new TextEncoder().encode(JSON.stringify(payload.toJSON()));
+        await this.bus.services.messages.dispatchThreadBytes(contextId, bytes, "file:" + Hash.sha256Hex(bytes));
       },
-      onFileReceived: ({ transferId, manifest, fileBytes, senderAccountId, contextId }) => {
-        return this.#handleFileReceived({ transferId, manifest, fileBytes, senderAccountId, threadId: contextId }).catch((err) => {
-          this.logger.error("[ServerFileTransferService] onFileReceived failed", err && err.message ? err.message : err);
-          this._emit("app.error", { source: "ServerFileTransferService", message: "onFileReceived failed", severity: "error", err });
-          throw err;
-        });
-      },
-      onProgress: null,
+      onFileReceived: ({ manifest, senderAccountId, contextId }) =>
+        this.bus.services.messages.handleFileBytesReceived(manifest, senderAccountId, contextId),
     });
   }
 
-  async sendFile(payload = {}) {
+  async sendFileBytes(payload) {
     const params = this._coerceParams(payload, FileSendParams);
-    const pending = this.#sendTail.then(() => this.#sendFile(params));
-    // The returned promise still reports failure. This tail only allows the
-    // next transfer to proceed without inheriting the previous rejection.
+    const pending = this.#sendTail.then(async () => {
+      this.#sendContext = params;
+      try {
+        const fileBytes = base64ToBytes(params.fileDataB64);
+        const result = await this.#fileTransferService.sendFile({
+          fileBytes, fileName: params.fileName,
+          mimeType: params.mimeType, peerAccountId: this.ownerAccountId, contextId: params.threadId,
+        });
+        return new FileSendResult({ threadId: params.threadId, fileHashHex: result.manifest.fileHashHex, fileSizeBytes: fileBytes.length, transferId: result.transferId });
+      } finally { this.#sendContext = null; }
+    });
     this.#sendTail = pending.then(() => undefined, () => undefined);
     return pending;
   }
 
-  async #sendFile(params) {
-    const fileBytes = base64ToBytes(params.fileDataB64);
-    const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
-
-    const thread = await this.bus.stores.threadStore.getThread(params.threadId);
-    if (!thread) {
-      throw new Error("ServerFileTransferService: thread not found for " + params.threadId);
-    }
-
-    this.#sendContext = channelId;
-    let result;
-    try {
-      result = await this.#fileTransferService.sendFile({
-        fileBytes,
-        fileName: params.fileName,
-        mimeType: params.mimeType,
-        peerAccountId: this.ownerAccountId,
-        contextId: params.threadId,
-        text: params.text || "",
-      });
-    } finally {
-      this.#sendContext = null;
-    }
-
-    const now = this.#clock();
-    const messageId = "img_" + now + "_" + result.transferId;
-    const captionText = params.text || "";
-    const imagePayload = new ChatImagePayloadV1({
-      fileName: params.fileName,
-      mimeType: params.mimeType,
-      fileSizeBytes: fileBytes.length,
-      fileHashHex: result.manifest.fileHashHex,
-      text: captionText,
-      channelId,
-    });
-
-    await this.bus.stores.threadStore.recordOutboundDeposit({
-      threadId: params.threadId,
-      senderKey: this.ownerAccountId,
-      messageId,
-      senderAccountId: this.ownerAccountId,
-      packetB64: JSON.stringify(imagePayload.toJSON()),
-      acceptedAtMs: now,
-      text: captionText,
-      payload: imagePayload,
-    }).catch((err) => {
-      this.logger.error("[ServerFileTransferService] outbound deposit persist failed", err && err.message ? err.message : err);
-      this._emit("app.error", { source: "ServerFileTransferService", message: "outbound deposit persist failed", severity: "error", err });
-    });
-
-    const previewText = captionText || defaultAttachmentPreview(params.mimeType, params.fileName);
-    const indexRecord = await this.bus.stores.threadIndex.upsertFromMessage({
-      threadId: params.threadId,
-      messageId: messageId,
-      ts: now,
-      preview: previewText,
-      senderAccountId: this.ownerAccountId,
-    }).catch((err) => {
-      this.logger.error("[ServerFileTransferService] outbound index upsert failed", err && err.message ? err.message : err);
-      this._emit("app.error", { source: "ServerFileTransferService", message: "outbound index upsert failed", severity: "warn", err });
-    });
-    if (indexRecord && this.bus.services && this.bus.services.threads) {
-      this.bus.services.threads.emitThreadIndexUpdated(indexRecord);
-    }
-
-    const outboundPacketB64 = JSON.stringify(imagePayload.toJSON());
-    this._emit("message.deposited", new MessageDepositedEvent({
-      threadId: params.threadId,
-      message: {
-        messageId,
-        threadId: params.threadId,
-        senderAccountId: this.ownerAccountId,
-        senderKey: this.ownerAccountId,
-        packetB64: outboundPacketB64,
-        text: captionText,
-        payload: imagePayload,
-        status: "pending",
-        createdAtMs: now,
-        acceptedAtMs: now,
-      },
-    }));
-
-    // sendFile above has handed all chunks to the SDK's delivery path by the
-    // time we get here. Mirror ServerMessagesService.sendMessage: persist
-    // the "sent" transition to the DB and notify the renderer via a
-    // dedicated message.status event. Without this the bubble is stuck on
-    // "SENDING" because nothing ever moves the row off "pending".
-    await this.bus.stores.threadStore.setMessageStatus({
-      threadId: params.threadId,
-      messageId,
-      status: "sent",
-      sentAtMs: now,
-    }).catch((err) => {
-      this.logger.error("[ServerFileTransferService] outbound status persist failed", err && err.message ? err.message : err);
-      this._emit("app.error", { source: "ServerFileTransferService", message: "outbound status persist failed", severity: "warn", err });
-    });
-    this._emit("message.status", new MessageStatusEvent({
-      threadId: params.threadId,
-      messageId,
-      status: "sent",
-      sentAtMs: now,
-    }));
-
-    return new FileSendResult({
-      threadId: params.threadId,
-      messageId: messageId,
-      fileHashHex: result.manifest.fileHashHex,
-      transferId: result.transferId,
-    });
+  async hasFile(fileHashHex, fileSizeBytes) {
+    const bytes = await this.#fileTransferService.getFile(fileHashHex);
+    return Boolean(bytes && bytes.length === fileSizeBytes);
   }
 
   async getFile(payload = {}) {
@@ -265,131 +121,10 @@ export class ServerFileTransferService extends BaseServerService {
     });
   }
 
-  async handleIncomingPayload(payload, { senderAccountId, threadId, channelId } = {}) {
+  async handleIncomingPayload(payload, { senderAccountId, threadId } = {}) {
     if (!this.#fileTransferService) return false;
-    // Chat owns channel identity. Persist it before acknowledging the
-    // manifest's application, and require it before applying any chunk.
-    // SDK owns the independently authenticated sender/thread binding.
-    if (payload instanceof FileManifestV1 && typeof payload.transferId === "string" && payload.transferId) {
-      const ch = typeof channelId === "string" ? channelId : "";
-      const key = "chat-channel:" + payload.transferId;
-      const prior = await this.#kvStore.get(key);
-      if (prior !== undefined && prior !== null && prior !== ch) throw new Error("File transfer channel mismatch");
-      const consumed = await this.#fileTransferService.handleIncomingPayload(payload, { senderAccountId, contextId: threadId });
-      if (consumed && (prior === undefined || prior === null)) await this.#kvStore.set(key, ch);
-      return consumed;
-    }
-    const transferId = payload && typeof payload.transferId === "string" ? payload.transferId : "";
-    if (transferId) {
-      const savedChannel = await this.#kvStore.get("chat-channel:" + transferId);
-      if (savedChannel === undefined || savedChannel === null) {
-        const err = new Error("Attachment metadata is not ready; leave this chunk queued for retry");
-        err.code = "FILE_TRANSFER_MANIFEST_PENDING";
-        throw err;
-      }
-    }
-    return this.#fileTransferService.handleIncomingPayload(payload, { senderAccountId, contextId: threadId });
-  }
-
-  async #handleFileReceived({ transferId, manifest, fileBytes, senderAccountId, threadId }) {
-    const resolvedThreadId = typeof threadId === "string" ? threadId.trim() : "";
-    const resolvedSender = typeof senderAccountId === "string" ? senderAccountId.trim() : "";
-
-    if (!resolvedThreadId) {
-      this.logger.error("[ServerFileTransferService] no thread context for completed transfer " + transferId);
-      throw new Error("Completed file requires durable thread context");
-    }
-
-    const now = this.#clock();
-    // The transfer completion callback is at-least-once: a manifest/chunk
-    // replay can complete the same authenticated transfer again. Bind the
-    // projection identity to that stable lineage instead of the local clock,
-    // otherwise every replay creates a second chat message.
-    const messageId = receivedFileMessageId({
-      senderAccountId: resolvedSender,
-      threadId: resolvedThreadId,
-      transferId,
-    });
-    const captionText = typeof manifest.text === "string" ? manifest.text : "";
-    const savedChannel = await this.#kvStore.get("chat-channel:" + transferId);
-    if (typeof savedChannel !== "string") throw new Error("File transfer channel context is not durable");
-    const channelId = savedChannel;
-    const imagePayload = new ChatImagePayloadV1({
-      fileName: manifest.fileName,
-      mimeType: manifest.mimeType,
-      fileSizeBytes: fileBytes.length,
-      fileHashHex: manifest.fileHashHex,
-      text: captionText,
-      channelId,
-    });
-
-    let persistResult;
-    try {
-      persistResult = await this.bus.stores.threadStore.upsertDepositedMessage({
-        messageId,
-        threadId: resolvedThreadId,
-        senderKey: resolvedSender,
-        packetB64: JSON.stringify(imagePayload.toJSON()),
-        acceptedAtMs: now,
-        senderAccountId: resolvedSender || null,
-        status: "delivered",
-        text: captionText,
-        payload: imagePayload,
-      });
-    } catch (err) {
-      this.logger.error("[ServerFileTransferService] inbound image persist failed", err && err.message ? err.message : err);
-      this._emit("app.error", { source: "ServerFileTransferService", message: "inbound image persist failed", severity: "error", err });
-      throw err;
-    }
-
-    if (!persistResult) throw new Error("File message projection did not return a durable result");
-    // A retry may find the message row committed but its index/event still
-    // unapplied. Finish under the original message timestamp.
-    const storedMessage = persistResult.message;
-    const acceptedAtMs = storedMessage && Number.isFinite(storedMessage.acceptedAtMs) ? storedMessage.acceptedAtMs : now;
-
-    const previewText = captionText || defaultAttachmentPreview(manifest.mimeType, manifest.fileName);
-    const indexRecord = await this.bus.stores.threadIndex.upsertFromMessage({
-      threadId: resolvedThreadId,
-      messageId: messageId,
-      ts: acceptedAtMs,
-      preview: previewText,
-    }).catch((err) => {
-      this.logger.error("[ServerFileTransferService] inbound index upsert failed", err && err.message ? err.message : err);
-      this._emit("app.error", { source: "ServerFileTransferService", message: "inbound index upsert failed", severity: "warn", err });
-      throw err;
-    });
-    if (indexRecord && this.bus.services && this.bus.services.threads) {
-      this.bus.services.threads.emitThreadIndexUpdated(indexRecord);
-    }
-
-    this._emit("message.deposited", new MessageDepositedEvent({
-      threadId: resolvedThreadId,
-      message: {
-        messageId,
-        threadId: resolvedThreadId,
-        senderAccountId: resolvedSender || null,
-        text: captionText,
-        payload: imagePayload,
-        status: "delivered",
-        createdAtMs: acceptedAtMs,
-        acceptedAtMs,
-        packetB64: JSON.stringify(imagePayload.toJSON()),
-      },
-    }));
-    this._emit("runtime.event.message.deposited", new MessageDepositedEvent({
-      threadId: resolvedThreadId,
-      message: {
-        messageId,
-        threadId: resolvedThreadId,
-        senderAccountId: resolvedSender || null,
-        text: captionText,
-        payload: imagePayload,
-        status: "delivered",
-        createdAtMs: acceptedAtMs,
-        acceptedAtMs,
-        packetB64: JSON.stringify(imagePayload.toJSON()),
-      },
-    }));
+    const record = payload instanceof ChatFileManifestV1 ? payload.manifest
+      : payload instanceof ChatFileChunkV1 ? payload.chunk : payload;
+    return this.#fileTransferService.handleIncomingPayload(record, { senderAccountId, contextId: threadId });
   }
 }
