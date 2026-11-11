@@ -76,7 +76,12 @@ export class SidebarNavView extends BusComponent {
       this._subscribe(stores.connectRequests, () => this.#refreshContactsBadge());
     }
     this._subscribe(stores.connection, () => this.#refreshStatusIndicator());
-    this._subscribe(stores.session, () => this.#refreshStatusIndicator());
+    this._subscribe(stores.session, () => {
+      if (this.#ownAvatarView) {
+        this.#ownAvatarView.setAccount(stores.session.activeAccountId() || "", stores.session.selfLabel() || "Account");
+      }
+      this.#refreshStatusIndicator();
+    });
     this.render();
   }
 
@@ -84,7 +89,7 @@ export class SidebarNavView extends BusComponent {
     if (!this._rootEl) return;
     const sessionStore = this.bus.stores.session;
     const accountLabel = sessionStore.selfLabel() || "Account";
-    const accountId = sessionStore.selectedOrVaultAccountId() || "";
+    const accountId = sessionStore.activeAccountId() || "";
 
     const wordmark = h("div", { className: "mb-space-xl titlebar-drag select-none flex items-center justify-center" }, [
       h("img", {

@@ -186,6 +186,31 @@ Underlying rez-node WS message families consumed for paid services: `settlement.
 
 ## 13. Fail-Closed Gating
 
+The active unlocked account is the sole self identity. Other accounts saved in
+the same vault do not become self senders, roster entries or message owners.
+Before unlock, only the selected account's hint may supply self identity.
+Own-account avatar views rebind when identity changes and invalidate pending
+loads when a profile is saved; stale identity or mount results cannot repaint.
+
+Thread state changes (archive, unarchive, lock and unlock) return and emit the
+same canonical full thread summary used by list/get. Thread storage owns state;
+the thread index owns activity, preview and unread fields. State mutations must
+not replace those fields with empty defaults.
+
+Web outgoing-link previews use the existing `links.unfurl` records and guarded
+Chat fetcher over a same-origin, request-only app endpoint. Incoming messages do
+not initiate unfurls. Only the outgoing URL is sent to the hosted preview
+service; account keys, cookies, chat bodies and credentials are excluded. The
+service fetches public metadata without persisting URLs. DNS-pinned requests,
+private-address and redirect rejection, byte/deadline limits, origin checks,
+per-IP admission and bounded concurrency apply. The public bus registers only
+metadata services; generic transport derives capabilities from registered
+functions and the canonical Chat bridge spec, with no account/node RPC access.
+Preview failure must not block sending, startup or reading messages.
+
+System diagnostics show the client version in the web build. A reported peer
+count without individual peer details is identified as such, not as zero peers.
+
 - No connect until unlock succeeds.
 - If unlock fails, state returns to `LOCKED` and any partial connection attempt is torn down.
 - If auth state transitions to `LOCKING`/`LOCKED`, active polling and transport activity are stopped immediately.

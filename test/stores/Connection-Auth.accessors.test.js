@@ -2,6 +2,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ConnectionStore } from "../../src/ui/stores/ConnectionStore.js";
 
+test("activeNodeUrl uses the active uplink row when the scalar is not reported", () => {
+  const store = new ConnectionStore();
+  assert.equal(store.activeNodeUrl(), null);
+  store.setConnection({ nodes: [{ url: "wss://spare", active: false }, { url: "wss://active", active: true }] });
+  assert.equal(store.activeNodeUrl(), "wss://active");
+  store.setConnection({ activeNode: "wss://reported" });
+  assert.equal(store.activeNodeUrl(), "wss://reported");
+  store.reset();
+  assert.equal(store.activeNodeUrl(), null);
+});
+
 test("ConnectionStore.isOnline true only when status === connected", () => {
   const c = new ConnectionStore();
   assert.equal(c.isOnline(), false);

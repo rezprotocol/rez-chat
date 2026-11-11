@@ -62,25 +62,22 @@ export class SessionStore {
     return typeof v === "string" && v.length > 0 ? v : null;
   }
 
-  // True if `id` matches any known self-identity slot (vault, peerlink,
-  // local inbox, selected account). Collapses the previous `collectSelfIds`
-  // helper in presenters/labels.js — same logic, single source.
+  // Self means the active account, not every account saved in this vault.
+  // The selected account's hint also covers the pre-connect identity window.
   isSelf(id) {
     const target = String(id || "").trim();
     if (!target) return false;
+    const activeId = this.activeAccountId();
+    const activeEntry = this.accountEntry(activeId);
     const slots = [
       this._state.accountId,
       this._state.ownerAccountId,
       this._state.localInboxId,
-      this._state.selectedAccountId,
+      activeId,
+      activeEntry ? activeEntry.accountIdHint : null,
     ];
     for (const slot of slots) {
       if (slot && String(slot).trim() === target) return true;
-    }
-    const accountList = Array.isArray(this._state.accountList) ? this._state.accountList : [];
-    for (const entry of accountList) {
-      const hint = entry && entry.accountIdHint;
-      if (hint && String(hint).trim() === target) return true;
     }
     return false;
   }
@@ -145,6 +142,10 @@ export class SessionStore {
     return typeof v === "string" && v.trim().length > 0 ? v.trim() : null;
   }
 
+  activeAccountId() {
+    return this.vaultAccountId() || this.selectedAccountIdRaw();
+  }
+
   // The id chrome should hang an avatar / id-pill off. Prefers the explicit
   // selection, falls back to the vault account id.
   selectedOrVaultAccountId() {
@@ -200,7 +201,7 @@ export class SessionStore {
   // The display label for the active self account from accountList, or null
   // if no matching row exposes a non-empty label.
   selfLabel() {
-    const entry = this.selectedAccountEntry();
+    const entry = this.accountEntry(this.activeAccountId());
     if (!entry || typeof entry !== "object") return null;
     const label = String(entry.label || "").trim();
     return label || null;

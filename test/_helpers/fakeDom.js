@@ -65,6 +65,16 @@ export class FakeElement extends FakeNode {
     return null;
   }
 
+  querySelectorAll(selector) {
+    const matches = [];
+    for (const child of this.children) {
+      if (!(child instanceof FakeElement)) continue;
+      if (child.#matches(selector)) matches.push(child);
+      matches.push(...child.querySelectorAll(selector));
+    }
+    return matches;
+  }
+
   #matches(selector) {
     const match = /^\[([^=]+)=['"]([^'"]+)['"]\]$/.exec(selector);
     if (!match) return false;

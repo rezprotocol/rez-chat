@@ -43,6 +43,12 @@ export class ConnectionStore extends StoreBase {
     return clone(this.#connection);
   }
 
+  activeNodeUrl() {
+    if (this.#connection.activeNode) return this.#connection.activeNode;
+    const active = this.#connection.nodes.find((node) => node.active === true);
+    return active ? nonEmptyString(active.url) : null;
+  }
+
   setConnection(patch = {}) {
     this.#connection = clone({
       ...this.#connection,

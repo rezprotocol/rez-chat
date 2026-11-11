@@ -431,10 +431,7 @@ export class SessionService extends BaseBusService {
   }
 
   _resolveAccountId() {
-    const snap = this._sessionStore.snapshot();
-    if (snap && snap.selectedAccountId) return String(snap.selectedAccountId).trim();
-    if (snap && snap.accountId) return String(snap.accountId).trim();
-    return "";
+    return this._sessionStore.activeAccountId() || "";
   }
 
   async _disconnectRuntimeForAuthOperation(operation) {

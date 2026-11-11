@@ -441,9 +441,9 @@ export class MessageBubbleView extends BusComponent {
   // by URL and returns synchronously from its in-memory cache after the
   // first resolve.
   #renderLinkPreview(bubbleEl, text, isMine) {
-    // Only our own outgoing messages unfurl. The fetch runs from this device;
-    // unfurling a peer-supplied URL discloses our IP address to whoever
-    // controls that URL (audit 2026-09-22). Enforced here, not per call site.
+    // Only our own outgoing messages unfurl. Native fetches run on the device;
+    // web fetches use the same-origin metadata service. Neither topology
+    // follows a peer-supplied URL automatically (audit 2026-09-22).
     if (isMine !== true) return;
     const urls = extractUrls(text);
     const url = urls.length > 0 ? urls[0] : "";

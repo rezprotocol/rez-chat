@@ -6,6 +6,8 @@ import {
 import { bootstrapChatRuntime } from "../../server/bootstrap/bootstrapChatRuntime.js";
 import { mapUnlockedAccountToRuntimeIdentity } from "../../server/bootstrap/unlockedAccountIdentity.js";
 import { browserChatRuntimeDbName } from "./browserRuntimeStorage.js";
+import { RemoteLinksService } from "../../server/services/RemoteLinksService.js";
+import { WEB_PREVIEW_PATH } from "../../server/config/webPreview.js";
 
 export { browserChatRuntimeDbName } from "./browserRuntimeStorage.js";
 
@@ -46,6 +48,10 @@ export async function bootstrapBrowserChatRuntime({ account, uplinks, logger = c
     cryptoProvider,
     uplinks,
     wsFactory: (url) => new globalThis.WebSocket(url),
+    linksServiceFactory: (options) => new RemoteLinksService({
+      ...options,
+      endpoint: new URL(WEB_PREVIEW_PATH, globalThis.location.origin).href,
+    }),
     logger,
   });
 }

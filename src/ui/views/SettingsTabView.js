@@ -1,6 +1,7 @@
 import { h } from "@rezprotocol/ui";
 import { BusComponent } from "../base/BusComponent.js";
 import { ellipsisId } from "../presenters/labels.js";
+import packageInfo from "../../../package.json" with { type: "json" };
 
 const STAT_LABEL_CLASS = "text-label-micro font-label-technical text-outline uppercase tracking-wider";
 const STAT_VALUE_CLASS = "text-label-technical font-label-technical text-on-surface-variant truncate";
@@ -17,7 +18,7 @@ export class SettingsTabView extends BusComponent {
     super({ bus });
     this._sidebarEl = null;
     this._mainEl = null;
-    this._appVersion = "";
+    this._appVersion = packageInfo.version + " (web)";
   }
 
   mount(parentEl) {
@@ -61,7 +62,7 @@ export class SettingsTabView extends BusComponent {
     const current = stores.connection.getConnection();
     const accountId = stores.session.vaultAccountId() || "Unknown";
     const deviceId = stores.session.deviceId() || "—";
-    const activeNode = String(current && current.activeNode || "").trim();
+    const activeNode = stores.connection.activeNodeUrl() || "";
     const nodes = Array.isArray(current && current.nodes) ? current.nodes : [];
     const connectedNodes = nodes.filter((node) => node && node.ready === true && node.healthy === true);
     const mesh = current && current.mesh && typeof current.mesh === "object" ? current.mesh : {};
@@ -86,11 +87,12 @@ export class SettingsTabView extends BusComponent {
     if (!this._mainEl) return;
     this._mainEl.replaceChildren();
     const current = this.bus.stores.connection.getConnection();
-    const activeNode = String(current && current.activeNode || "").trim();
+    const activeNode = this.bus.stores.connection.activeNodeUrl() || "";
     const nodes = Array.isArray(current && current.nodes) ? current.nodes : [];
     const mesh = current && current.mesh && typeof current.mesh === "object" ? current.mesh : {};
     const meshPeers = Array.isArray(mesh.peers) ? mesh.peers : [];
     const nodeLabel = activeNode || "Not connected";
+    const peerCount = Number.isFinite(Number(mesh.peerCount)) ? Number(mesh.peerCount) : meshPeers.length;
     const seedEntries = Object.entries(mesh && mesh.seedReachable && typeof mesh.seedReachable === "object" ? mesh.seedReachable : {});
     const backup = current && current.backup && typeof current.backup === "object" ? current.backup : {};
     const wrapper = h("div", { className: "p-space-xl flex flex-col gap-space-lg max-w-3xl overflow-y-auto custom-scrollbar h-full" }, [
@@ -172,7 +174,9 @@ export class SettingsTabView extends BusComponent {
                 title: nodeId,
               }, health + " · " + transport + " · " + source + " · " + nodeId);
             })
-          : [h("p", { className: "text-on-surface-variant/60 text-label-technical font-label-technical", "data-testid": "system.mesh.peer.none" }, "No mesh peers reported")]),
+          : [h("p", { className: "text-on-surface-variant/60 text-label-technical font-label-technical", "data-testid": "system.mesh.peer.none" }, peerCount > 0
+            ? String(peerCount) + " mesh peers reported; individual peer details are unavailable."
+            : "No mesh peers reported")]),
       ]),
       h("section", {
         className: "bg-surface-container-low border border-outline-variant/30 rounded-lg p-space-lg flex flex-col gap-space-sm",

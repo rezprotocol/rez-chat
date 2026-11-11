@@ -89,8 +89,14 @@ Everyone involved was someone you already shared a group with.
 Grab the newest release from the
 [Releases page](https://github.com/rezprotocol/rez-chat/releases).
 
-The release marked **Latest** is `v0.6.0-rc.10`, and that is the one you want — no
-hunting through pre-releases.
+**For the current tester round (2026-11-10), use the hosted web chat at
+[chat.rezprotocol.io](https://chat.rezprotocol.io).** Refresh normally to get the
+latest client and keep your saved site data.
+
+The published desktop `v0.6.0-rc.10` is **on hold for new testers**. Its local
+root-key custody fix and current web recovery fixes have not shipped in a new
+accepted desktop package. A working network connection does not clear those
+release gates; do not recommend that download as the current tested client.
 
 > **If you already have Rez Chat installed, check its version.** Anything older
 > than `v0.6.0-rc.6` cannot connect since the relay reset. `v0.5.2` in

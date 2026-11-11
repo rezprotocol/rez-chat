@@ -575,7 +575,7 @@ export class ServerThreadsService extends BaseServerService {
       visibilityState: params.visibilityState,
       accessState: params.accessState,
     });
-    const view = this.decorateThreadView(thread);
+    const view = thread ? await this.#loadThreadSummary(params.threadId, thread) : null;
     // Archive/hide/lock is account-state, not just acting-device UI. Emit a
     // bridged thread.updated so every connected client of this account reacts —
     // today the acting renderer hand-patches, but a second device (multi-tenant

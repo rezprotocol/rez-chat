@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { MessageSendParams } from "../src/records/index.js";
+import { MessageSendParams, ThreadStateSetParams } from "../src/records/index.js";
 import { ChatServerApp } from "../src/server/app/ChatServerApp.js";
 import { makeSealDispatch } from "./support/sealDispatchDouble.js";
 
@@ -126,6 +126,21 @@ test("thread.get returns canonical summary fields rebuilt from persisted message
   assert.equal(Array.isArray(threads.threads), true);
   assert.equal(threads.threads.length, 1);
   assert.equal(threads.threads[0].lastMessagePreview, "hello from history");
+
+  const events = [];
+  server.bus.on("thread.updated", (event) => events.push(event));
+  for (const state of [
+    { visibilityState: "hidden" }, { visibilityState: "visible" },
+    { accessState: "locked" }, { accessState: "open" },
+  ]) {
+    const changed = await server.bus.call("thread.state", "set", new ThreadStateSetParams({ threadId, ...state }));
+    for (const row of [changed.thread, events.at(-1).thread]) {
+      assert.equal(row.lastMessagePreview, "hello from history");
+      assert.equal(row.lastActivityMsgId, "msg_summary_1");
+      assert.equal(row.lastActivityAtMs, 2000);
+      for (const [key, value] of Object.entries(state)) assert.equal(row[key], value);
+    }
+  }
 });
 
 test("message.send normalizes messageId into result, events, and persisted message rows", async () => {

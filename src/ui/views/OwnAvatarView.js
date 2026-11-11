@@ -9,6 +9,8 @@ export class OwnAvatarView extends BusComponent {
   #fallbackLabel;
   #sizeClass;
   #roundedClass;
+  #revision = 0;
+  #pending = null;
 
   constructor({ bus, accountId, label, sizeClass, roundedClass } = {}) {
     super({ bus });
@@ -24,6 +26,7 @@ export class OwnAvatarView extends BusComponent {
     this._listen("session.avatarChanged", (evt) => {
       const changedId = evt && typeof evt.accountId === "string" ? evt.accountId : "";
       if (!changedId || changedId === this.#accountId) {
+        this.#revision += 1;
         OWN_AVATAR_CACHE.delete(this.#accountId);
         this.render();
       }
@@ -40,6 +43,15 @@ export class OwnAvatarView extends BusComponent {
   #resolveLabel() {
     const fromList = this.bus.stores.session.labelForAccountId(this.#accountId);
     return fromList || this.#fallbackLabel || "Account";
+  }
+
+  setAccount(accountId, label) {
+    const id = typeof accountId === "string" ? accountId.trim() : "";
+    if (id === this.#accountId && label === this.#fallbackLabel) return;
+    if (id !== this.#accountId) this.#revision += 1;
+    this.#accountId = id;
+    this.#fallbackLabel = typeof label === "string" ? label : "";
+    this.render();
   }
 
   render() {
@@ -66,17 +78,22 @@ export class OwnAvatarView extends BusComponent {
   }
 
   #fetchAvatar() {
+    const accountId = this.#accountId;
+    const revision = this.#revision;
     const mountVersion = this._captureMountVersion();
-    this.bus.call("session", "getOwnAvatar", { accountId: this.#accountId }).then((result) => {
-      if (!this._isMountVersionCurrent(mountVersion)) return;
+    const pending = accountId + ":" + revision + ":" + mountVersion;
+    if (this.#pending === pending) return;
+    this.#pending = pending;
+    this.bus.call("session", "getOwnAvatar", { accountId }).then((result) => {
+      if (!this._isMountVersionCurrent(mountVersion) || accountId !== this.#accountId || revision !== this.#revision) return;
       const b64 = result && typeof result.avatarDataB64 === "string" ? result.avatarDataB64 : "";
       if (b64) {
         const dataUrl = "data:image/jpeg;base64," + b64;
-        OWN_AVATAR_CACHE.set(this.#accountId, dataUrl);
+        OWN_AVATAR_CACHE.set(accountId, dataUrl);
         this.render();
       }
     }).catch((err) => {
       this.bus.emit("app.error", { source: "OwnAvatarView", message: "avatar fetch failed", severity: "info", err });
-    });
+    }).finally(() => { if (this.#pending === pending) this.#pending = null; });
   }
 }

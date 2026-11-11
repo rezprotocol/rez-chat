@@ -49,12 +49,19 @@ test("SessionStore.isSelf() matches either identity slot", () => {
   assert.equal(s.isSelf(null), false);
 });
 
-test("SessionStore.isSelf() matches accountList hints", () => {
+test("SessionStore.isSelf() excludes saved accounts outside the active account", () => {
   const s = makeStore();
+  s.setAccountList([{ id: "vault_a", label: "Alice", accountIdHint: "hinted_a" }, { id: "vault_b", label: "Bob", accountIdHint: "hinted_b" }]);
+  s.setSelectedAccountId("vault_a");
+  assert.equal(s.isSelf("hinted_a"), true, "selected account hint works before connect");
+  assert.equal(s.isSelf("hinted_b"), false);
   s.setUnlocked({ accountId: "vault_a", deviceId: "dev_a", ownerAccountId: "peer_a" });
-  s.setAccountList([{ accountIdHint: "hinted_a" }, { accountIdHint: "hinted_b" }]);
+  s.setSelectedAccountId("vault_b");
+  assert.equal(s.activeAccountId(), "vault_a", "unlocked identity wins stale picker selection");
+  assert.equal(s.selfLabel(), "Alice");
   assert.equal(s.isSelf("hinted_a"), true);
-  assert.equal(s.isSelf("hinted_b"), true);
+  assert.equal(s.isSelf("hinted_b"), false);
+  assert.equal(s.isSelf("vault_b"), false);
 });
 
 test("SessionStore.isUnlocked() reflects status", () => {

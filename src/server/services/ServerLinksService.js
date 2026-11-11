@@ -74,6 +74,7 @@ export class ServerLinksService extends BaseServerService {
   constructor({
     bus,
     linkPreviewStore,
+    cacheEnabled = true,
     ownerAccountId = null,
     clock = () => Date.now(),
     fetchImpl = null,
@@ -81,8 +82,8 @@ export class ServerLinksService extends BaseServerService {
     logger = console,
   } = {}) {
     super({ bus, ownerAccountId, logger });
-    if (!linkPreviewStore) throw new Error("ServerLinksService requires linkPreviewStore");
-    this.#store = linkPreviewStore;
+    if (cacheEnabled && !linkPreviewStore) throw new Error("ServerLinksService requires linkPreviewStore");
+    this.#store = cacheEnabled ? linkPreviewStore : null;
     this.#clock = clock;
     this.#fetch = typeof fetchImpl === "function" ? fetchImpl : fetchPinnedUrl;
     if (typeof dnsLookupImpl !== "function") throw new Error("ServerLinksService requires dnsLookupImpl");
@@ -103,14 +104,14 @@ export class ServerLinksService extends BaseServerService {
     if (owner && !UNFURL_RATE_LIMITER.record(owner, this.#clock())) {
       throw new Error("links.unfurl: rate limit exceeded");
     }
-    if (!params.forceRefresh) {
+    if (this.#store && !params.forceRefresh) {
       const cached = await this.#store.get(url);
       if (cached) {
         return new LinksUnfurlResult({ preview: cached, cached: true });
       }
     }
     const preview = await this.#fetchPreview(url);
-    await this.#store.put(preview).catch((err) => {
+    if (this.#store) await this.#store.put(preview).catch((err) => {
       this.logger.warn("[ServerLinksService] cache put failed",
         err && err.message ? err.message : err);
     });
@@ -226,7 +227,11 @@ export class ServerLinksService extends BaseServerService {
     let url = initialUrl;
     let hops = 0;
     while (true) {
-      const pinnedAddress = await resolveSafeUrlWithDns(url, this.#dnsLookup);
+      let dnsTimer;
+      const pinnedAddress = await Promise.race([
+        resolveSafeUrlWithDns(url, this.#dnsLookup),
+        new Promise((resolve, reject) => { dnsTimer = setTimeout(() => reject(new Error("dns_timeout")), FETCH_TIMEOUT_MS); }),
+      ]).finally(() => clearTimeout(dnsTimer));
       const response = await fetchWithTimeout(this.#fetch, url, {
         ...init,
         redirect: "manual",
