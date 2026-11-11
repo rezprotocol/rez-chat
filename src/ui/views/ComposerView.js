@@ -241,7 +241,7 @@ export class ComposerView extends BusComponent {
       "data-testid": "composer.send",
     }, [materialIcon("send")]);
 
-    const previewRow = h("div", { className: "hidden" });
+    const previewRow = h("div", { className: "hidden", "data-testid": "composer.attachment" });
     this.#renderStagedPreview(previewRow);
     const replyChip = h("div", { className: "hidden" });
     this.#replyChipEl = replyChip;

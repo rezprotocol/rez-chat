@@ -1,0 +1,34 @@
+import "../../src/styles/fonts.css";
+import "../../src/styles/tailwind.css";
+import "@rezprotocol/ui/framework/theme.css";
+import "../../src/ui/styles.css";
+import { BrowserUpdateService } from "../../src/ui/services/BrowserUpdateService.js";
+import { BrowserUpdateBannerView } from "../../src/ui/views/BrowserUpdateBannerView.js";
+import { ComposerView } from "../../src/ui/views/ComposerView.js";
+import { ChatBus } from "../../src/ui/root/ChatBus.js";
+import { ThreadStore } from "../../src/ui/stores/ThreadStore.js";
+import { UiStateStore } from "../../src/ui/stores/UiStateStore.js";
+import { ChatThread } from "../../src/records/index.js";
+import { ThreadQueries } from "../../src/ui/queries/ThreadQueries.js";
+
+const bus = new ChatBus();
+bus.stores.threads = new ThreadStore({ bus });
+bus.stores.uiState = new UiStateStore({ bus });
+bus.stores.threads.upsertThread(new ChatThread({ threadId: "th_update_qa", threadType: "direct", peerAccountId: "rez:acct:qa", peerInboxId: "inbox:qa" }));
+bus.stores.uiState.setSelectedThreadId("th_update_qa");
+bus.queries = { threads: new ThreadQueries({ stores: bus.stores }) };
+bus.services.messages = { getReplyDraft() { return ""; } };
+new ComposerView({ bus }).mount(document.getElementById("composer"));
+const banner = new BrowserUpdateBannerView();
+const service = new BrowserUpdateService((entry) => banner.setUpdate(entry));
+service.start();
+const loadedEntry = document.querySelector('script[type="module"][src]').getAttribute("src");
+if (loadedEntry.endsWith("aaaaaaaa.js")) localStorage.setItem("update-qa-preserved", "saved state survives refresh");
+document.getElementById("loaded").textContent = loadedEntry;
+document.getElementById("preserved").textContent = localStorage.getItem("update-qa-preserved");
+document.getElementById("publish").addEventListener("click", async () => {
+  await fetch("/__qa_publish", { method: "POST" });
+  window.dispatchEvent(new Event("focus"));
+});
+document.getElementById("check").addEventListener("click", () => window.dispatchEvent(new Event("online")));
+document.getElementById("stop").addEventListener("click", () => { service.stop(); banner.stop(); });

@@ -23,6 +23,7 @@ self.addEventListener("fetch", (event) => {
   if (request.method !== "GET") return;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin || isNetworkOnly(url)) return;
+  if (request.cache === "no-store" || (url.pathname === "/" && url.searchParams.has("__rez_update_check"))) return;
 
   if (request.mode === "navigate") {
     event.respondWith((async () => {

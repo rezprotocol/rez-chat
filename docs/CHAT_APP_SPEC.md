@@ -194,6 +194,24 @@ Underlying rez-node WS message families consumed for paid services: `settlement.
 
 ## 13. Fail-Closed Gating
 
+Browser clients compare their loaded immutable module entry with the current
+same-origin generated app HTML. Checks run at startup, once a minute while
+visible, and on focus, visibility return or reconnect; concurrent wakeups
+share one bounded request. Probes bypass HTTP and service-worker caches, omit
+credentials, reject redirects and validate the same-origin asset identity.
+Offline, malformed or failed checks never imply an update and retry without
+blocking chat. Stopped or superseded checks cannot announce an update.
+
+A changed entry shows an accessible "New version available" notice with
+Refresh and Later. Refresh is user initiated and confirms before discarding
+visible unsent text or a staged attachment; it does not clear saved account or
+message storage. Later suppresses that entry for the current app lifetime;
+a subsequent different entry is announced. Returning to the running entry
+clears the notice. Desktop/native update flows retain their own owners.
+Development source modules are excluded because they have no immutable build
+identity. Tabs loaded before this feature require one manual refresh to gain
+the detector; the feature never forcibly reloads an already open client.
+
 The active unlocked account is the sole self identity. Other accounts saved in
 the same vault do not become self senders, roster entries or message owners.
 Before unlock, only the selected account's hint may supply self identity.

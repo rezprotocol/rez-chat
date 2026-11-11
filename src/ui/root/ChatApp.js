@@ -47,10 +47,15 @@ import { UiNavigationService } from "../services/bus/UiNavigationService.js";
 import { LinksService } from "../services/bus/LinksService.js";
 import { SystemNoticesService } from "../services/bus/SystemNoticesService.js";
 import { UpdateAvailableBannerView } from "../views/UpdateAvailableBannerView.js";
+import { BrowserUpdateBannerView } from "../views/BrowserUpdateBannerView.js";
+import { BrowserUpdateService } from "../services/BrowserUpdateService.js";
 import { AccountBoundaryService } from "../services/AccountBoundaryService.js";
 import { browserChatRuntimeDbName } from "../../client/runtime/browserRuntimeStorage.js";
 
 export class ChatApp {
+  #browserUpdateBanner = null;
+  #browserUpdates = null;
+
   constructor({
     mountEl,
     theme = {},
@@ -80,6 +85,11 @@ export class ChatApp {
     this._createHost();
     this._updateBanner = new UpdateAvailableBannerView();
     this._updateBanner.start();
+    if (!hasDesktopRuntimeBridge() && !globalThis.rezMobile && globalThis.__REZ_MOBILE__ !== true) {
+      this.#browserUpdateBanner = new BrowserUpdateBannerView();
+      this.#browserUpdates = new BrowserUpdateService((entry) => this.#browserUpdateBanner.setUpdate(entry));
+      this.#browserUpdates.start();
+    }
     this._offSession = this.bus.stores.session.onChange(() => this._syncSceneFromSession());
     this._offUiState = this.bus.stores.uiState.onChange(() => this._syncSceneFromSession());
   }
@@ -290,6 +300,14 @@ export class ChatApp {
     if (this._updateBanner) {
       this._updateBanner.stop();
       this._updateBanner = null;
+    }
+    if (this.#browserUpdates) {
+      this.#browserUpdates.stop();
+      this.#browserUpdates = null;
+    }
+    if (this.#browserUpdateBanner) {
+      this.#browserUpdateBanner.stop();
+      this.#browserUpdateBanner = null;
     }
     for (const service of this._services || []) {
       if (service && typeof service.stop === "function") {
