@@ -1,5 +1,9 @@
 # One message lifecycle for images — 2026-11-10
 
+Latest: the November 11 file-drop and first-member group-delivery update is
+committed, pushed on `feat/hosted-cluster`, and deployed. See the final release
+record below; earlier local-status notes are historical.
+
 Status: committed, pushed and publicly deployed **November 10, 2026 at
 6:20 p.m. America/Chicago** (2026-11-11 00:20:09 UTC). Implementation, focused
 recovery/security checks, full clean suite and live Chrome/Firefox checks pass.
@@ -274,3 +278,76 @@ quota/retention work remains open. Legacy files with bytes lost by old clients
 may need resend. Published desktop packaging/custody gates remain open; no
 new native artifact is certified. iPhone and Swift sources and unrelated WIP
 remain untouched. Core/SDK/Node sources are not changed in this slice.
+
+## November 11 browser release — deployed
+
+Implementation commit: `5a9ea750bbb729a2ec9a3272ce5a08e0e48ac467` on
+`feat/hosted-cluster`, pushed to origin. Public promotion completed at
+**3:29:26 p.m. America/Chicago on November 11, 2026**
+(`2026-11-11T21:29:26Z`). No merge into or push to `master` occurred.
+
+Release: `/opt/rez/releases/web-chat-groups-20261111T211203Z/`.
+Public script: `/assets/index-CEPI9pYF.js`. Public entry SHA-256:
+`608cdc68b604b99b66f5a3b5356b6004a046c741e43c0c20aac6e38338d9f47d`.
+The previous entry and old assets remain available for rollback. Nineteen
+artifact files were checked before staging; public HTML was promoted atomically
+only after checking the previous entry for drift. External fetches matched
+both the tested HTML and JavaScript bytes. Three public readiness samples
+from 21:30:10Z through 21:30:31Z reported `ok=true`, `degraded=false`, with
+storage and Redis healthy. The public browser root loaded the new script
+without console errors. The temporary candidate HTML was removed afterward.
+
+The release was rebuilt from clean HEAD archives of Core, SDK, Node, UI and
+Chat plus exactly this task's selected changes, including selective hunks in
+the three mixed files. Every one of the thirteen selected candidate files
+was compared byte-for-byte with the implementation commit. Unrelated storage,
+identity, preview, packaging, test-fixture work and existing file deletions
+remain outside the commit and deployment. The deleted branding/font assets
+were available from HEAD in the temporary build snapshot; the checkout was
+not restored. The root `plans/MESSAGE_COMMIT_ACK_PLAN.md` policy update remains
+in the non-Git workspace; the same decision is committed in `CHAT_APP_SPEC.md`.
+
+Final verification: the clean-source normal suite passed **1,119 tests**,
+with three pre-existing gated desktop/live tests unrun, followed by **2/2 SDK
+portability tests**. The clean three-account relay test passed, including
+first-member Delivered with Carol offline, restart catch-up, matching IDs and
+exact bytes, and two intentional sends producing exactly two rows per account.
+After the final picker change, 41 focused receipt/architecture checks passed
+and the production build with integrity injection passed. The default full
+runner initially stalled; the successful full run used four files at a time.
+Missing SQLite native bindings initially failed desktop checks; the same
+existing dependency version (12.11.1) from a previously built candidate was
+reused only in the temporary snapshot, after which all active tests passed.
+No dependency or tooling configuration was added or changed.
+
+Fresh browser origins using the exact final release build and real hosted
+network passed: direct invite; recipient closed during text/image sends;
+sender reload before receipt; recipient reconnect and decoded image catch-up;
+both rows become Delivered; three-account group creation through a non-creator
+invite; exactly one image rendered per account; group image and text show
+Delivered. The final UI fixture passed picker selection/cancellation, whole-
+window drops, explicit Send, size/multiple-file limits, stale reads, disabled
+threads, overlay/listener cleanup and first-member status wording. The picker
+now retains its hidden input until selection or cancellation rather than
+detaching it immediately; this fixes the acceptance-run file chooser failure.
+Its regression waits for the asynchronous preview rather than assuming a
+fixed number of animation frames.
+
+Focused audit remains clear against the updated Chat spec and commit-ack plan:
+Chat owns receipt and group semantics, SDK owns generic byte/crypto behavior,
+stores own persistence, and views own DOM/drop/picker presentation. Shared
+receipt authorization and status application have one owner. No new split-
+brain, boundary/SSOT, hidden-transform or god-class finding was introduced.
+Dead/superseded status branches and duplicate status application were removed;
+the obsolete immediate picker detachment was replaced. Existing large services
+were not comprehensively decomposed or audited. Native packaging and the
+remaining gated live-mesh suite were not certified by this browser release.
+
+Acceptance evidence: `/tmp/rez-chat-release-20261111-eW3Ibo/`, including
+`full-final.log`, `clean-live-group.log`, `final-focused.log`, `build-final.log`,
+`public-verification.json`, the staged patch, package manifest, source revisions
+and `browser-group-proof.jpg`. Initial diagnostics are retained separately.
+No account data, mailbox state, node service, preview service or desktop/mobile
+package was reset or redeployed. Existing tabs need a normal refresh; saved
+legacy duplicate rows are retained, and Delivered means at least one member,
+not every member or a read receipt.
