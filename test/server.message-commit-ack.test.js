@@ -338,6 +338,46 @@ test("normal delivery: signed send → admitted commit → verified MessageCommi
   assert.equal((await pendingOf(alice)).length, 0);
 });
 
+test("signed group text requires a verified member commit proof; one member confirms Delivered after restart", async (t) => {
+  const { alice, bob, bobAccount } = await setupPair();
+  t.after(() => teardown(alice, bob));
+  const kv = alice.app.bus.stores.threadStore.kv;
+  await kv.set("app:threads/" + alice.account.accountId + "/" + THREAD,
+    { threadId: THREAD, threadType: "group", groupId: "g_proof", createdAtMs: 1000 });
+  const groups = alice.app.bus.stores.groupStore;
+  await groups.ensureGroup({ ownerAccountId: alice.account.accountId, groupId: "g_proof", createdBy: alice.account.accountId, title: "Proof" });
+  for (const accountId of [alice.account.accountId, bobAccount.accountId]) {
+    await groups.ensureMembership({ ownerAccountId: alice.account.accountId, groupId: "g_proof", accountId, role: "member" });
+  }
+  await sendSigned(alice, { messageId: "group-proof", text: "hi team" });
+  assert.equal((await pendingOf(alice)).length, 0, "group sends do not start the direct-message retry loop");
+  await alice.app.bus.services.messages.stop();
+  const message = await rowOf(alice, "group-proof");
+  const fingerprints = await alice.app.bus.stores.threadStore.listOriginalFingerprints({ threadId: THREAD });
+  assert.equal(fingerprints.length, 1);
+  const proof = new MessageCommitAckV1(ackFromAccount(bobAccount, {
+    messageId: message.messageId, messageFingerprint: fingerprints[0],
+  }));
+  // Use a fresh service instance, with no RAM receipt correlation.
+  const { ServerMessagesService } = await import("../src/server/services/ServerMessagesService.js");
+  const messages = new ServerMessagesService({ bus: alice.app.bus,
+    threadStore: alice.app.bus.stores.threadStore, threadIndex: alice.app.bus.stores.threadIndex,
+    groupStore: groups, deviceFanoutStore: alice.app.bus.stores.deviceFanoutStore, ownerAccountId: alice.account.accountId });
+  t.after(() => messages.stop());
+  await messages.handleDeliveryAck({ threadId: THREAD, senderAccountId: bobAccount.accountId, messageIds: [message.messageId] });
+  assert.equal((await rowOf(alice, message.messageId)).status, "sent", "legacy member ack cannot downgrade proof requirements");
+  const outsider = makeAccount();
+  await messages.handleCommitAck(new MessageCommitAckV1(ackFromAccount(outsider, {
+    messageId: message.messageId, messageFingerprint: fingerprints[0],
+  })), { senderAccountId: outsider.accountId });
+  assert.equal((await rowOf(alice, message.messageId)).status, "sent", "valid non-member proof is rejected");
+  const badProof = new MessageCommitAckV1({ ...proof.toJSON(), sig: bytesToBase64(new Uint8Array(64)) });
+  await messages.handleCommitAck(badProof, { senderAccountId: bobAccount.accountId });
+  assert.equal((await rowOf(alice, message.messageId)).status, "sent", "member identity alone cannot replace a valid signature");
+  await messages.handleCommitAck(proof, { senderAccountId: bobAccount.accountId });
+  assert.equal((await rowOf(alice, message.messageId)).status, "delivered");
+});
+
 test("a commit ack delivered before dispatch resolves consumes the pre-opened intent without leaving an immortal retry", async (t) => {
   const { network, alice, bob } = await setupPair();
   t.after(() => teardown(alice, bob));

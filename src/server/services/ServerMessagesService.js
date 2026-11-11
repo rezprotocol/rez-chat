@@ -535,9 +535,9 @@ export class ServerMessagesService extends BaseServerService {
     // The outbound row and receipt route exist before dispatch can synchronously
     // return a receiver acknowledgement. The durable route also survives restart.
     const receiptThread = await this.#threadStore.getThread(threadId);
-    if (receiptThread && receiptThread.threadType !== "group") {
+    if (receiptThread) {
       if (!signedFingerprint) await this.#threadStore.rememberDeliveryThread(threadId, messageId);
-      this.#ackPending.set(messageId, threadId);
+      if (!signedFingerprint) this.#ackPending.set(messageId, threadId);
     }
     let eventId = "";
     let messageQueued = false;
@@ -1223,13 +1223,14 @@ export class ServerMessagesService extends BaseServerService {
         || await this.#threadStore.deliveryThreadId(messageId);
       if (!resolvedThreadId) continue;
       const thread = await this.#threadStore.getThread(resolvedThreadId);
-      const expectedSender = thread && thread.threadType !== "group"
-        && typeof thread.peerAccountId === "string" ? thread.peerAccountId : "";
-      if (!expectedSender || expectedSender !== authenticatedSender) {
-        this.logger.warn("[ServerMessagesService] delivery ack sender mismatch for " + messageId
-          + " (authenticated " + authenticatedSender + ", expected " + (expectedSender || "<none>") + "); ignoring");
+      if (!await this.#receiptSenderAllowed(thread, authenticatedSender)) {
+        this.logger.warn("[ServerMessagesService] delivery ack sender is not a recipient for " + messageId + "; ignoring");
         continue;
       }
+      const outbound = await this.#threadStore.getMessageByIdempotency({
+        threadId: resolvedThreadId, senderKey: this.ownerAccountId, messageId,
+      });
+      if (!outbound || outbound.senderAccountId !== this.ownerAccountId) continue;
       // Hard cutover by message regime (plan §7 decision 1): a SIGNED send's
       // "delivered" is a PROOF carried only by a verified MessageCommitAck.
       // A legacy delivery ack for a message with an open pending-commit row
@@ -1237,28 +1238,32 @@ export class ServerMessagesService extends BaseServerService {
       // only — it was already counted for link recovery — and must not flip
       // the status; the retry loop keeps running until real proof arrives.
       const pendingCommit = await this.#threadStore.getPendingCommit({ messageId });
-      if (pendingCommit) {
+      if (pendingCommit || (outbound.payload && outbound.payload.contentHash)) {
         this.logger.warn("[ServerMessagesService] legacy delivery ack for signed message "
           + messageId + " ignored for status; awaiting MessageCommitAck proof");
         continue;
       }
-      await this.#threadStore.setMessageStatus({
-        threadId: resolvedThreadId,
-        messageId,
-        status: "delivered",
-        acceptedAtMs: now,
-      });
-      this.#queuedMessages = this.#queuedMessages.filter((entry) => !(entry.threadId === resolvedThreadId && entry.messageId === messageId));
-      this.#ackPending.delete(messageId);
-      await this.#threadStore.forgetDeliveryThread(messageId);
-      this.#discardQueueTracking(messageId);
-      this._emit("message.status", new MessageStatusEvent({
-        threadId: resolvedThreadId,
-        messageId,
-        status: "delivered",
-        acceptedAtMs: now,
-      }));
+      await this.#markDelivered(resolvedThreadId, messageId, now);
     }
+  }
+
+  async #receiptSenderAllowed(thread, senderAccountId) {
+    if (!thread || !senderAccountId || senderAccountId === this.ownerAccountId) return false;
+    if (thread.threadType !== "group") return thread.peerAccountId === senderAccountId;
+    const member = await this.#groupStore.getMembership({
+      ownerAccountId: this.ownerAccountId, groupId: thread.groupId, accountId: senderAccountId,
+    });
+    return Boolean(member && member.state === "active");
+  }
+
+  async #markDelivered(threadId, messageId, now) {
+    const stored = await this.#threadStore.setMessageStatus({ threadId, messageId, status: "delivered", acceptedAtMs: now });
+    if (!stored || stored.status !== "delivered") throw new Error("Delivery status was not committed");
+    this.#queuedMessages = this.#queuedMessages.filter((entry) => !(entry.threadId === threadId && entry.messageId === messageId));
+    this.#ackPending.delete(messageId);
+    await this.#threadStore.forgetDeliveryThread(messageId);
+    this.#discardQueueTracking(messageId);
+    this._emit("message.status", new MessageStatusEvent({ threadId, messageId, status: "delivered", acceptedAtMs: now }));
   }
 
   // ── MessageCommitAck (plans/MESSAGE_COMMIT_ACK_PLAN.md) ───────────────────
@@ -1357,6 +1362,14 @@ export class ServerMessagesService extends BaseServerService {
       }
     }
 
+    const resolvedThreadId = pending ? pending.threadId : record.threadId;
+    const thread = await this.#threadStore.getThread(resolvedThreadId);
+    if (!thread) throw new Error("commit ack references a missing thread");
+    if (!await this.#receiptSenderAllowed(thread, authedSender)) {
+      this.logger.warn("[ServerMessagesService] commit ack sender is not a recipient for " + record.messageId + "; ignoring");
+      return true;
+    }
+
     // Steps 2–5 — fail-closed acceptance (self-certifying recipient identity,
     // deviceId self-cert, signature, verifyAccountAuthority with CURRENT
     // revocation state). A direct-mode ack carries no revocable credential;
@@ -1394,34 +1407,12 @@ export class ServerMessagesService extends BaseServerService {
 
     // Terminal success: persist the user-visible status before consuming its
     // durable proof intent. A failed status write leaves the pending commit
-    // available for an exact retry. Group rows never flip on a member ack
-    // (DT-004); the verified evidence is their whole consumption.
-    const resolvedThreadId = pending ? pending.threadId : record.threadId;
-    const thread = await this.#threadStore.getThread(resolvedThreadId);
-    if (!thread) throw new Error("commit ack references a missing thread");
-    if (thread.threadType !== "group") {
-      const now = this.#clock();
-      await this.#threadStore.setMessageStatus({
-        threadId: resolvedThreadId,
-        messageId: record.messageId,
-        status: "delivered",
-        acceptedAtMs: now,
-      });
-    }
+    // available for an exact retry. In groups, Delivered confirms at least
+    // one authenticated member's commit, never an all-member delivery count.
+    await this.#markDelivered(resolvedThreadId, record.messageId, this.#clock());
     if (pending) {
       await this.#threadStore.deletePendingCommit({ messageId: record.messageId });
       this.#scheduleCommitSweep();
-    }
-    if (thread.threadType !== "group") {
-      this.#queuedMessages = this.#queuedMessages.filter((entry) => !(entry.threadId === resolvedThreadId && entry.messageId === record.messageId));
-      this.#ackPending.delete(record.messageId);
-      this.#discardQueueTracking(record.messageId);
-      this._emit("message.status", new MessageStatusEvent({
-        threadId: resolvedThreadId,
-        messageId: record.messageId,
-        status: "delivered",
-        acceptedAtMs: this.#clock(),
-      }));
     }
     return true;
   }

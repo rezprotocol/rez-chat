@@ -54,6 +54,7 @@ export class ComposerView extends BusComponent {
   #threadId;
   #disabled;
   #replyDraftOff;
+  #stageVersion = 0;
 
   constructor({ bus } = {}) {
     super({ bus });
@@ -81,6 +82,7 @@ export class ComposerView extends BusComponent {
       this._subscribe(uiStateStore, (evt) => {
         const type = evt && typeof evt.type === "string" ? evt.type : "";
         if (type === "ui.selectedThread.changed") {
+          this.#stageVersion += 1;
           this.#staged = null;
           this.render();
         }
@@ -114,6 +116,7 @@ export class ComposerView extends BusComponent {
   }
 
   unmount() {
+    this.#stageVersion += 1;
     if (typeof this.#replyDraftOff === "function") {
       this.#replyDraftOff();
       this.#replyDraftOff = null;
@@ -387,10 +390,11 @@ export class ComposerView extends BusComponent {
     if (!input || !sendBtn || !errorEl || !previewRow || !attachBtn) return;
 
     attachBtn.addEventListener("click", () => {
-      this.#pickFile(errorEl, previewRow);
+      this.#pickFile();
     });
 
     const send = () => {
+      if (this.#disabled) return;
       const text = String(input.value || "").trim();
       if (this.#staged) {
         const attachment = this.#staged;
@@ -440,18 +444,20 @@ export class ComposerView extends BusComponent {
     });
   }
 
-  #pickFile(errorEl, previewRow) {
+  #pickFile() {
+    const threadId = this.#threadId;
     const fileInput = document.createElement("input");
     fileInput.type = "file";
     fileInput.accept = ACCEPT_ATTR;
     fileInput.style.display = "none";
     fileInput.addEventListener("change", () => {
       const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
-      if (file) this.#stageFromFile(file, errorEl, previewRow);
+      if (file && threadId === this.#threadId) this.stageFile(file);
+      fileInput.remove();
     });
+    fileInput.addEventListener("cancel", () => fileInput.remove(), { once: true });
     document.body.appendChild(fileInput);
     fileInput.click();
-    document.body.removeChild(fileInput);
   }
 
   // Public entry point used by ThreadPanelView's drag/drop handler. Returns
@@ -460,12 +466,25 @@ export class ComposerView extends BusComponent {
   // missing refs).
   stageFile(file) {
     if (!(file instanceof File) && !(file instanceof Blob)) return false;
-    if (this.#disabled || !this.#threadId) return false;
+    if (!this.canStageFile()) return false;
     const errorEl = this.#errorEl;
     const previewRow = this.#previewRowEl;
     if (!errorEl || !previewRow) return false;
-    this.#stageFromFile(file, errorEl, previewRow);
-    return true;
+    return this.#stageFromFile(file, errorEl, previewRow);
+  }
+
+  canStageFile() {
+    return !this.#disabled && Boolean(this.#threadId);
+  }
+
+  stageFiles(files) {
+    if (!this.canStageFile() || !files || files.length === 0) return false;
+    if (files.length !== 1) {
+      this.#errorEl.textContent = "Attach one file at a time.";
+      this.#errorEl.classList.remove("hidden");
+      return false;
+    }
+    return this.stageFile(files[0]);
   }
 
   #stageFromFile(file, errorEl, previewRow) {
@@ -473,10 +492,13 @@ export class ComposerView extends BusComponent {
       const mb = Math.round(MAX_FILE_BYTES / (1024 * 1024));
       errorEl.textContent = "File too large (max " + mb + "MB).";
       errorEl.classList.remove("hidden");
-      return;
+      return false;
     }
+    const version = ++this.#stageVersion;
+    const threadId = this.#threadId;
     const reader = new FileReader();
     reader.onload = () => {
+      if (version !== this.#stageVersion || threadId !== this.#threadId || !this._rootEl || this.#disabled) return;
       const arrayBuffer = reader.result;
       const bytes = new Uint8Array(arrayBuffer);
       let binary = "";
@@ -497,12 +519,15 @@ export class ComposerView extends BusComponent {
       errorEl.classList.add("hidden");
       errorEl.textContent = "";
       this.#renderStagedPreview(previewRow);
+      this.#inputEl.focus();
     };
     reader.onerror = () => {
+      if (version !== this.#stageVersion || !this._rootEl) return;
       errorEl.textContent = "Failed to read file.";
       errorEl.classList.remove("hidden");
     };
     reader.readAsArrayBuffer(file);
+    return true;
   }
 
   #renderStagedPreview(previewRow) {

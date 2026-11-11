@@ -59,7 +59,9 @@ export class ThreadPanelView extends BusComponent {
   }
 
   #wireDragDrop() {
-    const root = this._rootEl;
+    // File drops anywhere in the active chat window target its selected
+    // conversation, including the sidebar. Prevent browser file navigation.
+    const root = window;
     if (!root) return;
     const hasFiles = (evt) => {
       const dt = evt.dataTransfer;
@@ -76,12 +78,12 @@ export class ThreadPanelView extends BusComponent {
       if (!hasFiles(evt)) return;
       evt.preventDefault();
       this.#dragDepth += 1;
-      this.#showOverlay();
+      if (this.#composer.canStageFile()) this.#showOverlay();
     };
     const onDragOver = (evt) => {
       if (!hasFiles(evt)) return;
       evt.preventDefault();
-      if (evt.dataTransfer) evt.dataTransfer.dropEffect = "copy";
+      if (evt.dataTransfer) evt.dataTransfer.dropEffect = this.#composer.canStageFile() ? "copy" : "none";
     };
     const onDragLeave = (evt) => {
       if (!hasFiles(evt)) return;
@@ -99,16 +101,12 @@ export class ThreadPanelView extends BusComponent {
       this.#hideOverlay();
       const files = evt.dataTransfer && evt.dataTransfer.files ? evt.dataTransfer.files : null;
       if (!files || files.length === 0) return;
-      // Single-file staging matches the composer's single-attachment model.
-      const file = files[0];
-      if (this.#composer && typeof this.#composer.stageFile === "function") {
-        this.#composer.stageFile(file);
-      }
+      this.#composer.stageFiles(files);
     };
-    root.addEventListener("dragenter", onDragEnter);
-    root.addEventListener("dragover", onDragOver);
-    root.addEventListener("dragleave", onDragLeave);
-    root.addEventListener("drop", onDrop);
+    root.addEventListener("dragenter", onDragEnter, true);
+    root.addEventListener("dragover", onDragOver, true);
+    root.addEventListener("dragleave", onDragLeave, true);
+    root.addEventListener("drop", onDrop, true);
     this.#dragHandlers = { onDragEnter, onDragOver, onDragLeave, onDrop };
   }
 
@@ -124,10 +122,10 @@ export class ThreadPanelView extends BusComponent {
 
   unmount() {
     if (this._rootEl && this.#dragHandlers) {
-      this._rootEl.removeEventListener("dragenter", this.#dragHandlers.onDragEnter);
-      this._rootEl.removeEventListener("dragover", this.#dragHandlers.onDragOver);
-      this._rootEl.removeEventListener("dragleave", this.#dragHandlers.onDragLeave);
-      this._rootEl.removeEventListener("drop", this.#dragHandlers.onDrop);
+      window.removeEventListener("dragenter", this.#dragHandlers.onDragEnter, true);
+      window.removeEventListener("dragover", this.#dragHandlers.onDragOver, true);
+      window.removeEventListener("dragleave", this.#dragHandlers.onDragLeave, true);
+      window.removeEventListener("drop", this.#dragHandlers.onDrop, true);
       this.#dragHandlers = null;
     }
     if (this.#header) { this.#header.unmount(); this.#header = null; }

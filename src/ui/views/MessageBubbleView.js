@@ -350,6 +350,10 @@ export class MessageBubbleView extends BusComponent {
         "data-message-status": String(message.status || "").trim() || "delivered",
       };
       if (state.title) statusRowAttrs.title = state.title;
+      if (thread.threadType === "group" && message.status === "delivered") {
+        statusRowAttrs.title = "Delivered to at least one group member.";
+        statusRowAttrs["aria-label"] = "Delivered to at least one group member";
+      }
       const statusRow = isTombstoned ? null : h("div", statusRowAttrs, [
         h("span", null, state.label),
         materialIcon(state.icon, { size: 14, className: state.iconClass }),

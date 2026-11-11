@@ -124,7 +124,7 @@ test("no image message is created if the byte transfer fails", async (t) => {
   assert.equal((await alice.rows()).length, 0);
 });
 
-test("a group attachment is delivered to every member without registering expected receipts", async () => {
+test("group attachments register receipt recovery for the message, never its byte chunks", async () => {
   class Kv {
     constructor() { this.m = new Map(); }
     get(k) { return this.m.get(k); }
@@ -151,6 +151,7 @@ test("a group attachment is delivered to every member without registering expect
     async getThread() { return { threadType: "group", groupId: "g1" }; },
     async recordOutboundDeposit() {},
     async setMessageStatus() {},
+    async rememberDeliveryThread() {},
   };
   const groupStore = {
     async listMembers() {
@@ -246,4 +247,52 @@ test("partial image/index projection retries under the original message time bef
   const rows = await restarted.rows();
   assert.equal(rows.length, 1); assert.equal(rows[0].acceptedAtMs, 1000);
   assert.equal((await alice.rows())[0].status, "delivered");
+});
+
+test("three-member group image has one bubble per receiver across duplicate delivery and restart; first member receipt confirms Delivered", async (t) => {
+  const carolId = "rez:acct:carol";
+  const threadId = "th_group_image";
+  const alice = await fixture(t, ALICE, BOB, threadId);
+  const bob = await fixture(t, BOB, ALICE, threadId);
+  const carol = await fixture(t, carolId, ALICE, threadId);
+  const seedGroup = async (node, owner) => {
+    await node.storage.getKeyValueStore(owner).set("app:threads/" + owner + "/" + threadId,
+      { threadId, threadType: "group", groupId: "g_images", createdAtMs: 500 });
+    const groups = node.app.bus.stores.groupStore;
+    await groups.ensureGroup({ ownerAccountId: owner, groupId: "g_images", createdBy: ALICE, title: "Images" });
+    for (const accountId of [ALICE, BOB, carolId]) {
+      await groups.ensureMembership({ ownerAccountId: owner, groupId: "g_images", accountId, role: accountId === ALICE ? "admin" : "member" });
+    }
+    node.app.bus.runtime.peerLinks = { ownerAccountId: owner, peerLinkStorage: { peerLinks: {
+      listByOwner: async () => [{ peerAccountId: ALICE, peerInboxId: "inbox:" + ALICE, state: "session_established" }],
+    } } };
+  };
+  await seedGroup(alice, ALICE); await seedGroup(bob, BOB); await seedGroup(carol, carolId);
+  const sent = await alice.app.bus.services.messages.sendFile({ ...params, threadId });
+  assert.equal((await alice.rows()).length, 1);
+  assert.equal((await alice.rows())[0].status, "sent");
+  const restartedAlice = await fixture(t, ALICE, BOB, threadId, alice.storage);
+  await seedGroup(restartedAlice, ALICE);
+  for (const senderAccountId of ["rez:acct:outsider", ALICE]) {
+    await restartedAlice.app.bus.services.messages.handleDeliveryAck({ senderAccountId, threadId, messageIds: [sent.messageId] });
+    assert.equal((await restartedAlice.rows())[0].status, "sent", "outsider/self cannot certify group delivery");
+  }
+  // Group fan-out captured a copy per member. Replay every copy twice at Bob
+  // before Carol receives anything: neither byte completion nor replay may
+  // mint a separate legacy image message.
+  for (const body of alice.wire) { await deliver(bob, body, ALICE); await deliver(bob, body, ALICE); }
+  assert.equal((await bob.rows()).length, 1);
+  assert.equal((await bob.rows())[0].messageId, sent.messageId);
+  for (const ack of bob.wire) await deliver(restartedAlice, ack, BOB);
+  assert.equal((await restartedAlice.rows())[0].status, "delivered", "one member receipt survives sender refresh");
+  assert.equal((await carol.rows()).length, 0, "Delivered does not mean every member received it");
+  const restartedBob = await fixture(t, BOB, ALICE, threadId, bob.storage);
+  await seedGroup(restartedBob, BOB);
+  for (const body of alice.wire) await deliver(restartedBob, body, ALICE);
+  for (const body of alice.wire) await deliver(carol, body, ALICE);
+  assert.equal((await restartedBob.rows()).length, 1);
+  assert.equal((await carol.rows()).length, 1);
+  assert.equal((await carol.rows())[0].messageId, sent.messageId);
+  const finalAlice = await fixture(t, ALICE, BOB, threadId, alice.storage);
+  assert.equal((await finalAlice.rows())[0].status, "delivered");
 });

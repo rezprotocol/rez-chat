@@ -147,6 +147,14 @@ backup remains a desktop feature until a versioned browser backup format is spec
   - `delivered`
   - `failed`
 - UI rendering may show derived status labels, but canonical transitions are driven by SDK/runtime events.
+- In a group, `delivered` confirms receipt by at least one other active member,
+  not every member and not that anyone read the message. The UI explains this
+  on the Delivered status. Signed text requires a verified commit proof for
+  the exact authored fact; unsigned text and attachments use authenticated
+  post-commit delivery acknowledgements. Self and non-member receipts do not
+  qualify. Receipt correlation survives sender refresh. This November 11,
+  2026 decision supersedes DT-004's earlier group-status-only policy; group
+  sends still have no N-recipient commit retry loop or delivery counts.
 - Message payloads are Rez objects; chat text is one possible payload shape, not a separate transport.
 
 ## 9. Idempotency Contract
@@ -246,9 +254,16 @@ complete. Message/index commit precedes receipt dispatch. Failed receipt or
 projection work remains retryable, with the original message timestamp.
 Unsigned message receipt routes are durable before dispatch; sender refresh
 cannot lose the target thread, and a late sent write cannot downgrade a
-committed delivered status. Group status follows the existing text policy:
-the first member receipt does not certify delivery to every member. Byte
+committed delivered status. Group status follows the same first-confirmed-member
+policy for text and attachments; it does not certify delivery to every member. Byte
 chunks never count as expected chat receipts.
+
+File drops anywhere in the active chat window stage an attachment for the
+selected writable conversation and prevent browser navigation to the file.
+Sending remains explicit. The composer accepts one file at a time, at most
+10 MiB; multiple-file drops produce an error rather than silently discarding
+files. A pending file read cannot attach to a different selected conversation
+or a composer that has been unmounted or disabled.
 
 Browser mutation promises resolve at transaction commit,
 not individual request success. Legacy transfers that already lost volatile

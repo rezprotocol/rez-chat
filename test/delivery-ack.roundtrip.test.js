@@ -246,16 +246,9 @@ test("delivery ack: 1:1 chat message transitions alice's row from sent → deliv
   assert.equal(deliveredOk, true, "alice's row should transition to delivered after ack");
 });
 
-// DT-004 group-ack split-brain repair. Before: the sender registered every
-// group fan-out copy as expecting an E2E delivery-ack (recordOutboundGroupMessage,
-// the only sender-side desync evidence) while receivers SUPPRESSED group acks —
-// so the evidence was structurally false and healthy-but-quiet links got
-// re-invited. The repaired contract: group members DO ack (resolved via the
-// sender's peer link, since a group thread has no peer identity), and the
-// sender's STATUS semantics stay 1:1-only (a group row never flips to
-// "delivered" on the first of N member acks — group messageIds are not
-// ack-pending-registered).
-test("DT-004: group fan-out triggers member acks (recovery evidence) without flipping the sender's group row to delivered", async () => {
+// Group member acknowledgements feed recovery and confirm delivery to at
+// least one member; they do not claim that every member received the message.
+test("group fan-out confirms Delivered after the first authenticated member acknowledgement", async () => {
   const aliceStorage = new TestStorageProvider();
   const bobStorage = new TestStorageProvider();
   const aliceSent = [];
@@ -345,14 +338,12 @@ test("DT-004: group fan-out triggers member acks (recovery evidence) without fli
   const ackBody = JSON.parse(Buffer.from(ackSends[0].plaintextBodyBytes).toString("utf8"));
   assert.deepEqual(ackBody.messageIds, ["mid_group_msg"], "ack carries the sender's local messageId");
 
-  // Route the ack back to Alice: her group row must NOT flip to "delivered"
-  // (group messageIds are not ack-pending-registered — the ack feeds recovery
-  // evidence only, never the N-ack-ambiguous group status).
+  // Route the member's post-commit acknowledgement back to Alice.
   await deliverToReceiver({ senderServer: bob, receiverServer: alice, sentBuf: bobSent, expectedPeerAccountId: ALICE });
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(
     aliceStatuses.some((e) => e.messageId === "mid_group_msg" && e.status === "delivered"),
-    false,
-    "a group row never transitions to delivered on a member ack",
+    true,
+    "a group row confirms delivery to at least one member",
   );
 });

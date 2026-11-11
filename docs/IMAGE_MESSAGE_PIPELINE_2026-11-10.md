@@ -145,6 +145,116 @@ map writing, and redundant post-dispatch ACK registration. Tests were aligned
 to the owning layer, with actual store and apply-outbox recovery regressions.
 No unresolved ownership/SSOT/boundary finding in changed code/direct dependencies.
 
+## November 11 follow-up: browser diagnosis and local UI changes
+
+The user's open Firefox tab visibly rendered the same image bytes under two
+different message IDs: one `img_recv_…` legacy completion row and one `local_…`
+normal message. Its console logged `unknown payload kind rez.image.v1` and its
+loaded entry was `index-C6SbI2X8.js`. A read of the currently published shell
+returned `index-BZ2AiNEI.js`. This confirms an older receiver was running both
+the legacy completion projection and the new sender's normal image envelope.
+The tab was refreshed, preserving site data; the user unlocked it again.
+The friend was offline, so confirmation used three independent QA browser
+accounts on the real hosted network, as explicitly requested by the user.
+Existing saved duplicate rows were not deleted or combined by content hash:
+repeated intentional sends of identical bytes must remain distinct messages.
+
+The following changes are **local and uncommitted, not published**:
+
+- `src/ui/views/ThreadPanelView.js`: file drag/drop capture across the active
+  chat window, including the sidebar; prevent file navigation, respect the
+  writable composer state, and remove window listeners on unmount.
+- `src/ui/views/ComposerView.js`: share picker/drop staging, reject multiple
+  files explicitly, retain the 10 MiB limit, invalidate stale file reads on
+  conversation changes/unmount, and block disabled sends.
+- `src/server/services/ServerMessagesService.js`: persist unsigned group
+  receipt correlation before dispatch; accept an authenticated active member's
+  post-commit receipt as Delivered. Signed group text still requires a valid
+  commit proof naming the exact authored fact. Self/non-members and legacy
+  acknowledgements for signed facts do not qualify. Shared recipient checking
+  and delivery-status application replace duplicated handlers.
+- `src/ui/views/MessageBubbleView.js`: group Delivered title/accessibility text
+  explains "at least one group member". It does not imply read or all-member
+  receipt. `ServerEventService.js` only updates the associated policy comment;
+  its pre-existing control-dispatch change is preserved.
+- `docs/CHAT_APP_SPEC.md` and root `plans/MESSAGE_COMMIT_ACK_PLAN.md`: document
+  the user's explicit first-member decision, superseding the prior DT-004
+  status policy. N-member retry/count semantics remain out of scope.
+- `test/messages.attachments.test.js`, `test/delivery-ack.roundtrip.test.js`,
+  `test/server.message-commit-ack.test.js`: group image replay/restart coverage,
+  delayed receipt after sender refresh, partial-group confirmation, signed
+  proof/non-member/bad-signature checks, and the updated group status assertion.
+  Existing unrelated edits in the signed-proof test are preserved.
+- `test/e2e.local-mesh.group-three.test.js`: extend the existing real three-leaf
+  relay test with first-member delivery while Carol is offline, image catch-up
+  after restarting Carol, exact-byte/shared-ID checks and a second intentional
+  send of identical image bytes. Preserve its pre-existing bootstrap changes.
+- `scripts/qa-chat-attachments.mjs` and
+  `test/support/chatAttachmentUiFixture.js`: isolated browser checks using real
+  stores/views and native File/DataTransfer objects; no network messages or
+  real account data. These browser checks are run explicitly.
+
+Verification: **127 focused Node tests pass, zero failures/skips**, across
+attachment, delivery/commit acknowledgement, resend, mutation, device fan-out,
+group authorization, storage, message-store, summary, IPC, view and Core-import
+boundary checks. Browser checks pass for whole-window drops, explicit Send,
+multiple-file rejection, size limit, stale reads after conversation switching,
+disabled threads, overlay cleanup, listener cleanup and group status wording.
+The styled fixture also asserts that its application styles loaded.
+`git diff --check` passes. The extended real local three-account mesh test also
+passes (one test, 11.3 seconds, zero failures/skips). Full repository/native and
+the remaining live-mesh suites were not run.
+
+Three real browser accounts also pass using the production-built candidate
+`index-CaoV-Ws_.js`, isolated origins `127.0.0.1:5191`/`:5192`/`:5193` and the
+real hosted `wss://chat.rezprotocol.io/ws` network. Alice creates the group,
+invites Bob, and Bob invites Carol; Alice's roster shows all three. Carol's
+tab is closed before Alice sends a 115.5 KB, 256-pixel PNG. Alice and Bob each
+render exactly one decoded image with the same message ID, and Alice shows
+Delivered before Carol reopens. Bob refreshes; Carol reopens/unlocks and
+catches up: each still renders exactly one image with the sender's ID. Alice
+intentionally sends the identical file a second time: every browser renders
+exactly two decoded images, with the same two IDs across all accounts. Bob's
+group text reaches Delivered too. Alice then refreshes/unlocks: both image
+rows remain Delivered and only the two intentional images are rendered.
+This is real UI/crypto/network/storage validation, not the synthetic UI fixture
+or mocked send dispatch. Only disposable QA accounts were used; the user
+explicitly approved acknowledging their recovery prompts. No recovery words
+were retained for use. No messages were sent from the user's account.
+
+The working-checkout production build fails because previously deleted
+`rez-ui/branding/filled-silhouette/rez-icon-mark-notification.png` is missing;
+other branding and the icon font were also already deleted. A temporary copy
+of the current sources with four tracked branding/font files restored from
+HEAD builds successfully and passes integrity injection. No asset was restored
+in the user's checkout. Existing bundle-size and Node transport externalization
+warnings remain. Evidence/logs: `/tmp/rez-chat-tweaks-focused.log`,
+`/tmp/rez-chat-tweaks-direct-deps.log`, `/tmp/rez-chat-tweaks-build.log`,
+`/tmp/rez-chat-tweaks-isolated-build.log`,
+`/tmp/rez-chat-tweaks-live-group.log`; candidate
+`/tmp/rez-chat-ui-check-SkkP69/`.
+
+Focused audit: checked Chat spec sections 8/13, commit-ack plan, DT-004 history,
+Chat file wrappers/payload registry, group membership, thread status/idempotency
+storage and direct UI/service dependencies. Canonical owners remain SDK for
+generic bytes/crypto, Chat services for message/status/receipt semantics, Chat
+stores for persistence, and views for DOM/drop presentation. No new protocol
+record, cross-layer import, dependency or transport directive was added.
+No new split-brain/SSOT/boundary or mixed-responsibility finding remains in
+touched code. Existing large message/event services were not decomposed or
+audited in full. Removed dead/superseded paths: duplicate delivery-status
+application and obsolete group-status exclusions/comments. No byte-transfer
+projection writer or hash-based message deduplication was introduced. No
+implementation/spec drift remains against the updated user-approved policy.
+
+Remaining limits: current active membership is required when a receipt arrives;
+a removed member's late receipt is ignored. Signed text stays Sent if a member
+cannot provide valid proof. There is no all-member delivery count/retry loop.
+Old open tabs must refresh to run current image handling; already stored
+duplicate messages remain. The drop/status changes still require publication
+and acceptance in the hosted app. No commit, push, master merge or deployment
+was performed.
+
 ## Limits and rollout requirements
 
 Both web participants should refresh normally, retaining saved site data.

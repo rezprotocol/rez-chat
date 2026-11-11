@@ -607,10 +607,9 @@ export class ServerEventService extends BaseServerService {
     // evidence structurally false and re-invited healthy-but-quiet links.
     // A group thread carries no peer identity, so resolve the authenticated
     // sender's inbox from its peer link — the message just decrypted over
-    // that link, so it exists. Sender-side STATUS stays 1:1-only: group
-    // messageIds are not ack-pending-registered (ServerMessagesService), so
-    // a group ack clears recovery evidence without flipping the row to
-    // "delivered" on the first of N member acks. Carries the sender's local
+    // that link, so it exists. Sender-side Delivered now confirms the first
+    // authenticated member receipt, not delivery to every member. The ack
+    // also clears recovery evidence. Carries the sender's local
     // messageId (payload.messageId, not the relay's eventId).
     if (decodedPayload && (decodedPayload.kind === CHAT_MESSAGE_KIND || decodedPayload.kind === IMAGE_KIND) && thread && messageId) {
       // Only admitted signed semantics may select a device. Resolve its inbox

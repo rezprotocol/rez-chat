@@ -81,7 +81,7 @@ async function startChatLeaf({ tmp, label, entryRelayKeyId, entryRelayPort }) {
   const wsUrl = "ws://127.0.0.1:" + wsPort + wsPath;
   const bootstrapped = await bootstrapChatServer({ nodeDataDir: dataDir, wsUrl, logger: silentLogger });
   await bootstrapped.chatServer.start();
-  return { label, nodeApp, chat: bootstrapped.chatServer, accountId: bootstrapped.ownerAccountId };
+  return { label, nodeApp, chat: bootstrapped.chatServer, accountId: bootstrapped.ownerAccountId, wsUrl, dataDir };
 }
 
 async function stopLeaf(app) {
@@ -229,6 +229,49 @@ test("live local mesh: transitive group meshes Alice↔Carol (A invites B, B inv
     });
     const carolGotAlice = await waitForMessageText(carol.chat, carolThreadId, a2all, "Carol receives Alice's message");
     assert.equal(carolGotAlice.senderAccountId, alice.accountId, "credited to Alice");
+    // Real encrypted group attachment: Carol is offline while Bob's committed
+    // receipt confirms first-member delivery. Restart resumes Carol's bytes and
+    // message without creating a separate legacy completion row.
+    await carol.chat.stop();
+    const fileDataB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aV9sAAAAASUVORK5CYII=";
+    const caption = "group-image " + nonce;
+    const image = await alice.chat.bus.call("file", "send", {
+      threadId: aliceThreadId, fileDataB64, fileName: "group-proof.png", mimeType: "image/png", text: caption,
+    });
+    const bobImage = await waitForMessageText(bob.chat, bobThreadId, caption, "Bob receives one group image");
+    assert.equal(bobImage.messageId, image.messageId);
+    await waitFor(async () => {
+      const page = await alice.chat.bus.call("thread.messages", "list", { threadId: aliceThreadId, limit: 50 });
+      return page.items.some((row) => row.messageId === image.messageId && row.status === "delivered");
+    }, CHAT_TIMEOUT_MS, "first online member confirms Delivered while Carol is offline");
+    const restarted = await bootstrapChatServer({ nodeDataDir: carol.dataDir, wsUrl: carol.wsUrl, logger: silentLogger });
+    carol.chat = restarted.chatServer;
+    await carol.chat.start();
+    const carolImage = await waitForMessageText(carol.chat, carolThreadId, caption, "Carol receives one image after restart");
+    assert.equal(carolImage.messageId, image.messageId);
+    for (const [leaf, threadId] of [[alice, aliceThreadId], [bob, bobThreadId], [carol, carolThreadId]]) {
+      const page = await leaf.chat.bus.call("thread.messages", "list", { threadId, limit: 50 });
+      const rows = page.items.filter((row) => row.payload && row.payload.fileHashHex === image.fileHashHex);
+      assert.equal(rows.length, 1, leaf.label + " has exactly one image row");
+      const cached = await leaf.chat.bus.call("file", "get", { fileHashHex: image.fileHashHex });
+      assert.equal(cached.fileDataB64, fileDataB64, leaf.label + " retains exact image bytes");
+    }
+    console.log("[group-image-proof] 3 real accounts: one image each; first-member Delivered with Carol offline; Carol restart preserves one ID and exact bytes");
+
+    // Identical bytes intentionally sent again must remain a second message.
+    const secondCaption = "group-image-again " + nonce;
+    const second = await alice.chat.bus.call("file", "send", {
+      threadId: aliceThreadId, fileDataB64, fileName: "group-proof.png", mimeType: "image/png", text: secondCaption,
+    });
+    assert.notEqual(second.messageId, image.messageId);
+    await waitForMessageText(bob.chat, bobThreadId, secondCaption, "Bob receives intentional second send");
+    await waitForMessageText(carol.chat, carolThreadId, secondCaption, "Carol receives intentional second send");
+    for (const [leaf, threadId] of [[alice, aliceThreadId], [bob, bobThreadId], [carol, carolThreadId]]) {
+      const page = await leaf.chat.bus.call("thread.messages", "list", { threadId, limit: 50 });
+      assert.equal(page.items.filter((row) => row.payload && row.payload.fileHashHex === image.fileHashHex).length, 2,
+        leaf.label + " has exactly two rows after two intentional sends");
+    }
+    console.log("[group-image-proof] identical image sent twice: exactly two messages per account, never four");
   } finally {
     for (const app of started.reverse()) {
       if (app && app.chat) await stopLeaf(app);
