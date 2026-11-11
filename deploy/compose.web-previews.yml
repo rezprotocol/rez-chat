@@ -1,6 +1,6 @@
 services:
   web-previews:
-    image: rez-network-routing:20261110
+    image: ${REZ_NETWORK_IMAGE:-ghcr.io/rezprotocol/node:0.6.0-rc.11}
     container_name: rez-web-previews
     restart: unless-stopped
     entrypoint: ["node", "/app/rez-chat/scripts/serve-web-previews.mjs"]
@@ -8,6 +8,7 @@ services:
       REZ_WEB_ORIGIN: https://chat.rezprotocol.io
       REZ_WEB_TRUSTED_PROXIES: 172.30.0.4
     volumes:
+      - ${REZ_WEB_PREVIEW_SOURCE:?required}/package.json:/app/rez-chat/package.json:ro
       - ${REZ_WEB_PREVIEW_SOURCE:?required}/src:/app/rez-chat/src:ro
       - ${REZ_WEB_PREVIEW_SOURCE:?required}/scripts/serve-web-previews.mjs:/app/rez-chat/scripts/serve-web-previews.mjs:ro
     networks: [edge]
