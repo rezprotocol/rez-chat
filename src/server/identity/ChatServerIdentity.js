@@ -1,12 +1,11 @@
 import { randomBytes } from "node:crypto";
-import { Identity, bytesToBase64 } from "@rezprotocol/sdk/client";
 import { StoredServerIdentity } from "../../records/domain/StoredServerIdentity.js";
 
 const STORE_KEY = "chat-server:identity:v1";
 
 /**
- * Loads chat-server's account-level identity from its own storage, or generates
- * and persists one on first boot.
+ * Verifies the persisted public identity against the vault-supplied identity.
+ * Never generates an account or loads its private key from an unprotected row.
  *
  * This is the chat-server (user/account) identity. It is NOT the node identity.
  * In Shape A (see docs/HOSTED_NODE_DESIGN.md §1) the node operator must never
@@ -21,10 +20,8 @@ const STORE_KEY = "chat-server:identity:v1";
 /**
  * @param {object} options
  * @param {object} options.storageProvider
- * @param {object} options.cryptoProvider
- * @param {object} [options.expectedIdentity] - Optional pre-derived identity
- *     (e.g. BIP39-seed-derived from DesktopVaultService). If provided and no
- *     identity is stored yet, it's persisted as-is. If provided and a stored
+ * @param {object} options.expectedIdentity - Required vault-derived identity.
+ *     Only its public identity is persisted. If a stored
  *     identity exists with a different pubkey, the call throws unless
  *     `allowOverwrite` is true (the once-per-account rotation case at first
  *     account-creation after a fresh boot).
@@ -33,53 +30,45 @@ const STORE_KEY = "chat-server:identity:v1";
  */
 export async function ensureChatServerIdentity({
   storageProvider,
-  cryptoProvider,
   expectedIdentity = null,
   allowOverwrite = false,
 } = {}) {
   if (!storageProvider || typeof storageProvider.getKeyValueStore !== "function") {
     throw new Error("ensureChatServerIdentity requires storageProvider");
   }
-  if (!cryptoProvider) {
-    throw new Error("ensureChatServerIdentity requires cryptoProvider");
+  if (!expectedIdentity) {
+    const err = new Error("ensureChatServerIdentity: vault expectedIdentity is required to boot; refusing to generate an account");
+    err.code = "ROOT_KEY_IN_VAULT_BUT_NOT_SUPPLIED";
+    throw err;
+  }
+  const expectedAccountId = String(expectedIdentity.accountId || "").trim();
+  const expectedPub = String(expectedIdentity.publicKeyB64 || "").trim();
+  const expectedPriv = String(expectedIdentity.privateKeyB64 || "").trim();
+  const delegated = expectedIdentity.hasAdminRoot === false;
+  if (!expectedAccountId || !expectedPub || (!delegated && !expectedPriv)) {
+    throw new Error("ensureChatServerIdentity: expectedIdentity must include accountId, publicKeyB64, privateKeyB64");
+  }
+  if (delegated && expectedPriv) {
+    throw new Error("ensureChatServerIdentity: a delegated expectedIdentity must not carry privateKeyB64");
+  }
+  if (delegated && !String(expectedIdentity.deviceId || "").trim()) {
+    throw new Error("ensureChatServerIdentity: a delegated expectedIdentity must include accountId, publicKeyB64, deviceId");
   }
   const kv = storageProvider.getKeyValueStore(null);
-  const stored = await kv.get(STORE_KEY);
+  if (typeof kv.getStrict !== "function") throw new Error("ensureChatServerIdentity requires strict storage reads");
+  const stored = await kv.getStrict(STORE_KEY);
   let storedRecord = null;
-  if (stored && typeof stored === "object" && !Array.isArray(stored)) {
-    // KV-deserialization boundary: tolerate corrupt blobs and regenerate.
-    try {
-      storedRecord = new StoredServerIdentity(stored);
-    } catch (err) {
-      console.warn("[chat-server] stored identity blob is corrupt; regenerating", err && err.message ? err.message : err);
-      storedRecord = null;
-    }
+  if (stored !== undefined) {
+    // Corrupt is never absent: preserve the row and fail closed, even when
+    // rotation was requested. It may be the last evidence of an existing account.
+    storedRecord = new StoredServerIdentity(stored);
   }
 
   if (storedRecord) {
-    if (!expectedIdentity) {
-      // GHSA-7gc9-4c96-2rxm: a vault-custody row deliberately holds no private
-      // key, so there is nothing to boot from without the vault. Fail loud —
-      // NEVER fall through to the generate branch below, which would mint a
-      // second account and orphan this one.
-      if (storedRecord.hasAdminRoot !== false && storedRecord.rootKeyCustody === "vault") {
-        const err = new Error(
-          "ensureChatServerIdentity: stored identity " + storedRecord.accountId
-          + " keeps its root key in the vault (rootKeyCustody='vault'), so an expectedIdentity "
-          + "is required to boot. Refusing to generate a replacement account.",
-        );
-        err.code = "ROOT_KEY_IN_VAULT_BUT_NOT_SUPPLIED";
-        throw err;
-      }
-      return storedRecord;
-    }
-    const expectedPub = String(expectedIdentity.publicKeyB64 || "").trim();
-    if (!expectedPub) {
-      throw new Error("ensureChatServerIdentity: expectedIdentity is missing publicKeyB64");
-    }
-    // Needed by the scrub below; the admin-root persist path re-derives its own.
-    const expectedPriv = String(expectedIdentity.privateKeyB64 || "").trim();
     if (storedRecord.publicKeyB64 === expectedPub) {
+      if (storedRecord.accountId !== expectedAccountId || storedRecord.hasAdminRoot === delegated) {
+        throw new Error("ensureChatServerIdentity: stored identity authority does not match expectedIdentity");
+      }
       // GHSA-7gc9-4c96-2rxm — the scrub, and the ONLY place cleartext root key
       // material is removed from disk.
       //
@@ -110,8 +99,7 @@ export async function ensureChatServerIdentity({
           rootKeyCustody: "vault",
         });
         await kv.set(STORE_KEY, scrubbed.toJSON());
-        console.warn("[chat-server] scrubbed the cleartext root key from local storage for "
-          + storedRecord.accountId + "; the vault envelope is now its only home (GHSA-7gc9-4c96-2rxm)");
+        console.warn("[chat-server] scrubbed the cleartext root key; the vault envelope is now its only home (GHSA-7gc9-4c96-2rxm)");
         // The RUNTIME identity still needs the key — it just no longer comes
         // off disk. `expectedIdentity` (the vault) is now its sole source.
         return new StoredServerIdentity({
@@ -143,64 +131,40 @@ export async function ensureChatServerIdentity({
       + " to " + String(expectedIdentity.accountId || "?") + " (allowOverwrite=true)");
   }
 
-  if (expectedIdentity) {
-    const expectedAccountId = String(expectedIdentity.accountId || "").trim();
-    const expectedPub = String(expectedIdentity.publicKeyB64 || "").trim();
-    const expectedPriv = String(expectedIdentity.privateKeyB64 || "").trim();
-    // S9 delegated branch: a seedless device holds NO account private key —
-    // its row persists the account PUBLIC key + the self-certifying deviceId
-    // of the device key C. A delegated identity that DOES carry a private key
-    // is a contradiction (someone parked admin-root material on a device that
-    // must not have it) — fail loud rather than persist it.
-    if (expectedIdentity.hasAdminRoot === false) {
-      if (expectedPriv) {
-        throw new Error("ensureChatServerIdentity: a delegated expectedIdentity must not carry privateKeyB64");
-      }
-      const delegatedDeviceId = String(expectedIdentity.deviceId || "").trim();
-      if (!expectedAccountId || !expectedPub || !delegatedDeviceId) {
-        throw new Error("ensureChatServerIdentity: a delegated expectedIdentity must include accountId, publicKeyB64, deviceId");
-      }
-      const record = new StoredServerIdentity({
-        accountId: expectedAccountId,
-        deviceId: delegatedDeviceId,
-        publicKeyB64: expectedPub,
-        privateKeyB64: "",
-        hasAdminRoot: false,
-      });
-      await kv.set(STORE_KEY, record.toJSON());
-      return record;
-    }
-    if (!expectedAccountId || !expectedPub || !expectedPriv) {
-      throw new Error("ensureChatServerIdentity: expectedIdentity must include accountId, publicKeyB64, privateKeyB64");
-    }
-    // GHSA-7gc9-4c96-2rxm: the private key is NOT persisted. The vault
-    // envelope supplies it at every boot (rez-chat/src/index.js is the only
-    // production caller and always does), so writing it here only ever created
-    // a second, unprotected copy.
-    const deviceId = `dev:${randomBytes(8).toString("hex")}`;
+  // S9 delegated branch: a seedless device holds NO account private key —
+  // its row persists the account PUBLIC key + the self-certifying deviceId
+  // of the device key C. A delegated identity that DOES carry a private key
+  // is a contradiction (someone parked admin-root material on a device that
+  // must not have it) — fail loud rather than persist it.
+  if (expectedIdentity.hasAdminRoot === false) {
+    const delegatedDeviceId = String(expectedIdentity.deviceId || "").trim();
     const record = new StoredServerIdentity({
       accountId: expectedAccountId,
-      deviceId,
+      deviceId: delegatedDeviceId,
       publicKeyB64: expectedPub,
       privateKeyB64: "",
-      rootKeyCustody: "vault",
+      hasAdminRoot: false,
     });
     await kv.set(STORE_KEY, record.toJSON());
-    return new StoredServerIdentity({
-      accountId: expectedAccountId,
-      deviceId,
-      publicKeyB64: expectedPub,
-      privateKeyB64: expectedPriv,
-    });
+    return record;
   }
-
-  const identity = await Identity.generate({ cryptoProvider });
+  // GHSA-7gc9-4c96-2rxm: the private key is NOT persisted. The vault
+  // envelope supplies it at every boot (rez-chat/src/index.js is the only
+  // production caller and always does), so writing it here only ever created
+  // a second, unprotected copy.
+  const deviceId = `dev:${randomBytes(8).toString("hex")}`;
   const record = new StoredServerIdentity({
-    accountId: identity.getAccountId(),
-    deviceId: `dev:${randomBytes(8).toString("hex")}`,
-    publicKeyB64: bytesToBase64(identity.getPublicKeyBytes()),
-    privateKeyB64: bytesToBase64(identity.getPrivateKeyBytes()),
+    accountId: expectedAccountId,
+    deviceId,
+    publicKeyB64: expectedPub,
+    privateKeyB64: "",
+    rootKeyCustody: "vault",
   });
   await kv.set(STORE_KEY, record.toJSON());
-  return record;
+  return new StoredServerIdentity({
+    accountId: expectedAccountId,
+    deviceId,
+    publicKeyB64: expectedPub,
+    privateKeyB64: expectedPriv,
+  });
 }

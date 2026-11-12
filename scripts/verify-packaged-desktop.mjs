@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import path from "node:path";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -51,7 +52,7 @@ function validateOptions({ executable, dataDir, launchArgs = [], cycles = 2, tim
     throw new Error("timeoutMs must be an integer from 5000 through 300000");
   }
   return {
-    executable: resolvedExecutable,
+    executable: fs.realpathSync(resolvedExecutable),
     dataDir: resolvedDataDir,
     launchArgs: launchArgs.map((value) => String(value)),
     cycles,
@@ -71,11 +72,19 @@ function pathWithoutNode(envPath) {
   return kept.join(path.delimiter);
 }
 
-function writeIsolatedConfig(dataDir) {
+async function writeIsolatedConfig(dataDir) {
+  const wsPort = await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      server.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
   const configPath = path.join(dataDir, "rez.config.json");
   const config = {
     node: {
-      ws: { host: "127.0.0.1", port: 8787, path: "/ws" },
+      ws: { host: "127.0.0.1", port: wsPort, path: "/ws" },
       storage: { dataDir: path.join(dataDir, "node-data") },
       backup: { retentionDays: 1 },
       // Full-mesh mode requires local routing participation. An empty relay
@@ -237,7 +246,7 @@ async function waitForPidDeath(pid, timeoutMs) {
 
 export async function verifyPackagedDesktop(options = {}) {
   const checked = validateOptions(options);
-  writeIsolatedConfig(checked.dataDir);
+  await writeIsolatedConfig(checked.dataDir);
   const childEnv = {
     ...process.env,
     ...options.env,

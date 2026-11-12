@@ -1,8 +1,8 @@
 /**
  * End-to-end UI test for the desktop app.
  *
- * Launches TWO real Electron processes (the actual main.mjs that ships in
- * the .app bundle) with separate user-data-dirs and node WS ports, drives
+ * Launches TWO real Electron development-shell processes with separate
+ * user-data-dirs and node WS ports, drives
  * each through the REAL renderer UI:
  *   signup → connect → generate invite (window A)
  *   read invite code from window A's UI → paste + accept (window B)
@@ -48,7 +48,24 @@ async function launchInstance(playwright, { label, userDataDir, nodeWsPort, desk
     cwd: CHAT_ROOT,
     timeout: 30000,
   });
-  const page = await electronApp.firstWindow({ timeout: 30000 });
+  electronApp.process().stdout.on("data", (chunk) => process.stdout.write("[" + label + " main] " + chunk));
+  electronApp.process().stderr.on("data", (chunk) => process.stderr.write("[" + label + " main] " + chunk));
+  // The first window is the temporary data: splash screen. Drive the real
+  // loopback-served application window after the splash has closed.
+  const isApplication = (page) => /^http:\/\/127\.0\.0\.1:/.test(page.url());
+  await electronApp.firstWindow({ timeout: 30000 });
+  const page = electronApp.windows().find(isApplication) || await electronApp.waitForEvent("window", {
+    timeout: 30000,
+    predicate: async (candidate) => {
+      try {
+        await candidate.waitForURL(/^http:\/\/127\.0\.0\.1:/, { timeout: 30000 });
+        return true;
+      } catch (err) {
+        if (candidate.isClosed()) return false;
+        throw err;
+      }
+    },
+  });
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
   return { electronApp, page };
 }
@@ -65,6 +82,9 @@ async function signup(page, profileName) {
     if (form) form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
   });
   await page.waitForSelector("[data-testid='nav.chat']", { timeout: 30000 });
+  // Complete the real recovery-phrase onboarding without recording the
+  // phrase. The acknowledgement becomes enabled after its reading delay.
+  await page.locator("button[data-role='ack']").click({ timeout: 20000 });
 }
 
 async function gotoContactsTab(page) {
@@ -138,18 +158,16 @@ test("two-user UI: signup, invite, accept, bidirectional messaging via real Elec
   { skip: shouldRun ? false : "set RUN_INTEGRATION=1 to enable (launches 2 electron windows, uses live relays, ~30s)" },
   async (t) => {
     // Confirm UI artifacts exist (electron main.mjs requires them).
-    const uiRoot = path.resolve(CHAT_ROOT, "../artifacts/rez-chat");
+    const uiRoot = path.resolve(CHAT_ROOT, "artifacts/rez-chat");
     if (!fs.existsSync(path.join(uiRoot, "index.html"))) {
-      t.skip("UI artifacts missing at " + uiRoot + " — run `npm -w rez-chat run build` first");
-      return;
+      throw new Error("UI artifacts missing at " + uiRoot + " — run `npm -w rez-chat run build` first");
     }
 
     let playwright;
     try {
       playwright = await import("playwright");
-    } catch {
-      t.skip("playwright not installed");
-      return;
+    } catch (err) {
+      throw new Error("playwright is required for the requested desktop UI gate", { cause: err });
     }
 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "rez-ui-twouser-"));
@@ -198,8 +216,8 @@ test("two-user UI: signup, invite, accept, bidirectional messaging via real Elec
     // Step 2: Alice generates an invite code via the UI.
     await gotoContactsTab(alice.page);
     const inviteCode = await generateInviteCode(alice.page);
-    assert.ok(inviteCode && inviteCode.startsWith("rez:inv:v2:"),
-      "expected v2 invite code, got: " + inviteCode);
+    assert.ok(inviteCode && inviteCode.startsWith("rez:inv:v3:"),
+      "expected the current v3 invite code");
 
     // Step 3: Bob navigates to Contacts and accepts the invite via the UI.
     await gotoContactsTab(bob.page);

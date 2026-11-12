@@ -98,20 +98,20 @@ fn generate_control_token() -> String {
 /// rez-chat repo root: in dev it is the parent of src-tauri/; in a packaged
 /// app the JS tree ships under the resource directory (packaging phase).
 fn resolve_chat_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    if let Ok(env_root) = std::env::var("REZ_CHAT_ROOT") {
-        let trimmed = env_root.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
     // A release binary may be launched on the same machine that compiled it.
     // Never let the compile-time checkout path win there: the bundled Node
     // and native modules are signed and built as one release unit. Mixing the
     // bundled Node with a checkout's better-sqlite3 makes macOS reject the
     // module (and can also cross Node ABIs). Only debug shells use the source
-    // tree automatically; REZ_CHAT_ROOT remains the explicit override.
+    // tree or developer overrides; release shells use only bundled resources.
     #[cfg(debug_assertions)]
     {
+        if let Ok(env_root) = std::env::var("REZ_CHAT_ROOT") {
+            let trimmed = env_root.trim();
+            if !trimmed.is_empty() {
+                return Ok(PathBuf::from(trimmed));
+            }
+        }
         let dev_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         if dev_root.join("src/desktop/sidecar-main.js").exists() {
             return dev_root
@@ -399,7 +399,7 @@ fn run_boot_sequence(app: tauri::AppHandle) {
 
         let control_token = generate_control_token();
         let config = SidecarConfig {
-            node_bin: resolve_node_bin(),
+            node_bin: resolve_node_bin()?,
             entry: chat_root.join("src/desktop/sidecar-main.js"),
             cwd: chat_root.clone(),
             user_data_dir,

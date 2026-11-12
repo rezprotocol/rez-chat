@@ -1,10 +1,10 @@
 [package]
 name = "rez-chat-shell"
-version = "0.5.1"
+version = "0.6.0-rc.15"
 description = "Rez Chat desktop shell (Tauri)"
 authors = ["Rez Protocol"]
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.96"
 
 [lib]
 name = "rez_chat_shell"

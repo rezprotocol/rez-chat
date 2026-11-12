@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { startRezNode } from "@rezprotocol/node";
-import { bootstrapChatServer } from "../src/server/index.js";
+import { bootstrapTestChatServer } from "./support/bootstrapTestChatServer.js";
 import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**
@@ -79,7 +79,7 @@ async function startChatLeaf({ tmp, label, entryRelayKeyId, entryRelayPort }) {
     },
   });
   const wsUrl = "ws://127.0.0.1:" + wsPort + wsPath;
-  const bootstrapped = await bootstrapChatServer({ nodeDataDir: dataDir, wsUrl, logger: silentLogger });
+  const bootstrapped = await bootstrapTestChatServer({ nodeDataDir: dataDir, wsUrl, logger: silentLogger });
   await bootstrapped.chatServer.start();
   return { label, nodeApp, chat: bootstrapped.chatServer, accountId: bootstrapped.ownerAccountId, wsUrl, dataDir };
 }
@@ -229,6 +229,7 @@ test("live local mesh: transitive group meshes Alice↔Carol (A invites B, B inv
     });
     const carolGotAlice = await waitForMessageText(carol.chat, carolThreadId, a2all, "Carol receives Alice's message");
     assert.equal(carolGotAlice.senderAccountId, alice.accountId, "credited to Alice");
+
     // Real encrypted group attachment: Carol is offline while Bob's committed
     // receipt confirms first-member delivery. Restart resumes Carol's bytes and
     // message without creating a separate legacy completion row.
@@ -244,7 +245,7 @@ test("live local mesh: transitive group meshes Alice↔Carol (A invites B, B inv
       const page = await alice.chat.bus.call("thread.messages", "list", { threadId: aliceThreadId, limit: 50 });
       return page.items.some((row) => row.messageId === image.messageId && row.status === "delivered");
     }, CHAT_TIMEOUT_MS, "first online member confirms Delivered while Carol is offline");
-    const restarted = await bootstrapChatServer({ nodeDataDir: carol.dataDir, wsUrl: carol.wsUrl, logger: silentLogger });
+    const restarted = await bootstrapTestChatServer({ nodeDataDir: carol.dataDir, wsUrl: carol.wsUrl, logger: silentLogger });
     carol.chat = restarted.chatServer;
     await carol.chat.start();
     const carolImage = await waitForMessageText(carol.chat, carolThreadId, caption, "Carol receives one image after restart");

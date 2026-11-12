@@ -15,31 +15,43 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "nsis", "appimage", "deb"],
-    "icon": ["../build/icon.icns", "../build/icon.ico", "../build/icon.png"],
+    "targets": [
+      "app",
+      "dmg",
+      "nsis",
+      "appimage",
+      "deb"
+    ],
+    "icon": [
+      "../build/icon.icns",
+      "../build/icon.ico",
+      "../build/icon.png"
+    ],
     "createUpdaterArtifacts": true,
-    "externalBin": ["binaries/rez-chat-node"],
+    "externalBin": [
+      "binaries/rez-chat-node"
+    ],
     "resources": {
       "../package.json": "package.json",
       "../src": "src",
-      "../node_modules/@rezprotocol/core/src": "node_modules/@rezprotocol/core/src",
-      "../node_modules/@rezprotocol/core/package.json": "node_modules/@rezprotocol/core/package.json",
-      "../node_modules/@rezprotocol/sdk/src": "node_modules/@rezprotocol/sdk/src",
-      "../node_modules/@rezprotocol/sdk/package.json": "node_modules/@rezprotocol/sdk/package.json",
-      "../node_modules/@rezprotocol/node/src": "node_modules/@rezprotocol/node/src",
-      "../node_modules/@rezprotocol/node/package.json": "node_modules/@rezprotocol/node/package.json",
-      "../node_modules/@rezprotocol/ui/src": "node_modules/@rezprotocol/ui/src",
-      "../node_modules/@rezprotocol/ui/branding": "node_modules/@rezprotocol/ui/branding",
-      "../node_modules/@rezprotocol/ui/package.json": "node_modules/@rezprotocol/ui/package.json",
-      "../node_modules/ws": "node_modules/ws",
-      "../node_modules/better-sqlite3": "node_modules/better-sqlite3",
-      "../node_modules/bindings": "node_modules/bindings",
-      "../node_modules/file-uri-to-path": "node_modules/file-uri-to-path"
+      "../../node_modules/@rezprotocol/core/src": "node_modules/@rezprotocol/core/src",
+      "../../node_modules/@rezprotocol/core/package.json": "node_modules/@rezprotocol/core/package.json",
+      "../../node_modules/@rezprotocol/sdk/src": "node_modules/@rezprotocol/sdk/src",
+      "../../node_modules/@rezprotocol/sdk/package.json": "node_modules/@rezprotocol/sdk/package.json",
+      "../../node_modules/@rezprotocol/node/src": "node_modules/@rezprotocol/node/src",
+      "../../node_modules/@rezprotocol/node/package.json": "node_modules/@rezprotocol/node/package.json",
+      "../../node_modules/@rezprotocol/ui/src": "node_modules/@rezprotocol/ui/src",
+      "../../node_modules/@rezprotocol/ui/branding": "node_modules/@rezprotocol/ui/branding",
+      "../../node_modules/@rezprotocol/ui/package.json": "node_modules/@rezprotocol/ui/package.json",
+      "../../node_modules/ws": "node_modules/ws",
+      "../../node_modules/better-sqlite3": "node_modules/better-sqlite3",
+      "../../node_modules/bindings": "node_modules/bindings",
+      "../../node_modules/file-uri-to-path": "node_modules/file-uri-to-path"
     },
     "macOS": {
       "hardenedRuntime": true,
       "entitlements": "../build/entitlements.mac.plist",
-      "minimumSystemVersion": "10.15"
+      "minimumSystemVersion": "13.5"
     }
   },
   "plugins": {

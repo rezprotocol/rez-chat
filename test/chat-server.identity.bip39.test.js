@@ -1,12 +1,7 @@
 // Phase 2 — ensureChatServerIdentity with BIP39-seed-rooted expectedIdentity.
 //
-// Verifies the four behaviors:
-//   1. empty storage + no expected → random-generate (legacy path)
-//   2. empty storage + expected → persist expected as-is
-//   3. stored + expected matches → return stored (no-op)
-//   4. stored + expected differs + !allowOverwrite → throw
-//   5. stored + expected differs + allowOverwrite → overwrite + return new
-//   6. stored + no expected → return stored (legacy: boot-before-vault-unlock path)
+// Pins vault-only key custody, strict reads, verified upgrade scrubbing and
+// explicit rotation. Missing/corrupt state must never mint a replacement account.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -19,6 +14,8 @@ import { Identity } from "@rezprotocol/sdk/client";
 import { Bip39 } from "@rezprotocol/sdk/crypto/bip39";
 import { SeedKeys } from "@rezprotocol/sdk/crypto/seedDerivation";
 import { ensureChatServerIdentity } from "../src/server/identity/ChatServerIdentity.js";
+import { DesktopVaultService } from "../src/desktop/runtime/DesktopVaultService.js";
+import { bootstrapChatServer } from "../src/server/bootstrap/bootstrapChatServer.js";
 
 function tmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -100,20 +97,45 @@ test("ensureChatServerIdentity — stored + expected mismatch throws unless allo
   assert.equal(rotated.publicKeyB64, expectedB.publicKeyB64);
 });
 
-test("ensureChatServerIdentity — legacy empty + no expected still random-generates", async () => {
+test("ensureChatServerIdentity — empty storage without a vault identity fails without writing", async () => {
   const rootDir = tmpDir("rez-csi-3-");
   const cryptoProvider = new NodeCryptoProvider();
-  const a = await ensureChatServerIdentity({
-    storageProvider: new FsStorageProvider({ rootDir }),
+  const provider = new FsStorageProvider({ rootDir });
+  await assert.rejects(() => ensureChatServerIdentity({
+    storageProvider: provider,
     cryptoProvider,
-  });
-  assert.match(a.accountId, /^rez:acct:/);
-  assert.match(a.deviceId, /^dev:/);
-  const b = await ensureChatServerIdentity({
-    storageProvider: new FsStorageProvider({ rootDir }),
-    cryptoProvider,
-  });
-  assert.equal(b.publicKeyB64, a.publicKeyB64);
+  }), /required to boot/);
+  assert.equal(await provider.getKeyValueStore(null).getStrict("chat-server:identity:v1"), undefined);
+});
+
+test("identity corruption is preserved, never treated as a new install or rotation", async () => {
+  const rootDir = tmpDir("rez-csi-corrupt-");
+  const provider = new FsStorageProvider({ rootDir });
+  const kv = provider.getKeyValueStore(null);
+  const corrupt = { accountId: "existing-account", privateKeyB64: "existing-key" };
+  const expected = await deriveSeededIdentity();
+  await kv.set("chat-server:identity:v1", corrupt);
+  await assert.rejects(() => ensureChatServerIdentity({
+    storageProvider: provider,
+    expectedIdentity: expected,
+    allowOverwrite: true,
+  }), /requires deviceId/);
+  assert.deepEqual(await kv.getStrict("chat-server:identity:v1"), corrupt);
+});
+
+test("unreadable identity bytes fail closed without overwriting the original file", async () => {
+  const rootDir = tmpDir("rez-csi-unreadable-");
+  const provider = new FsStorageProvider({ rootDir });
+  const kv = provider.getKeyValueStore(null);
+  const key = "chat-server:identity:v1";
+  const expected = await deriveSeededIdentity();
+  await kv.set(key, { invalid: true });
+  const file = path.join(rootDir, "kv", Buffer.from(key).toString("base64url") + ".json");
+  fs.writeFileSync(file, "{interrupted identity write");
+  await assert.rejects(() => ensureChatServerIdentity({
+    storageProvider: provider, expectedIdentity: expected, allowOverwrite: true,
+  }), (err) => err.name === "KeyValueUnreadableError");
+  assert.equal(fs.readFileSync(file, "utf8"), "{interrupted identity write");
 });
 
 // --- GHSA-7gc9-4c96-2rxm: cleartext root key custody ---------------------
@@ -229,6 +251,26 @@ test("GHSA-7gc9: same public key but a DIFFERENT private key refuses to scrub �
   assert.notEqual(row.privateKeyB64, "", "nothing was scrubbed — we do not destroy a key we cannot account for");
 });
 
+test("legacy identity requires a vault and rejects conflicting account authority without changing disk", async (t) => {
+  const rootDir = tmpDir("rez-csi-authority-");
+  t.after(() => fs.rmSync(rootDir, { recursive: true, force: true }));
+  const provider = new FsStorageProvider({ rootDir });
+  const kv = provider.getKeyValueStore(null);
+  const expected = await deriveSeededIdentity();
+  const legacy = { ...expected, deviceId: "dev:legacy-authority" };
+  await kv.set(STORE_KEY, legacy);
+  await assert.rejects(() => ensureChatServerIdentity({ storageProvider: provider }), /required to boot/);
+  for (const conflicting of [
+    { ...expected, accountId: "rez:acct:wrong-account" },
+    { ...expected, hasAdminRoot: false, privateKeyB64: "", deviceId: "dev:delegated" },
+  ]) {
+    await assert.rejects(() => ensureChatServerIdentity({
+      storageProvider: provider, expectedIdentity: conflicting, allowOverwrite: true,
+    }), /stored identity authority does not match/);
+    assert.deepEqual(await kv.getStrict(STORE_KEY), legacy);
+  }
+});
+
 test("GHSA-7gc9: a scrubbed row with no vault identity FAILS LOUD instead of minting a replacement account", async () => {
   const rootDir = tmpDir("rez-csi-ghsa-noexpected-");
   const expected = await deriveSeededIdentity();
@@ -251,4 +293,59 @@ test("GHSA-7gc9: a scrubbed row with no vault identity FAILS LOUD instead of min
 
   const row = await readStoredRow(rootDir);
   assert.equal(row.accountId, expected.accountId, "the original account row is untouched");
+});
+
+test("GHSA-7gc9: a real vault unlock and upgraded bootstrap preserve encrypted legacy state across restart", async (t) => {
+  const rootDir = tmpDir("rez-csi-vault-upgrade-");
+  t.after(() => fs.rmSync(rootDir, { recursive: true, force: true }));
+  const dbPath = path.join(rootDir, "vault.sqlite");
+  // Password-based vault encryption is real. OS keychain/UI acceptance is a
+  // separate packaged-release gate, not simulated by this integration test.
+  const vault = new DesktopVaultService({ dbPath }).open();
+  t.after(() => vault.close());
+  const password = "synthetic upgrade fixture password";
+  const account = await vault.createAccount({ profileName: "Upgrade fixture", password });
+  const original = vault.getChatServerIdentity();
+  const chatDir = path.join(rootDir, "chat-server");
+  const publicKv = new FsStorageProvider({ rootDir: chatDir }).getKeyValueStore(null);
+  await publicKv.set(STORE_KEY, {
+    accountId: original.accountId,
+    deviceId: "dev:legacy-upgrade",
+    publicKeyB64: original.publicKeyB64,
+    privateKeyB64: original.privateKeyB64,
+  });
+  // This is the published pre-fix storage-key derivation. The production
+  // bootstrap must still open these exact ciphertext bytes after the scrub.
+  const encryptionKey = await new NodeCryptoProvider().hkdfSha256(Buffer.from(original.privateKeyB64, "base64"), {
+    salt: new TextEncoder().encode("rez:chat-server:storage:v1"),
+    info: new TextEncoder().encode("rez:chat-server:kv:aes256gcm"),
+    length: 32,
+  });
+  const legacyKv = new FsStorageProvider({ rootDir: chatDir, encryptionKey }).getKeyValueStore(null);
+  await legacyKv.set("upgrade-proof", "existing encrypted conversation state");
+  vault.close();
+  vault.open();
+  await assert.rejects(() => vault.unlock({ accountId: account.accountId, password: "wrong password" }));
+  assert.equal((await publicKv.getStrict(STORE_KEY)).privateKeyB64, original.privateKeyB64,
+    "failed vault unlock must leave the legacy recovery evidence untouched");
+
+  for (let boot = 0; boot < 2; boot += 1) {
+    await vault.unlock({ accountId: account.accountId, password });
+    const runtime = await bootstrapChatServer({
+      nodeDataDir: rootDir,
+      wsUrl: "ws://127.0.0.1:1/ws",
+      expectedChatServerIdentity: vault.getChatServerIdentity(),
+    });
+    try {
+      assert.equal(runtime.identity.accountId, original.accountId);
+      assert.equal(runtime.identity.deviceId, "dev:legacy-upgrade");
+      assert.equal(await runtime.storageProvider.getKeyValueStore(null).getStrict("upgrade-proof"),
+        "existing encrypted conversation state");
+      assert.equal((await publicKv.getStrict(STORE_KEY)).privateKeyB64, "");
+      assert.equal(fileContainingSecret(chatDir, original.privateKeyB64), null);
+    } finally {
+      await runtime.chatServer.stop();
+      vault.lock();
+    }
+  }
 });

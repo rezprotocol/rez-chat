@@ -61,7 +61,6 @@ export async function bootstrapChatServer({
   const bootstrapProvider = new FsStorageProvider({ rootDir: chatStorageDir });
   const identity = await ensureChatServerIdentity({
     storageProvider: bootstrapProvider,
-    cryptoProvider,
     expectedIdentity: hasAdminRoot
       ? expectedChatServerIdentity
       : { ...expectedChatServerIdentity, deviceId: deviceKey.deviceId },

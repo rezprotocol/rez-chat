@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { startRezNode } from "@rezprotocol/node";
-import { bootstrapChatServer } from "../src/server/index.js";
+import { bootstrapTestChatServer } from "./support/bootstrapTestChatServer.js";
 import { createDefaultRezConfig } from "../src/server/config/defaultRezConfig.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -193,7 +193,7 @@ async function startChatNode(label, knownRelays) {
   };
   const nodeApp = await startRezNode(config);
   const wsUrl = "ws://127.0.0.1:" + wsPort + "/ws";
-  const bootstrapped = await bootstrapChatServer({ nodeDataDir: dataDir, wsUrl, logger: makeLogger(label) });
+  const bootstrapped = await bootstrapTestChatServer({ nodeDataDir: dataDir, wsUrl, logger: makeLogger(label) });
   await bootstrapped.chatServer.start();
   return { label, tmpDir, nodeApp, chat: bootstrapped.chatServer, accountId: bootstrapped.ownerAccountId, wsUrl };
 }

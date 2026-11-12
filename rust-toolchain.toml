@@ -1,5 +1,4 @@
-# Pinned for reproducible local + CI builds. Tauri 2's dependency tree now
-# pulls edition2024 crates, which need Rust >= 1.85.
+# Pinned for reproducible local + CI builds with the patched Tauri 2 graph.
 [toolchain]
-channel = "1.89.0"
+channel = "1.96.0"
 profile = "minimal"

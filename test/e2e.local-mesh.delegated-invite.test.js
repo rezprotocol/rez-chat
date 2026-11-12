@@ -13,7 +13,7 @@ import {
   AccountDeviceCapabilityV1,
   ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
 } from "@rezprotocol/core";
-import { bootstrapChatServer } from "../src/server/index.js";
+import { bootstrapTestChatServer } from "./support/bootstrapTestChatServer.js";
 import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**
@@ -190,7 +190,7 @@ async function startPgHome({ tmp, entryRelayKeyId, entryRelayPort }) {
 async function startChatLeaf({ tmp, label, wsUrl, expectedChatServerIdentity = null, deviceKey = null }) {
   const dataDir = path.join(tmp, label);
   await fs.mkdir(dataDir, { recursive: true });
-  const bootstrapped = await bootstrapChatServer({
+  const bootstrapped = await bootstrapTestChatServer({
     nodeDataDir: dataDir,
     wsUrl,
     logger: silentLogger,

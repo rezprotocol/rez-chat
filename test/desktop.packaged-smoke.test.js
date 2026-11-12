@@ -10,6 +10,8 @@ test("packaged verifier requires two healthy starts and reaps each sidecar", asy
   const dataDir = path.join(root, "profile");
   const serverPath = path.join(root, "server.mjs");
   const launcherPath = path.join(root, "launcher.mjs");
+  const executableLink = path.join(root, "node-link");
+  fs.symlinkSync(process.execPath, executableLink);
   fs.writeFileSync(serverPath, `
     import fs from "node:fs";
     import http from "node:http";
@@ -50,13 +52,14 @@ test("packaged verifier requires two healthy starts and reaps each sidecar", asy
 
   try {
     const result = await verifyPackagedDesktop({
-      executable: process.execPath,
+      executable: executableLink,
       launchArgs: [launcherPath],
       dataDir,
       cycles: 2,
       timeoutMs: 10_000,
     });
     assert.equal(result.receipts.length, 2);
+    assert.equal(result.executable, fs.realpathSync(process.execPath));
     assert.notEqual(result.receipts[0].instanceId, result.receipts[1].instanceId);
     assert.equal(fs.existsSync(path.join(dataDir, "sidecar.lock")), false);
   } finally {

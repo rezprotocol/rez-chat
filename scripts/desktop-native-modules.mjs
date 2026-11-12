@@ -2,14 +2,12 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CHAT_ROOT = path.resolve(__dirname, "..");
-// Standalone rez-chat repo: deps live in rez-chat/node_modules. (Earlier
-// monorepo layout had a hoisted root node_modules above this directory.)
-const NODE_MODULES_ROOT = path.join(CHAT_ROOT, "node_modules");
-const PREBUILD_INSTALL = path.join(NODE_MODULES_ROOT, "prebuild-install", "bin.js");
-const BETTER_SQLITE_ROOT = path.join(NODE_MODULES_ROOT, "better-sqlite3");
+const require = createRequire(import.meta.url);
+const PREBUILD_INSTALL = require.resolve("prebuild-install/bin.js");
+const BETTER_SQLITE_ROOT = path.dirname(require.resolve("better-sqlite3/package.json"));
+const INSTALL_ROOT = path.resolve(BETTER_SQLITE_ROOT, "../..");
 
 export async function prepareElectronNativeModules(env = process.env, opts = {}) {
   if (env.REZ_CHAT_SKIP_ELECTRON_REBUILD === "1") {
@@ -28,7 +26,7 @@ export async function restoreNodeNativeModules(env = process.env) {
   }
 
   console.log("[desktop:native] restoring native modules for Node");
-  await runCommand("npm", ["rebuild", "better-sqlite3"], CHAT_ROOT);
+  await runCommand("npm", ["rebuild", "better-sqlite3"], INSTALL_ROOT);
 }
 
 async function rebuildBetterSqliteForElectron({ platform, arch } = {}) {
@@ -55,7 +53,7 @@ async function rebuildBetterSqliteForElectron({ platform, arch } = {}) {
   } catch (err) {
     if (targetPlatform !== process.platform || targetArch !== process.arch) throw err;
     console.warn("[desktop:native] no matching prebuild; compiling better-sqlite3 from source");
-    await runCommand("npm", ["rebuild", "better-sqlite3", "--build-from-source"], CHAT_ROOT, {
+    await runCommand("npm", ["rebuild", "better-sqlite3", "--build-from-source"], INSTALL_ROOT, {
       npm_config_runtime: "electron",
       npm_config_target: target,
       npm_config_arch: targetArch,
@@ -66,15 +64,12 @@ async function rebuildBetterSqliteForElectron({ platform, arch } = {}) {
 }
 
 function electronTargetVersion() {
-  const pkg = JSON.parse(fs.readFileSync(path.join(CHAT_ROOT, "package.json"), "utf8"));
-  const raw = pkg.devDependencies && pkg.devDependencies.electron
-    ? pkg.devDependencies.electron
-    : "";
-  const match = String(raw).match(/[0-9]+(?:\.[0-9]+){0,2}/);
-  if (!match) {
+  const pkg = JSON.parse(fs.readFileSync(require.resolve("electron/package.json"), "utf8"));
+  const version = String(pkg.version || "");
+  if (!/^\d+\.\d+\.\d+(?:[-+].*)?$/.test(version)) {
     throw new Error("Unable to resolve Electron version from rez-chat package.json");
   }
-  return match[0];
+  return version;
 }
 
 function runCommand(command, args, cwd, env = {}) {

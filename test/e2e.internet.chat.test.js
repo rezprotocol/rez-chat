@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { startRezNode } from "@rezprotocol/node";
-import { bootstrapChatServer } from "../src/server/index.js";
+import { bootstrapTestChatServer } from "./support/bootstrapTestChatServer.js";
 import { createDefaultRezConfig } from "../src/server/config/defaultRezConfig.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -128,7 +128,7 @@ async function startChatNode(label, knownRelays, routePolicy) {
 
   const nodeApp = await startRezNode(config);
   const wsUrl = "ws://127.0.0.1:" + wsPort + wsPath;
-  const bootstrapped = await bootstrapChatServer({
+  const bootstrapped = await bootstrapTestChatServer({
     nodeDataDir: dataDir,
     wsUrl,
     logger: silentLogger,

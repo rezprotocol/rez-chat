@@ -46,8 +46,8 @@ enum BootSignal {
 
 #[derive(Debug, Clone)]
 pub struct SidecarConfig {
-    /// Node binary. Resolution order: REZ_NODE_BIN env, bundled sidecar
-    /// binary (phase 5), `node` from PATH (dev).
+    /// Debug builds permit a developer override or PATH Node. Packaged
+    /// builds require their bundled Node and fail closed if it is absent.
     pub node_bin: PathBuf,
     /// Absolute path to src/desktop/sidecar-main.js.
     pub entry: PathBuf,
@@ -141,6 +141,7 @@ impl SidecarHandle {
         on_request: Arc<HostRequestHandler>,
     ) -> Result<Self, String> {
         let mut command = Command::new(&config.node_bin);
+        configure_node_environment(&mut command);
         command
             .arg(&config.entry)
             .arg("--rez-sidecar")
@@ -326,38 +327,84 @@ impl Drop for SidecarHandle {
     }
 }
 
-/// Resolve the Node binary for the sidecar. Order:
-///   1. REZ_NODE_BIN env (explicit override)
-///   2. dev (debug) builds: `node` on PATH — it matches the architecture of
-///      the developer's npm-installed native modules (better-sqlite3). The
-///      bundled externalBin follows the RUST target triple, which on a
-///      Rosetta-installed rustup is x86_64 even on arm64 Macs; loading an
-///      arm64 .node from an x86_64 node aborts the sidecar.
-///   3. release builds: the app-specific bundled sidecar binary next to the
-///      app executable (externalBin), PATH `node` as a last resort.
-pub fn resolve_node_bin() -> PathBuf {
-    if let Ok(env_bin) = std::env::var("REZ_NODE_BIN") {
-        let trimmed = env_bin.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+// The key-holding Node process receives only OS/session plumbing. In
+// particular, Node flags, module paths, loader hooks, dynamic-library
+// injection, proxies and Rez developer overrides never cross this boundary.
+fn configure_node_environment(command: &mut Command) {
+    command.env_clear();
+    for name in [
+        "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "TMP", "TEMP",
+        "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SHELL", "USERPROFILE",
+        "APPDATA", "LOCALAPPDATA", "SystemRoot", "WINDIR", "COMSPEC",
+        "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
         }
     }
-    if cfg!(debug_assertions) {
-        return PathBuf::from("node");
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let bundled = dir.join(if cfg!(windows) {
-                "rez-chat-node.exe"
-            } else {
-                "rez-chat-node"
-            });
-            if bundled.exists() {
-                return bundled;
+}
+
+fn node_binary_path(debug: bool, override_path: Option<PathBuf>, executable: Option<PathBuf>) -> Result<PathBuf, String> {
+    if debug {
+        if let Some(path) = override_path {
+            if !path.as_os_str().is_empty() {
+                return Ok(path);
             }
         }
+        return Ok(PathBuf::from("node"));
     }
-    PathBuf::from("node")
+    let executable = executable.ok_or("cannot locate the packaged launcher")?;
+    let directory = executable.parent().ok_or("packaged launcher has no parent directory")?;
+    let bundled = directory.join(if cfg!(windows) { "rez-chat-node.exe" } else { "rez-chat-node" });
+    if !bundled.is_file() {
+        return Err("bundled Node executable is missing; reinstall this desktop candidate".to_string());
+    }
+    Ok(bundled)
+}
+
+pub fn resolve_node_bin() -> Result<PathBuf, String> {
+    node_binary_path(
+        cfg!(debug_assertions),
+        std::env::var("REZ_NODE_BIN").ok().map(|value| PathBuf::from(value.trim())),
+        std::env::current_exe().ok(),
+    )
+}
+
+#[cfg(test)]
+mod launcher_security_tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_environment_drops_injection_and_developer_values() {
+        let mut command = Command::new("unused");
+        for name in ["NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "REZ_CHAT_ROOT", "REZ_NODE_BIN", "REZ_CONTROL_TOKEN", "HTTPS_PROXY"] {
+            command.env(name, "hostile-parent-value");
+        }
+        configure_node_environment(&mut command);
+        let retained: Vec<_> = command.get_envs().filter_map(|(name, value)| value.map(|_| name)).collect();
+        for name in ["NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "REZ_CHAT_ROOT", "REZ_NODE_BIN", "REZ_CONTROL_TOKEN", "HTTPS_PROXY"] {
+            assert!(!retained.iter().any(|key| *key == name));
+        }
+        if std::env::var_os("HOME").is_some() {
+            assert!(retained.iter().any(|key| *key == "HOME"));
+        }
+    }
+
+    #[test]
+    fn packaged_node_never_uses_developer_override_or_path_fallback() {
+        let directory = std::env::temp_dir().join(format!("rez-node-resolution-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("rez-chat-shell");
+        assert!(node_binary_path(false, Some(PathBuf::from("hostile-node")), Some(executable.clone())).is_err());
+        let bundled = directory.join(if cfg!(windows) { "rez-chat-node.exe" } else { "rez-chat-node" });
+        std::fs::write(&bundled, "test fixture, never executed").unwrap();
+        assert_eq!(node_binary_path(false, Some(PathBuf::from("hostile-node")), Some(executable)).unwrap(), bundled);
+        assert!(node_binary_path(false, None, None).is_err());
+        assert_eq!(node_binary_path(true, Some(PathBuf::from("developer-node")), None).unwrap(), PathBuf::from("developer-node"));
+        assert_eq!(node_binary_path(true, None, None).unwrap(), PathBuf::from("node"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[cfg(windows)]

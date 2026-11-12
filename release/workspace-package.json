@@ -1,0 +1,15 @@
+{
+  "name": "rez-polyrepo-build-root",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": [
+    "rez-core",
+    "rez-sdk",
+    "rez-node",
+    "rez-chat",
+    "rez-ui"
+  ],
+  "overrides": {
+    "minimatch@>=7.0.0 <11.0.1": "^11.0.1"
+  }
+}

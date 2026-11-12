@@ -3,8 +3,9 @@ import { nonEmptyString } from "./coerce.js";
 
 /**
  * StoredServerIdentity: the persisted local identity envelope for the
- * chat-server process. Contains the account id, the per-process device id,
- * and the keypair (Base64). Stored once on first boot and loaded thereafter.
+ * chat-server process. Current admin-root rows contain public identity only;
+ * the runtime record receives its private key from the unlocked vault.
+ * Legacy inline rows remain readable solely for the verified-vault scrub.
  *
  * S9: `hasAdminRoot` distinguishes an admin-root row (holds the account
  * private key — every pre-S9 blob, where the field is absent) from a

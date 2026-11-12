@@ -23,9 +23,10 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const NODE_VERSION = "22.15.0";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHAT_ROOT = path.resolve(__dirname, "..");
+const NODE_VERSION = fs.readFileSync(path.join(CHAT_ROOT, ".node-version"), "utf8").trim();
+if (!/^\d+\.\d+\.\d+$/.test(NODE_VERSION)) throw new Error("A pinned desktop Node version is required");
 const BIN_DIR = path.join(CHAT_ROOT, "src-tauri", "binaries");
 const SIDECAR_BASENAME = "rez-chat-node";
 
@@ -61,10 +62,8 @@ async function main() {
   const isWindows = triple.includes("windows");
   const outName = SIDECAR_BASENAME + "-" + triple + (isWindows ? ".exe" : "");
   const outPath = path.join(BIN_DIR, outName);
-  if (fs.existsSync(outPath)) {
-    console.log("[fetch-sidecar-node] already present: " + outPath);
-    return;
-  }
+  // Always verify the pinned archive. An old or replaced cached executable
+  // must not silently survive a sidecar runtime/security update.
   fs.mkdirSync(BIN_DIR, { recursive: true });
 
   const archiveName = spec.dist + "." + spec.ext;

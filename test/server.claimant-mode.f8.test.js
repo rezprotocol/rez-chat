@@ -5,7 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
-import { bytesToBase64, MemoryStorageProvider as CoreMemoryStorageProvider } from "@rezprotocol/core";
+import { Identity, bytesToBase64, MemoryStorageProvider as CoreMemoryStorageProvider } from "@rezprotocol/core";
 import { NodeCryptoProvider, startRezNode } from "@rezprotocol/node";
 
 import { InboxClaimant } from "../src/server/inbox/InboxClaimant.js";
@@ -294,11 +294,17 @@ test("F8.1: a claimant-mode desktop boot — real bootstrapChatServer + full Cha
   });
   t.after(() => nodeApp.stop().catch(() => {}));
   const nodeIdentity = nodeApp.runtime.getIdentity();
+  const accountIdentity = await Identity.generate({ cryptoProvider: CRYPTO });
 
   const bootstrapped = await bootstrapChatServer({
     nodeDataDir: path.join(tmpDir, "chat-data"),
     wsUrl: "ws://127.0.0.1:" + wsPort + "/ws",
     expectedNodePublicKeyB64: nodeIdentity.nodePublicKeyB64,
+    expectedChatServerIdentity: {
+      accountId: accountIdentity.getAccountId(),
+      publicKeyB64: bytesToBase64(accountIdentity.getPublicKeyBytes()),
+      privateKeyB64: bytesToBase64(accountIdentity.getPrivateKeyBytes()),
+    },
     sessionMode: "claimant",
     logger: { log() {}, warn() {}, error() {} },
   });

@@ -512,7 +512,9 @@ export class ServerEventService extends BaseServerService {
             err && err.message ? err.message : err);
           // Byte/control failures must never become ordinary chat bubbles.
           if (decodedPayload.kind === FILE_MANIFEST_KIND || decodedPayload.kind === FILE_CHUNK_KIND) throw err;
-          return false;
+          // A failed control operation must remain retryable in the durable
+          // inbound pipeline, never become an ordinary chat message.
+          throw err;
         });
         if (consumed) return;
       } else if (!entry) {

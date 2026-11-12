@@ -77,9 +77,10 @@ export async function startRezChat(options = {}) {
   // identity, both separate from the node's. This is the data-split
   // foundation for Shape A (see docs/HOSTED_NODE_DESIGN.md §10).
   //
-  // Identity: chat-server generates an ed25519 keypair on first boot and
-  // persists it in chat-server's storage. The account ID derives from
-  // chat-server's pubkey, NOT from the node's. The node has its own
+  // Identity: the unlocked vault supplies the account keypair. Chat-server
+  // persists only its public identity assertion; it never generates a fallback
+  // account or stores the root private key. The account ID derives from
+  // that account's pubkey, NOT from the node's. The node has its own
   // separate keypair for its routing/network role. In a hosted-node
   // deployment, chat-server's private key never reaches the operator —
   // only its pubkey, and only as the verifiable claim in session.hello.

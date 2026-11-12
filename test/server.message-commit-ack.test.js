@@ -36,7 +36,6 @@ class AppKV {
   constructor() { this._data = new Map(); this._failSetIncludes = ""; }
   async get(key) { return this._data.get(key); }
   async getStrict(key) { return this._data.has(key) ? this._data.get(key) : undefined; }
-  async getStrict(key) { return this.get(key); }
   async set(key, value) {
     if (this._failSetIncludes && String(key).includes(this._failSetIncludes)) {
       this._failSetIncludes = "";
@@ -613,6 +612,32 @@ test("commit proof is retained until delivered status is durable", async (t) => 
   assert.equal((await pendingOf(alice)).length, 1, "proof intent remains durable after status failure");
 
   await alice.app.bus.services.messages.handleCommitAck(ack, { senderAccountId: bobAccount.accountId });
+  assert.equal((await rowOf(alice, "m1")).status, "delivered");
+  assert.equal((await pendingOf(alice)).length, 0);
+});
+
+test("a failed commit-ack dispatch never persists a peer message and the same frame can retry", async (t) => {
+  const storage = new AppStorageProvider();
+  const { network, alice, bob, bobAccount } = await setupPair({ aliceStorage: storage });
+  t.after(() => teardown(alice, bob));
+  await sendSigned(alice, { messageId: "m1", text: "retry the proof" });
+  network.queue.length = 0;
+  const ack = ackFromAccount(bobAccount, {
+    messageId: "m1",
+    messageFingerprint: (await pendingOf(alice))[0].fingerprint,
+  });
+  const deposit = {
+    eventId: "evt_failed_ack",
+    mailboxId: "inbox:alice",
+    plaintextB64: Buffer.from(JSON.stringify(ack)).toString("base64"),
+    senderAccountId: bobAccount.accountId,
+  };
+  storage.getKeyValueStore(alice.account.accountId).failNextSetIncluding("app:messages/");
+  await assert.rejects(() => alice.app.bus.services.events.applyUserMessage(deposit), /injected set failure/);
+  assert.equal((await rowOf(alice, "m1")).text, "retry the proof");
+  assert.equal((await rowOf(alice, "m1")).status, "sent");
+  assert.equal((await pendingOf(alice)).length, 1);
+  await alice.app.bus.services.events.applyUserMessage(deposit);
   assert.equal((await rowOf(alice, "m1")).status, "delivered");
   assert.equal((await pendingOf(alice)).length, 0);
 });

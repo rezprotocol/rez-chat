@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { startRezNode } from "@rezprotocol/node";
-import { bootstrapChatServer } from "../src/server/index.js";
+import { bootstrapTestChatServer } from "./support/bootstrapTestChatServer.js";
 import { MESH_FORM_WAIT_MS } from "./support/meshFormWait.js";
 
 /**
@@ -82,7 +82,7 @@ async function startChatLeaf({ tmp, label, entryRelayKeyId, entryRelayPort }) {
     },
   });
   const wsUrl = "ws://127.0.0.1:" + wsPort + wsPath;
-  const bootstrapped = await bootstrapChatServer({ nodeDataDir: dataDir, wsUrl, logger: silentLogger });
+  const bootstrapped = await bootstrapTestChatServer({ nodeDataDir: dataDir, wsUrl, logger: silentLogger });
   await bootstrapped.chatServer.start();
   return { label, nodeApp, chat: bootstrapped.chatServer, accountId: bootstrapped.ownerAccountId };
 }
