@@ -28,7 +28,7 @@ is `0.6.0-rc.15`; Core, SDK and Node use the same private coordinated version.
 - **Release inputs:** `.node-version` pins Node 24.22.2. The fetcher verifies its
   official archive checksum every time rather than trusting an existing binary.
   `rust-toolchain.toml`, Cargo manifests/lock and the existing JavaScript build
-  dependencies are updated. No direct dependency or vendored code is added.
+  dependencies are updated. No direct dependency or vendored code is added. The same Tauri CLI 2.11.2 is fetched from its official, SHA-256-pinned release binary instead of recompiling the builder.
   Tauri resource sources and native-module rebuilds use the root workspace.
   `release/workspace-package{,-lock}.json` reproduce that single install.
 - **Support floor:** this candidate requires **macOS 13.5+**, matching its bundled
@@ -42,7 +42,7 @@ is `0.6.0-rc.15`; Core, SDK and Node use the same private coordinated version.
   check is distinct from tests of the shipped Tauri installer.
 - **Private build workflow:** manual-only, immutable sibling revisions, read-only
   repository permissions, security/recovery gates before builds, platform-native
-  builds, macOS signing/notarization verification and real installed-app smoke
+  builds selected from `release/desktop-build-inputs.json`, macOS signing/notarization verification and real installed-app smoke
   tests. macOS also upgrades a checksum-pinned rc.10 profile using each bundle's
   actual vault/storage/SQLite code. Only CMS AES-256-GCM ciphertext is uploaded;
   its RSA-OAEP recipient private key stays on the operator's machine. There is no
@@ -77,7 +77,7 @@ Evidence is kept privately at `/tmp/rez-desktop-private-20261112/`:
 | Published rc.10 to candidate artifact upgrade | PASS: real old vault/SQLite/encrypted message; wrong-password evidence preserved; same network/account device identities; root key scrub; two runtime boots and two installed-shell launches |
 | Final packaged-verifier and boundary checks | PASS: eight tests, no skips |
 | Database-backed complete local mesh | PASS: 16 tests, zero failures and zero skips |
-| Signed/notarized macOS and Linux installers | Owner approved private signed CI; qualification pending, unsigned local output is not a substitute |
+| Signed/notarized macOS and Linux installers | Apple Silicon + Linux PASS; Intel format qualification retry pending; see platform notes below |
 
 An initial local backed mesh run collided with the Electron test's temporary
 SQLite ABI rebuild. The isolated failing case passed after restoring the Node
@@ -125,27 +125,64 @@ packaged verifier symlink regression, synthetic restart fixture ownership,
 real two-window UI gate and reusable artifact upgrade checker. Existing mesh
 and backend recovery assertions remain in force.
 
-**Remaining acceptance:** private CI signing/notarization, actual Intel/Linux
-installer results and OS-keychain/biometric interaction; physical older-Mac
-coverage and owner visual acceptance. No iPhone/Swift/Windows acceptance is
+**Remaining acceptance:** Intel legacy-format qualification, OS-keychain/biometric
+interaction, physical older-Mac coverage and owner visual acceptance. Automatic
+updater application/rollback against a release feed was not performed. No iPhone/Swift/Windows acceptance is
 claimed. No public distribution is approved by these checks.
 
-## Final local disposition
+## Private platform qualification
 
-All local gates above pass. Automatic approval review rejected the combined
-source-branch push and signing-workflow dispatch: the repositories are public,
-and sending source plus encrypted artifacts to GitHub was not considered
-explicitly authorized by the private-candidate request. No remote push or
-workflow dispatch ran. The owner subsequently explicitly approved the candidate source pushes and
-private encrypted signed build. That signing/Intel/Linux qualification is now
-authorized and will be recorded separately when it completes.
+Runtime source/dependency cut: `5c4c47048dbc3a428b4c7ecf247cec9401ca187f`.
+[Private CI 43315856191](https://github.com/rezprotocol/rez-chat/actions/runs/43315856191)
+passed all shared gates. Apple Silicon and Linux installers completed their
+platform gates and encrypted uploads. Downloads were authenticated-decrypted
+locally and matched both archive checksums and the exact source commit.
 
-The private Node 24 platform floor is documented upstream at
-[Node v24.22.2 build requirements](https://github.com/nodejs/node/blob/v24.22.2/BUILDING.md).
-The refreshed Tauri generated ACL/schemas add command descriptions for exit,
-fullscreen-on-monitor and notification-listener removal; only listener removal
-is added to notification defaults. App capability configuration is unchanged;
-no filesystem, network, loader or shell-execution permission is introduced.
+The signed Apple Silicon DMG additionally passed local strict/deep code-signature
+verification, Gatekeeper, ticket validation, two fresh launches, two launches
+over a migrated rc.10 profile, and two hostile-environment launches without
+executing the injection marker. The artifact's actual sidecar then completed
+two password-unlock, real node-status RPC, encrypted-history read and lock cycles
+in the SAME process, with a required clean exit. This is reproducible with
+`scripts/verify-packaged-session.mjs`; host keychain/biometric availability is
+explicitly unavailable in that synthetic password-vault test. Native UI
+automation is not enabled on the local Mac; no physical-keychain, biometric or
+full native WebKit visual-interaction acceptance is claimed. The actual two-user
+renderer flow was exercised in the Electron development shell, separately.
+
+Intel's new signed installer passed its two fresh starts. One ticket validation
+failed after Apple accepted notarization because Apple's CloudKit connection
+was lost (NSURLError -1005); only the failed platform was rerun. Bounded strict
+ticket-check retries and compiler-cache retention on failure now prevent that
+external transient from unnecessarily discarding a build in future runs.
+
+The next Intel attempt exposed a defect in the OLD published rc.10 Intel asset:
+its SQLite addon is ARM-only and cannot load in its x86 Node runtime. Its pinned
+archive SHA-256 matches the official release, so this is an existing packaging
+defect. The candidate builds on native Intel runners and already passed its
+actual SQLite/vault startup checks. There is no claim that the broken old Intel
+executable successfully created a profile. Instead, the explicitly named Intel
+FORMAT fixture uses the verified old JS/schema/crypto tree with only the SQLite
+package and its loader dependencies replaced by the candidate's compatible
+signed package, under the candidate Node runtime. That fixture method was
+verified locally; the dedicated Intel CI qualification remains pending at this
+checkpoint. Apple Silicon's upgrade fixture uses the unmodified old published
+artifact and its actual old Node/SQLite runtime.
+
+The owner explicitly authorized the five candidate source branches and encrypted
+private signing runs. Public releases, npm writes, updater promotion and hosted
+deployments remain unauthorized and unchanged by this work. All five original
+HEADs, tracked diffs and untracked-file contents match their initial snapshots.
+
+Upstream references: [Node v24.22.2 platform requirements](https://github.com/nodejs/node/blob/v24.22.2/BUILDING.md),
+[official Tauri CLI 2.11.2 release](https://github.com/tauri-apps/tauri/releases/tag/tauri-cli-v2.11.2).
+The refreshed Tauri ACL/schemas add exit/fullscreen command descriptions and
+notification-listener removal; only listener removal enters notification
+defaults. App capability configuration is unchanged; no filesystem, network,
+loader or shell-execution permission is introduced. Historical comments refer
+to `HOSTED_NODE_DESIGN.md`, which is absent from this checkout and was not
+checked; current `CHAT_APP_SPEC.md` and the listed executable contracts were
+checked instead. Those stale comment links remain a documentation follow-up.
 
 ### Files changed
 
@@ -216,3 +253,5 @@ no filesystem, network, loader or shell-execution permission is introduced.
 - `release/workspace-package.json`
 - `release/workspace-package-lock.json`
 - `docs/DESKTOP_PRIVATE_CANDIDATE_2026-11-12.md`
+- `scripts/verify-packaged-session.mjs`
+- `release/desktop-build-inputs.json`

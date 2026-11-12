@@ -8,6 +8,15 @@ on:
         description: Public X.509 encryption certificate; private key stays with the operator
         type: string
         required: true
+      target:
+        description: Platform to qualify; existing successful platforms need not rebuild
+        type: choice
+        default: all
+        options:
+          - all
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+          - x86_64-unknown-linux-gnu
 
 permissions:
   contents: read
@@ -23,8 +32,11 @@ env:
 jobs:
   preflight:
     name: Security and recovery preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      matrix: ${{ steps.build-inputs.outputs.matrix }}
+      builder_version: ${{ steps.build-inputs.outputs.builder_version }}
     services:
       postgres:
         image: postgres:16
@@ -90,6 +102,13 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.96.0"
+
+      - name: Select canonical build inputs
+        id: build-inputs
+        env:
+          REQUESTED_TARGET: ${{ inputs.target }}
+        run: |
+          node --input-type=module -e 'import fs from "node:fs"; const spec=JSON.parse(fs.readFileSync("rez-chat/release/desktop-build-inputs.json")); const requested=process.env.REQUESTED_TARGET || "all"; const targets=requested==="all" ? spec.targets : spec.targets.filter(row=>row.target===requested); if (!targets.length) throw new Error("Unknown desktop target"); fs.appendFileSync(process.env.GITHUB_OUTPUT, "builder_version="+spec.tauriCliVersion+"\nmatrix="+JSON.stringify({include:targets})+"\n");'
 
       - name: Install the locked root workspace
         shell: bash
@@ -172,18 +191,8 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            target: aarch64-apple-darwin
-            bundles: app,dmg
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            bundles: app,dmg
-          # Windows remains deferred until signing credentials are provisioned.
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bundles: appimage,deb
+      # Windows remains deferred until signing credentials are provisioned.
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
 
     runs-on: ${{ matrix.os }}
 
@@ -236,6 +245,7 @@ jobs:
         uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: rez-chat/src-tauri
+          cache-on-failure: true
 
       - name: Add Rust target for the pinned toolchain
         # dtolnay/rust-toolchain adds `targets` to `stable`, but
@@ -313,7 +323,34 @@ jobs:
           fi
 
       - name: Install the pinned desktop builder
-        run: cargo install tauri-cli --locked --version 2.11.2
+        shell: bash
+        env:
+          BUILDER_VERSION: ${{ needs.preflight.outputs.builder_version }}
+          BUILDER_ARCHIVE: ${{ matrix.cliArchive }}
+          BUILDER_SHA256: ${{ matrix.cliSha256 }}
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/rez-desktop-builder"
+          mkdir -p "$tools/unpacked"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "$tools/$BUILDER_ARCHIVE" \
+            "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v$BUILDER_VERSION/$BUILDER_ARCHIVE"
+          if [ "$RUNNER_OS" = macOS ]; then
+            printf '%s  %s\n' "$BUILDER_SHA256" "$tools/$BUILDER_ARCHIVE" | shasum -a 256 --check
+          else
+            printf '%s  %s\n' "$BUILDER_SHA256" "$tools/$BUILDER_ARCHIVE" | sha256sum --check
+          fi
+          case "$BUILDER_ARCHIVE" in
+            *.zip) unzip -q "$tools/$BUILDER_ARCHIVE" -d "$tools/unpacked" ;;
+            *.tgz) tar -xzf "$tools/$BUILDER_ARCHIVE" -C "$tools/unpacked" ;;
+            *) exit 1 ;;
+          esac
+          builder=$(find "$tools/unpacked" -type f -name cargo-tauri -print -quit)
+          test -n "$builder"
+          mkdir -p "$HOME/.cargo/bin"
+          cp "$builder" "$HOME/.cargo/bin/cargo-tauri"
+          chmod +x "$HOME/.cargo/bin/cargo-tauri"
+          test "$(cargo tauri --version | awk '{print $NF}')" = "$BUILDER_VERSION"
 
       - name: Test native launcher security
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml launcher_security_tests
@@ -363,12 +400,22 @@ jobs:
           trap - EXIT
           codesign --verify --deep --strict --verbose=2 "$installed"
           spctl --assess --type execute --verbose=2 "$installed"
-          xcrun stapler validate "$installed"
+          # Apple's ticket lookup can lose its connection after notarization
+          # succeeds. Retry the same strict check; never bypass its result.
+          ticket_validated=0
+          for validation_attempt in 1 2 3; do
+            if xcrun stapler validate "$installed"; then
+              ticket_validated=1
+              break
+            fi
+            if [ "$validation_attempt" -lt 3 ]; then sleep 10; fi
+          done
+          test "$ticket_validated" -eq 1
           node scripts/verify-packaged-desktop.mjs \
             --executable "$installed/Contents/MacOS/rez-chat-shell" \
             --data-dir "$RUNNER_TEMP/rez-installed-smoke-profile"
 
-      - name: Upgrade a real rc.10 encrypted profile with the signed macOS app
+      - name: Upgrade the rc.10 encrypted data format with the signed macOS app
         if: runner.os == 'macOS'
         working-directory: rez-chat
         env:
@@ -389,14 +436,32 @@ jobs:
           tar -xzf "$old/app.tar.gz" -C "$old"
           installed="$RUNNER_TEMP/rez-candidate-installed/Rez Chat.app"
           profile="$RUNNER_TEMP/rez-upgrade-profile"
-          "$old/Rez Chat.app/Contents/MacOS/node" scripts/verify-desktop-upgrade.mjs seed \
-            "$old/Rez Chat.app/Contents/Resources" "$profile"
+          if [ "$REZ_DESKTOP_TARGET" = x86_64-apple-darwin ]; then
+            # The published rc.10 Intel bundle contains an ARM-only SQLite
+            # addon and cannot create a vault on Intel. Preserve the verified
+            # old JS/schema/crypto code in a separate format-fixture tree,
+            # replacing only its native SQLite package with the candidate's
+            # compatible signed package. This is explicitly a format test,
+            # not a claim that the broken old Intel executable ran.
+            legacy_resources="$RUNNER_TEMP/rez-legacy-format-resources"
+            ditto "$old/Rez Chat.app/Contents/Resources" "$legacy_resources"
+            for module in better-sqlite3 bindings file-uri-to-path; do
+              rm -rf "$legacy_resources/node_modules/$module"
+              ditto "$installed/Contents/Resources/node_modules/$module" "$legacy_resources/node_modules/$module"
+            done
+            "$installed/Contents/MacOS/rez-chat-node" scripts/verify-desktop-upgrade.mjs seed "$legacy_resources" "$profile"
+          else
+            "$old/Rez Chat.app/Contents/MacOS/node" scripts/verify-desktop-upgrade.mjs seed \
+              "$old/Rez Chat.app/Contents/Resources" "$profile"
+          fi
           for boot in 1 2; do
             "$installed/Contents/MacOS/rez-chat-node" scripts/verify-desktop-upgrade.mjs check \
               "$installed/Contents/Resources" "$profile"
           done
           node scripts/verify-packaged-desktop.mjs \
             --executable "$installed/Contents/MacOS/rez-chat-shell" --data-dir "$profile"
+          "$installed/Contents/MacOS/rez-chat-node" scripts/verify-packaged-session.mjs \
+            "$installed/Contents/MacOS/rez-chat-node" "$installed/Contents/Resources" "$profile"
 
       - name: Install and smoke Linux deb twice
         if: runner.os == 'Linux'

@@ -1,0 +1,26 @@
+{
+  "tauriCliVersion": "2.11.2",
+  "targets": [
+    {
+      "os": "macos-15",
+      "target": "aarch64-apple-darwin",
+      "bundles": "app,dmg",
+      "cliArchive": "cargo-tauri-aarch64-apple-darwin.zip",
+      "cliSha256": "bfe1db27714f49c47ae1d8566e1029ede843ae7aac361fe8c0ba3a4bfc21d877"
+    },
+    {
+      "os": "macos-15-intel",
+      "target": "x86_64-apple-darwin",
+      "bundles": "app,dmg",
+      "cliArchive": "cargo-tauri-x86_64-apple-darwin.zip",
+      "cliSha256": "d19d373866765ecf17112501daa645b8be3f23d231989a7824d4ec73b1efddb2"
+    },
+    {
+      "os": "ubuntu-24.04",
+      "target": "x86_64-unknown-linux-gnu",
+      "bundles": "appimage,deb",
+      "cliArchive": "cargo-tauri-x86_64-unknown-linux-gnu.tgz",
+      "cliSha256": "1da3864154731ca0c98436392d4793c70a3f151be7beb59d8aa17092aca53c1e"
+    }
+  ]
+}
