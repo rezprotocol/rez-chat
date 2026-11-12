@@ -76,12 +76,12 @@ Evidence is kept privately at `/tmp/rez-desktop-private-20261112/`:
 | Installed release with hostile Node options / developer paths | PASS: two boots, injection marker never written |
 | Published rc.10 to candidate artifact upgrade | PASS: real old vault/SQLite/encrypted message; wrong-password evidence preserved; same network/account device identities; root key scrub; two runtime boots and two installed-shell launches |
 | Final packaged-verifier and boundary checks | PASS: eight tests, no skips |
-| Database-backed complete local mesh | Final run pending at initial source checkpoint; see final qualification receipt |
-| Signed/notarized macOS and Linux installers | Pending private CI; unsigned local output is not a substitute |
+| Database-backed complete local mesh | PASS: 16 tests, zero failures and zero skips |
+| Signed/notarized macOS and Linux installers | Owner approved private signed CI; qualification pending, unsigned local output is not a substitute |
 
 An initial local backed mesh run collided with the Electron test's temporary
 SQLite ABI rebuild. The isolated failing case passed after restoring the Node
-binding. The complete backed gate is rerun serially; no product code or readiness
+binding. The complete backed gate then passed serially; no product code or readiness
 assertion was weakened to hide that test-environment error. The private workflow
 runs these stages serially too.
 
@@ -129,3 +129,90 @@ and backend recovery assertions remain in force.
 installer results and OS-keychain/biometric interaction; physical older-Mac
 coverage and owner visual acceptance. No iPhone/Swift/Windows acceptance is
 claimed. No public distribution is approved by these checks.
+
+## Final local disposition
+
+All local gates above pass. Automatic approval review rejected the combined
+source-branch push and signing-workflow dispatch: the repositories are public,
+and sending source plus encrypted artifacts to GitHub was not considered
+explicitly authorized by the private-candidate request. No remote push or
+workflow dispatch ran. The owner subsequently explicitly approved the candidate source pushes and
+private encrypted signed build. That signing/Intel/Linux qualification is now
+authorized and will be recorded separately when it completes.
+
+The private Node 24 platform floor is documented upstream at
+[Node v24.22.2 build requirements](https://github.com/nodejs/node/blob/v24.22.2/BUILDING.md).
+The refreshed Tauri generated ACL/schemas add command descriptions for exit,
+fullscreen-on-monitor and notification-listener removal; only listener removal
+is added to notification defaults. App capability configuration is unchanged;
+no filesystem, network, loader or shell-execution permission is introduced.
+
+### Files changed
+
+**rez-core**
+
+- `package.json`
+
+**rez-sdk**
+
+- `package.json`
+- `src/peer-link/PeerLinkService.js`
+- `test/peer-link.runtime-ownership.audit.test.js`
+
+**rez-node**
+
+- `package.json`
+- `release/workspace-package-lock.json`
+
+**rez-ui**
+
+- `package.json`
+
+**rez-chat**
+
+- `.github/workflows/desktop-build.yml`
+- `package.json`
+- `rust-toolchain.toml`
+- `scripts/desktop-native-modules.mjs`
+- `scripts/fetch-sidecar-node.mjs`
+- `scripts/verify-packaged-desktop.mjs`
+- `src-tauri/Cargo.lock`
+- `src-tauri/Cargo.toml`
+- `src-tauri/gen/schemas/acl-manifests.json`
+- `src-tauri/gen/schemas/desktop-schema.json`
+- `src-tauri/gen/schemas/macOS-schema.json`
+- `src-tauri/src/lib.rs`
+- `src-tauri/src/sidecar.rs`
+- `src-tauri/tauri.conf.json`
+- `src/index.js`
+- `src/records/domain/StoredServerIdentity.js`
+- `src/server/bootstrap/bootstrapChatServer.js`
+- `src/server/identity/ChatServerIdentity.js`
+- `src/server/services/ServerEventService.js`
+- `test/chat-server.identity.bip39.test.js`
+- `test/desktop.packaged-smoke.test.js`
+- `test/desktop.two-user-ui.integration.test.js`
+- `test/e2e.internet.catchup.test.js`
+- `test/e2e.internet.chat.test.js`
+- `test/e2e.internet.group-offline-accept.test.js`
+- `test/e2e.internet.group-three.test.js`
+- `test/e2e.internet.group.test.js`
+- `test/e2e.internet.queued.test.js`
+- `test/e2e.internet.recovery.test.js`
+- `test/e2e.local-mesh.chat.test.js`
+- `test/e2e.local-mesh.delegated-invite.test.js`
+- `test/e2e.local-mesh.group-coremember-separation.test.js`
+- `test/e2e.local-mesh.group-offline-accept.test.js`
+- `test/e2e.local-mesh.group-reconnect.test.js`
+- `test/e2e.local-mesh.group-recovery.test.js`
+- `test/e2e.local-mesh.group-three.test.js`
+- `test/e2e.local-mesh.group.test.js`
+- `test/e2e.local-mesh.reconnect-asymmetric.test.js`
+- `test/server.claimant-mode.f8.test.js`
+- `test/server.message-commit-ack.test.js`
+- `.node-version`
+- `test/support/bootstrapTestChatServer.js`
+- `scripts/verify-desktop-upgrade.mjs`
+- `release/workspace-package.json`
+- `release/workspace-package-lock.json`
+- `docs/DESKTOP_PRIVATE_CANDIDATE_2026-11-12.md`
