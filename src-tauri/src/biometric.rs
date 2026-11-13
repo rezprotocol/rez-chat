@@ -1,12 +1,14 @@
-//! Biometric authorization gate (Touch ID / Windows Hello).
+//! OS authorization gate (macOS owner authentication / Windows Hello).
 //!
-//! Port of electron/runtime/BiometricGate.mjs semantics:
+//! Host authentication contract:
 //!   - `is_available()` -> platform supports a biometric prompt right now
 //!   - `authenticate(reason)` -> Ok(true) on success, Ok(false) on user
 //!     cancel, Err on platform failure
 //!   - Linux: unavailable, fail-closed (SECURITY_AUDIT MED-18) — the
-//!     keyring-gated unlock path still applies, exactly as under Electron.
+//!     password unlock remains available; device unlock never skips consent.
 //!
+//! macOS authentication permits the OS password fallback even when the
+//! separate biometric capability probe reports unavailable.
 //! This is the user-authorization GESTURE only; the cryptographic boundary
 //! remains the keychain-held device key (see keychain.rs).
 
@@ -15,7 +17,7 @@ mod imp {
     use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2_foundation::{NSError, NSString};
-    use objc2_local_authentication::{LAContext, LAPolicy};
+    use objc2_local_authentication::{LAContext, LAError, LAPolicy};
     use std::ptr::NonNull;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -31,13 +33,14 @@ mod imp {
 
     pub fn authenticate(reason: &str) -> Result<bool, String> {
         let (tx, rx) = mpsc::channel::<Result<bool, String>>();
+        // Retain this request context until its asynchronous reply completes.
+        let context = unsafe { LAContext::new() };
         unsafe {
-            let context = LAContext::new();
             if context
-                .canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics)
+                .canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication)
                 .is_err()
             {
-                return Err("biometric unavailable".to_string());
+                return Err("Native authentication unavailable; unlock with your Rez password".to_string());
             }
             let localized = NSString::from_str(reason);
             let reply = RcBlock::new(move |success: objc2::runtime::Bool, error: *mut NSError| {
@@ -45,30 +48,59 @@ mod imp {
                     let _ = tx.send(Ok(true));
                     return;
                 }
-                let message = NonNull::new(error)
-                    .map(|ptr| {
+                let outcome = match NonNull::new(error) {
+                    Some(ptr) => {
                         let err: Retained<NSError> = Retained::retain(ptr.as_ptr()).unwrap();
-                        err.localizedDescription().to_string()
-                    })
-                    .unwrap_or_else(|| "authentication failed".to_string());
-                // User cancel is a normal outcome, not a platform error.
-                if message.to_ascii_lowercase().contains("cancel") {
-                    let _ = tx.send(Ok(false));
-                } else {
-                    let _ = tx.send(Err(message));
-                }
+                        if is_cancellation(err.code()) {
+                            Ok(false)
+                        } else {
+                            Err(err.localizedDescription().to_string())
+                        }
+                    }
+                    None => Err("native authentication failed".to_string()),
+                };
+                let _ = tx.send(outcome);
             });
             context.evaluatePolicy_localizedReason_reply(
-                LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
+                LAPolicy::DeviceOwnerAuthentication,
                 &localized,
                 &reply,
             );
         }
         match rx.recv_timeout(Duration::from_secs(120)) {
             Ok(outcome) => outcome,
-            Err(_) => Err("biometric prompt timed out".to_string()),
+            Err(_) => {
+                unsafe { context.invalidate() };
+                Err("native authentication timed out".to_string())
+            },
         }
     }
+
+    fn is_cancellation(code: isize) -> bool {
+        [LAError::UserCancel, LAError::UserFallback, LAError::SystemCancel, LAError::AppCancel]
+            .iter()
+            .any(|error| error.0 == code)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cancellation_is_independent_of_os_message_language() {
+            for error in [LAError::UserCancel, LAError::UserFallback, LAError::SystemCancel, LAError::AppCancel] {
+                assert!(is_cancellation(error.0));
+            }
+        }
+
+        #[test]
+        fn authentication_errors_never_count_as_cancellation() {
+            for error in [LAError::AuthenticationFailed, LAError::PasscodeNotSet, LAError::NotInteractive] {
+                assert!(!is_cancellation(error.0));
+            }
+        }
+    }
+
 }
 
 #[cfg(target_os = "windows")]

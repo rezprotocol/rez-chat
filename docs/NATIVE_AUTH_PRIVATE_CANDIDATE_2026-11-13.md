@@ -1,0 +1,19 @@
+# Native authentication private candidate — 2026-11-13
+
+The packaged Tauri application requests OS authentication directly, without a preceding Rez warning. On macOS, LocalAuthentication's DeviceOwnerAuthentication policy owns Touch ID and system-password fallback. Only successful OS authorization permits the existing keychain-backed vault unlock. Cancellation, unavailable authentication and errors do not approve unlock; the user can still enter their Rez password.
+
+The capability probe continues to describe biometric hardware availability; it is not used to skip owner authentication. Windows keeps its existing Hello authorization adapter. Linux has no native owner-auth adapter and now fails closed for device unlock rather than silently accepting keychain access. Password unlock is unaffected; native Linux device-unlock UX is not certified by this change.
+
+The request context stays alive until the callback completes and is invalidated on timeout. Cancellation uses LocalAuthentication error codes rather than localized English text. The keychain-held key and password-vault formats do not change.
+
+## Verification and focused audit
+
+Local checks: four native tests pass, including two cancellation/error classification tests and the existing two launcher-injection/path tests. Twenty focused JavaScript tests pass with no failures or skips: native approval-before-vault ordering, cancellation/unavailability denial, keychain reset/password fallback and generic IPC boundaries. Signed rebuild and physical approval/cancellation acceptance are pending at this source checkpoint.
+
+Files changed: `src-tauri/src/lib.rs`, `src-tauri/src/biometric.rs`, `src/desktop/sidecar-main.js`, `src/desktop/runtime/registerDesktopIpc.js` (comment only), `test/desktop.ipc.test.js`, and this report. The user's explicit request for this native-authentication correction is the scope for these existing desktop Rust host edits. No dependency, build configuration, Swift, iPhone or protocol code changes.
+
+Contracts checked: the existing LocalAuthentication binding's policy/error APIs, `DesktopVaultService.unlockWithDevice`, the host-channel request/response path, `registerDesktopIpc`'s authorization ordering and cancellation behavior, `LoginUnlockView`'s locked/password fallback, and the desktop custody/transport ownership rules in AGENTS and CHAT_APP_SPEC. The old MED-10/MED-18 comment references have no matching headings in the current group-focused SECURITY_AUDIT document; they are historical labels rather than an independently verified native specification. This document states the current native authorization contract.
+
+Canonical owner: Rust host owns OS authentication and keychain access; Chat retains vault/session behavior. SDK/Node/UI ownership is unchanged. Duplicate/split-brain: removed the redundant Tauri confirmation helper and silent no-biometric approval; no replacement application dialog or parallel unlock path. The legacy Electron development host retains its existing adapter and is not the distributed Tauri application. Boundary/SSOT: generic host/IPC transport and existing confirmed response shape are retained; no new wire record or per-chat directive. God-class findings: no new class/module or responsibility expansion; changes remain within the existing native host adapter. Dead code removed: `confirm_unlock_with_device` warning helper and unavailable-biometric success branch. Tests added: three IPC authorization tests and two native cancellation-classification tests. This is an audit of touched code/direct dependencies, not a whole-repository audit.
+
+No public publication, updater feed change or live deployment is authorized. Original working trees and iPhone/Swift work stay untouched. A fresh signed candidate and owner-assisted native approval/cancellation tests are required before this revised artifact is marked qualified.

@@ -326,23 +326,16 @@ fn handle_host_request(
             "available": biometric::is_available(),
         })),
         "biometric.confirmUnlock" => {
-            // MED-10 dialog first; only a confirmed dialog reaches the
-            // biometric gesture (MED-18: skip gesture when unavailable —
-            // the keyring-gated unlock path still applies).
-            if !confirm_unlock_with_device(app) {
-                return Ok(serde_json::json!({ "confirmed": false }));
-            }
-            if !biometric::is_available() {
-                return Ok(serde_json::json!({ "confirmed": true, "biometric": false }));
-            }
+            // The OS owns user consent. Never approve a keychain-only unlock
+            // when native authentication is unavailable or cancelled.
             let reason = params
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unlock Rez");
             match biometric::authenticate(reason) {
-                Ok(true) => Ok(serde_json::json!({ "confirmed": true, "biometric": true })),
+                Ok(true) => Ok(serde_json::json!({ "confirmed": true })),
                 Ok(false) => Ok(serde_json::json!({ "confirmed": false })),
-                Err(err) => Err(format!("biometric authentication failed: {}", err)),
+                Err(err) => Err(format!("native authentication failed: {}", err)),
             }
         }
         "badge.set" => {
@@ -352,28 +345,6 @@ fn handle_host_request(
         }
         other => Err(format!("unhandled host op '{}'", other)),
     }
-}
-
-/// SECURITY_AUDIT MED-10: native confirmation dialog gating the biometric
-/// prompt. Runs on the sidecar's host-channel reader thread (never the main
-/// thread — the dialog API blocks). The webview cannot draw, dismiss, or
-/// click this dialog; a compromised renderer cannot silently chain into a
-/// biometric unlock.
-fn confirm_unlock_with_device(app: &tauri::AppHandle) -> bool {
-    app.dialog()
-        .message(
-            "Rez is requesting to unlock your local account vault using this \
-             device's biometric (Touch ID / Windows Hello).\n\n\
-             If you did NOT just take an action that should require an unlock, \
-             click Cancel.",
-        )
-        .title("Unlock Rez")
-        .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "Unlock".to_string(),
-            "Cancel".to_string(),
-        ))
-        .blocking_show()
 }
 
 /// Phases 2–4 of the boot sequence; runs OFF the main thread so the splash

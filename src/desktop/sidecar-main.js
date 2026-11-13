@@ -297,10 +297,9 @@ export async function startSidecar() {
   registerDesktopRuntimeIpc({
     ipcMain: controlUplink.ipcRegistry,
     supervisor,
-    // SECURITY_AUDIT MED-10/MED-18: the Rust host shows the native confirm
-    // dialog AND runs the biometric gesture as ONE atomic host op — the
-    // webview cannot reach between them. biometricGate stays null because
-    // the gesture lives inside confirmUnlock on the host side.
+    // The Rust host performs OS authentication as one atomic host operation.
+    // Approval/cancellation comes from the OS, never from renderer UI.
+    // biometricGate stays null because authentication runs in the host.
     biometricGate: null,
     getWindow: () => controlUplink.windowAdapter,
     confirmUnlockWithDevice: async () => {

@@ -180,3 +180,35 @@ test("desktop IPC wraps supervisor failures without throwing across bridge", asy
   assert.equal(result.ok, false);
   assert.equal(result.error.message, "boom");
 });
+
+test("native host approval must finish before the vault can unlock", async () => {
+  const ipcMain = new FakeIpcMain();
+  const supervisor = buildSupervisor();
+  const order = [];
+  supervisor.unlockWithDevice = async () => { order.push("vault"); return { unlocked: true }; };
+  registerDesktopRuntimeIpc({ ipcMain, supervisor, confirmUnlockWithDevice: async () => {
+    order.push("native-auth");
+    return true;
+  } });
+  const result = await ipcMain.invoke("desktop:vault:unlockWithDevice");
+  assert.equal(result.ok, true);
+  assert.deepEqual(order, ["native-auth", "vault"]);
+});
+
+for (const mode of ["cancel", "unavailable"]) {
+  test("native host " + mode + " cannot unlock the vault", async () => {
+    const ipcMain = new FakeIpcMain();
+    const supervisor = buildSupervisor();
+    let attempts = 0;
+    supervisor.unlockWithDevice = async () => { attempts += 1; };
+    registerDesktopRuntimeIpc({ ipcMain, supervisor, confirmUnlockWithDevice: async () => {
+      if (mode === "unavailable") throw new Error("Native authentication unavailable");
+      return false;
+    } });
+    const result = await ipcMain.invoke("desktop:vault:unlockWithDevice");
+    assert.equal(result.ok, false);
+    if (mode === "cancel") assert.equal(result.error.code, "UNLOCK_CANCELLED");
+    else assert.equal(result.error.message, "Native authentication unavailable");
+    assert.equal(attempts, 0);
+  });
+}

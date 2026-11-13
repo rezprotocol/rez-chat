@@ -54,10 +54,10 @@ export function registerDesktopRuntimeIpc({ ipcMain, supervisor, biometricGate =
   ipcMain.handle("desktop:vault:unlock", (_event, args = {}) => invoke((params) => supervisor.unlock(params), args));
   ipcMain.handle("desktop:vault:unlockWithDevice", (_event, args = {}) => invoke(async (params) => {
     // SECURITY_AUDIT MED-10: a renderer-side compromise can call this IPC
-    // programmatically. A native confirmation dialog (injected from main.mjs)
-    // gates the biometric prompt behind an interaction the renderer cannot
-    // fake. Tests may inject a no-op confirm to bypass this. Cancel here
-    // surfaces a typed error to the caller; no biometric is shown.
+    // programmatically. The injected host authorization must succeed before
+    // touching the vault. Tauri performs OS authentication directly; the
+    // legacy Electron host owns its own authorization adapter. Cancellation
+    // and native-authentication errors leave the vault locked.
     if (typeof confirmUnlockWithDevice === "function") {
       const confirmed = await confirmUnlockWithDevice();
       if (!confirmed) {
