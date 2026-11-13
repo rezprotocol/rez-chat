@@ -246,6 +246,8 @@ jobs:
         with:
           workspaces: rez-chat/src-tauri
           cache-on-failure: true
+          # Private installers must never be exported through a build cache.
+          cache-targets: false
 
       - name: Add Rust target for the pinned toolchain
         # dtolnay/rust-toolchain adds `targets` to `stable`, but

@@ -1,6 +1,7 @@
 # Private desktop candidate: 2026-11-12
 
-This is a qualification candidate, **not an approved public desktop release**.
+**Automated qualification: PASS on Apple Silicon, Intel Mac and Linux.**
+This is a private qualification candidate, **not an approved public desktop release**.
 No npm publication, release tag, GitHub Release, updater-feed promotion, container
 push or hosted deployment is part of this work. The private application version
 is `0.6.0-rc.15`; Core, SDK and Node use the same private coordinated version.
@@ -43,8 +44,9 @@ is `0.6.0-rc.15`; Core, SDK and Node use the same private coordinated version.
 - **Private build workflow:** manual-only, immutable sibling revisions, read-only
   repository permissions, security/recovery gates before builds, platform-native
   builds selected from `release/desktop-build-inputs.json`, macOS signing/notarization verification and real installed-app smoke
-  tests. macOS also upgrades a checksum-pinned rc.10 profile using each bundle's
-  actual vault/storage/SQLite code. Only CMS AES-256-GCM ciphertext is uploaded;
+  tests. macOS also checks a checksum-pinned rc.10 encrypted-data upgrade: ARM
+  uses the original executable; Intel uses the explicit legacy-format fixture
+  described below because the old published Intel SQLite binary is broken. Only CMS AES-256-GCM ciphertext is uploaded;
   its RSA-OAEP recipient private key stays on the operator's machine. There is no
   release-creation or updater-publishing step. Ciphertext expires after three days.
 
@@ -77,7 +79,8 @@ Evidence is kept privately at `/tmp/rez-desktop-private-20261112/`:
 | Published rc.10 to candidate artifact upgrade | PASS: real old vault/SQLite/encrypted message; wrong-password evidence preserved; same network/account device identities; root key scrub; two runtime boots and two installed-shell launches |
 | Final packaged-verifier and boundary checks | PASS: eight tests, no skips |
 | Database-backed complete local mesh | PASS: 16 tests, zero failures and zero skips |
-| Signed/notarized macOS and Linux installers | Apple Silicon + Linux PASS; Intel format qualification retry pending; see platform notes below |
+| Signed/notarized macOS and Linux installers | PASS: Apple Silicon and Intel DMG install/start/signature/ticket gates; Linux deb and AppImage each start twice |
+| Intel encrypted-data upgrade and packaged session | PASS: legacy-format fixture, two installed launches, two real sidecar unlock/RPC/history/lock cycles and clean exit |
 
 An initial local backed mesh run collided with the Electron test's temporary
 SQLite ABI rebuild. The isolated failing case passed after restoring the Node
@@ -119,14 +122,15 @@ crypto argument/imports, release-mode developer source/Node overrides, release
 PATH fallback, old sidecar cache fast path, tag-triggered publishing in the
 candidate workflow, unconfigured Windows jobs and stale UI-test assumptions.
 
-**Tests added/updated:** custody failure/legacy upgrade cases, durable ACK retry
+**Tests added/updated:** reusable packaged-session unlock/RPC/history/lock checker,
+custody failure/legacy upgrade cases, durable ACK retry
 cases, runtime ownership admission/retry cases, two native launcher tests,
 packaged verifier symlink regression, synthetic restart fixture ownership,
 real two-window UI gate and reusable artifact upgrade checker. Existing mesh
 and backend recovery assertions remain in force.
 
-**Remaining acceptance:** Intel legacy-format qualification, OS-keychain/biometric
-interaction, physical older-Mac coverage and owner visual acceptance. Automatic
+**Remaining acceptance:** OS-keychain/biometric interaction, physical older-Mac
+coverage and full native WebKit visual/user-flow acceptance. Automatic
 updater application/rollback against a release feed was not performed. No iPhone/Swift/Windows acceptance is
 claimed. No public distribution is approved by these checks.
 
@@ -153,8 +157,9 @@ renderer flow was exercised in the Electron development shell, separately.
 Intel's new signed installer passed its two fresh starts. One ticket validation
 failed after Apple accepted notarization because Apple's CloudKit connection
 was lost (NSURLError -1005); only the failed platform was rerun. Bounded strict
-ticket-check retries and compiler-cache retention on failure now prevent that
-external transient from unnecessarily discarding a build in future runs.
+ticket-check retries address that external transient without bypassing ticket
+verification. Future builds disable target-directory caching; task-owned native
+build caches were deleted after qualification. Only registry/tool caches remain.
 
 The next Intel attempt exposed a defect in the OLD published rc.10 Intel asset:
 its SQLite addon is ARM-only and cannot load in its x86 Node runtime. Its pinned
@@ -165,9 +170,29 @@ executable successfully created a profile. Instead, the explicitly named Intel
 FORMAT fixture uses the verified old JS/schema/crypto tree with only the SQLite
 package and its loader dependencies replaced by the candidate's compatible
 signed package, under the candidate Node runtime. That fixture method was
-verified locally; the dedicated Intel CI qualification remains pending at this
-checkpoint. Apple Silicon's upgrade fixture uses the unmodified old published
-artifact and its actual old Node/SQLite runtime.
+verified locally and passed on the native Intel runner. Apple Silicon's upgrade
+fixture uses the unmodified old published artifact and its actual old Node/SQLite
+runtime.
+
+[Intel CI 43330019109](https://github.com/rezprotocol/rez-chat/actions/runs/43330019109)
+completed successfully at source `893b2b2c84e4f0948709bd223a88b4d905aadce4`,
+including shared security/recovery preflight, both native launcher tests, signed
+and notarized build, DMG install and two starts, legacy-format upgrade, two real
+packaged-session cycles, clean exit and encrypted upload. Local authenticated
+decryption, archive/source verification and individual installer checksums pass.
+The downloaded Intel executable, Node and SQLite addon are all x86_64, and its
+installed bundle passes strict/deep code-signature verification locally.
+
+Runtime source and dependency locks are identical between the ARM/Linux source
+cut and Intel source cut. Only the qualification workflow, input manifest, session
+checker and this report differ. The final bookkeeping commit changes only this
+report and disables native target caching; no rebuild is required for those edits.
+
+Private recovered installers and SHA-256 inventory are retained outside Git under
+`.local/desktop-candidates/rc15-20261112/installers/`. Encryption keys are kept
+separately. A filename scan of installed resources found no environment files,
+npm credentials, PEM/private-key/certificate files or SQLite database dumps;
+this was a targeted package-content check, not an entropy-based secret audit.
 
 The owner explicitly authorized the five candidate source branches and encrypted
 private signing runs. Public releases, npm writes, updater promotion and hosted
