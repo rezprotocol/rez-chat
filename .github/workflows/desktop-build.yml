@@ -354,8 +354,8 @@ jobs:
           chmod +x "$HOME/.cargo/bin/cargo-tauri"
           test "$(cargo tauri --version | awk '{print $NF}')" = "$BUILDER_VERSION"
 
-      - name: Test native launcher security
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml launcher_security_tests
+      - name: Test native authentication and launcher security
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
         working-directory: rez-chat
 
       - name: Build private desktop candidate

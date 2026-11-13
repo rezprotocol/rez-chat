@@ -185,7 +185,7 @@ test("native host approval must finish before the vault can unlock", async () =>
   const ipcMain = new FakeIpcMain();
   const supervisor = buildSupervisor();
   const order = [];
-  supervisor.unlockWithDevice = async () => { order.push("vault"); return { unlocked: true }; };
+  supervisor.unlockWithDevice = async () => { order.push("vault"); return supervisor.vaultStatus(); };
   registerDesktopRuntimeIpc({ ipcMain, supervisor, confirmUnlockWithDevice: async () => {
     order.push("native-auth");
     return true;
